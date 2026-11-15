@@ -47,6 +47,7 @@ import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
+import { requireManagedEventHandoff } from "./eventTaskAccess.ts";
 import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
@@ -55,6 +56,8 @@ import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
 import * as EnvironmentHandlers from "./toolkits/environment/handlers.ts";
 import { ThemeToolkit } from "./toolkits/theme/tools.ts";
 import * as ThemeHandlers from "./toolkits/theme/handlers.ts";
+import { EventOrchestrationToolkit } from "./toolkits/eventOrchestration/tools.ts";
+import * as EventOrchestrationHandlers from "./toolkits/eventOrchestration/handlers.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ProjectHandlers from "./toolkits/project/handlers.ts";
 import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
@@ -934,6 +937,7 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
  */
 const HANDOFF_TOOLS: ReadonlySet<string> = new Set([
   "delegate_task",
+  "event_task_assign",
   "create_threads",
   "t3_thread_launch",
   "t3_thread_send",
@@ -1151,7 +1155,24 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
                 "mcp.tool.name": name,
               },
             },
-            () => options.handle(payload),
+            () =>
+              requireManagedEventHandoff(name).pipe(
+                Effect.andThen(options.handle(payload)),
+                Effect.catchTags({
+                  OrchestratorMcpFailure: (error) =>
+                    Effect.succeed(
+                      new McpSchema.CallToolResult({
+                        isError: true,
+                        content: [
+                          {
+                            type: "text",
+                            text: JSON.stringify({ code: error.code, message: error.message }),
+                          },
+                        ],
+                      }),
+                    ),
+                }),
+              ),
           ),
       });
     }),
@@ -1281,6 +1302,11 @@ const layerThemeToolkit = toolkitRegistration(ThemeToolkit, ThemeHandlers.layer)
   Layer.provide(ThreadCommandExecutor.layer),
 );
 
+const layerEventOrchestrationToolkit = toolkitRegistration(
+  EventOrchestrationToolkit,
+  EventOrchestrationHandlers.layer,
+);
+
 export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
 
 export const layerAttachmentToolkit = toolkitRegistration(
@@ -1342,6 +1368,7 @@ export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE,
 export const layerTools = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
+  layerEventOrchestrationToolkit,
   layerThreadToolkit,
   layerAttachmentToolkit,
   layerProjectRegistration,

@@ -58,6 +58,7 @@ import { EnvironmentToolkit } from "../../apps/server/src/mcp/toolkits/environme
 import { HtmlToolkit } from "../../apps/server/src/mcp/toolkits/html/tools.ts";
 import { MessageToolkit } from "../../apps/server/src/mcp/toolkits/message/tools.ts";
 import { OrchestratorToolkit } from "../../apps/server/src/mcp/toolkits/orchestrator/tools.ts";
+import { EventOrchestrationToolkit } from "../../apps/server/src/mcp/toolkits/eventOrchestration/tools.ts";
 import { PreviewToolkit } from "../../apps/server/src/mcp/toolkits/preview/tools.ts";
 import { PreviewControlsToolkit } from "../../apps/server/src/mcp/toolkits/previewControls/tools.ts";
 import { ProjectToolkit } from "../../apps/server/src/mcp/toolkits/project/tools.ts";
@@ -448,6 +449,7 @@ export const normalizeToolInput = (name: string, input: unknown) => {
 // description, and schema through unchanged.
 const t3SourceTools: ReadonlyArray<Tool.Any> = [
   OrchestratorToolkit,
+  EventOrchestrationToolkit,
   ThreadToolkit,
   AttachmentToolkit,
   ProjectToolkit,

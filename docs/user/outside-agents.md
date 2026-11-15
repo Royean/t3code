@@ -6,6 +6,19 @@ check which providers and models are available. This covers Claude Code or
 Codex in your own terminal, ChatGPT, and bots that support MCP. Each agent signs
 in once, and you choose what it may do.
 
+## Event hubs
+
+This fork also accepts approved GitHub events from an authenticated event hub.
+T3 chooses from configured roles and runs the work in coordinator and child
+threads. Task state, progress and recovery records belong to T3; the event hub
+only tracks delivery. Task dashboards read T3's task API directly. Role
+registration is opt-in; see [event orchestration setup](../operations/event-orchestration.md).
+
+Each task has one current executor and at most three attempts. Work whose old
+executor may still be running waits for its state to be resolved before another
+agent takes over. Completed work waits for verification, and you can cancel the
+job through the integration.
+
 ## Add T3 Code to an assistant app
 
 Open the command palette (`Cmd/Ctrl+K`) and choose **Use T3 Code in another

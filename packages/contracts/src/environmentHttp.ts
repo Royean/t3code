@@ -71,6 +71,15 @@ import {
 } from "./speech.ts";
 import { SecretReference } from "./secretReference.ts";
 import {
+  EventOrchestrationAdmission,
+  EventOrchestrationCancelInput,
+  EventOrchestrationChanges,
+  EventOrchestrationConfig,
+  EventOrchestrationJob,
+  EventOrchestrationJobDetail,
+  GitHubEventSubmission,
+} from "./eventOrchestration.ts";
+import {
   OrchestrationV2ShellHttpSnapshot,
   OrchestrationV2ShellResumable,
   OrchestrationV2ThreadBoundedSnapshot,
@@ -1063,6 +1072,89 @@ class EnvironmentWebhooksHttpApi extends HttpApiGroup.make("webhooks")
   .add(HttpApiEndpoint.patch("webhookPatch", WEBHOOK_PATH, webhookEndpoint))
   .add(HttpApiEndpoint.get("webhookGet", WEBHOOK_PATH, webhookEndpoint)) {}
 
+export class EnvironmentEventOrchestrationError extends Schema.TaggedError<EnvironmentEventOrchestrationError>()(
+  "EnvironmentEventOrchestrationError",
+  { reason: Schema.String },
+) {
+  override get message(): string {
+    return `Event orchestration request rejected: ${this.reason}.`;
+  }
+}
+
+const eventOrchestrationErrors = [
+  ...EnvironmentScopedOperationErrors,
+  EnvironmentEventOrchestrationError.pipe(HttpApiSchema.status(400)),
+] as const;
+const changeCursor = Schema.NumberFromString.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0),
+);
+
+class EnvironmentEventOrchestrationHttpApi extends HttpApiGroup.make("eventOrchestration")
+  .add(
+    HttpApiEndpoint.post("configure", "/api/event-orchestration/config", {
+      headers: OptionalBearerHeaders,
+      payload: EventOrchestrationConfig,
+      success: EventOrchestrationConfig,
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("submit", "/api/event-orchestration/events", {
+      headers: OptionalBearerHeaders,
+      payload: GitHubEventSubmission,
+      success: EventOrchestrationAdmission,
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("list", "/api/event-orchestration/jobs", {
+      headers: OptionalBearerHeaders,
+      success: Schema.Array(EventOrchestrationJob),
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("get", "/api/event-orchestration/jobs/:jobId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ jobId: TrimmedNonEmptyString }),
+      success: Schema.NullOr(EventOrchestrationJobDetail),
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("changes", "/api/event-orchestration/changes", {
+      headers: OptionalBearerHeaders,
+      query: Schema.Struct({
+        after: Schema.optional(changeCursor),
+        limit: Schema.optional(
+          Schema.NumberFromString.check(
+            Schema.isInt(),
+            Schema.isBetween({ minimum: 1, maximum: 500 }),
+          ),
+        ),
+      }),
+      success: EventOrchestrationChanges,
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("resume", "/api/event-orchestration/resume", {
+      headers: OptionalBearerHeaders,
+      payload: Schema.Struct({ jobId: TrimmedNonEmptyString }),
+      success: EventOrchestrationJobDetail,
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("cancel", "/api/event-orchestration/cancel", {
+      headers: OptionalBearerHeaders,
+      payload: EventOrchestrationCancelInput,
+      success: EventOrchestrationJobDetail,
+      error: eventOrchestrationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  ) {}
+
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
@@ -1072,4 +1164,5 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentProjectsHttpApi)
   .add(EnvironmentVoiceHttpApi)
   .add(EnvironmentConnectHttpApi)
+  .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi) {}

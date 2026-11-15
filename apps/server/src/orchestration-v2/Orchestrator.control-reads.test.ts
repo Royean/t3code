@@ -1206,6 +1206,88 @@ it.effect("settles only the stopped run's background work, once", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect.each(["runtime", "interaction"] as const)(
+  "refuses delegated permission escalation after a parent %s downgrade",
+  (mode) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parentThreadId = ThreadId.make(`thread:delegation-ceiling-${mode}`);
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`create-ceiling-${mode}`),
+        threadId: parentThreadId,
+        projectId: ProjectId.make("project:delegation-ceiling"),
+        title: "Coordinator",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`start-ceiling-${mode}`),
+        threadId: parentThreadId,
+        messageId: MessageId.make(`message:ceiling-${mode}`),
+        text: "Delegate approved work.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const run = (yield* projections.getThreadProjection(parentThreadId)).runs[0]!;
+      if (mode === "runtime") {
+        yield* orchestrator.dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("narrow-runtime"),
+          threadId: parentThreadId,
+          runtimeMode: "approval-required",
+        });
+      } else {
+        yield* orchestrator.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("narrow-interaction"),
+          threadId: parentThreadId,
+          interactionMode: "plan",
+        });
+      }
+      const rejected = yield* orchestrator
+        .dispatch({
+          type: "delegated_task.request",
+          commandId: CommandId.make(`delegate-ceiling-${mode}`),
+          parentThreadId,
+          parentRunId: run.id,
+          parentNodeId: run.rootNodeId!,
+          task: "Implement the task.",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+        })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(rejected));
+      assert.isEmpty((yield* projections.getThreadProjection(parentThreadId)).subagents);
+      yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make(`delegate-narrow-${mode}`),
+        parentThreadId,
+        parentRunId: run.id,
+        parentNodeId: run.rootNodeId!,
+        task: "Do the work within current permissions.",
+        modelSelection,
+        runtimeMode: mode === "runtime" ? "approval-required" : "full-access",
+        interactionMode: mode === "interaction" ? "plan" : "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      assert.lengthOf((yield* projections.getThreadProjection(parentThreadId)).subagents, 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("keeps delegated child pull-request links independent of the parent", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

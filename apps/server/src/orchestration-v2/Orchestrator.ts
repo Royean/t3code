@@ -9384,6 +9384,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Parent run ${command.parentRunId} is stopping.`,
         });
       }
+      if (exceededDispatchModeLimit(parentProjection.thread, command) !== undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Delegated task permissions exceed the parent's current modes.",
+        });
+      }
       const parentNode = parentProjection.nodes.find(
         (candidate) => candidate.id === command.parentNodeId,
       );
