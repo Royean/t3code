@@ -113,6 +113,7 @@ const makeHarness = Effect.gen(function* () {
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
   const launches = yield* Ref.make<ReadonlyArray<ThreadLaunch.ThreadLaunchInput>>([]);
   const instructions = yield* Ref.make("PRIVATE-ROLE-INSTRUCTIONS-v1");
+  const scheduled = yield* Ref.make(0);
   const sequence = yield* Ref.make(1);
   const pendingSettlement = yield* Ref.make(false);
   const launchFailures = yield* Ref.make(false);
@@ -126,7 +127,7 @@ const makeHarness = Effect.gen(function* () {
     IdAllocator.layer,
     ManagedPolicy.layerTest(),
     FileSystem.layerNoop({ readFileString: () => Ref.get(instructions) }),
-    Layer.succeed(Scheduler.Scheduler, { register: () => Effect.void }),
+    Layer.succeed(Scheduler.Scheduler, { register: () => Ref.update(scheduled, (n) => n + 1) }),
     Layer.mock(Receipts.CommandReceiptStoreV2)({
       getByCommandId: (commandId) =>
         Effect.gen(function* () {
@@ -242,6 +243,7 @@ const makeHarness = Effect.gen(function* () {
     commands,
     launches,
     instructions,
+    scheduled,
     sequence,
     pendingSettlement,
     launchFailures,
@@ -263,15 +265,21 @@ it.effect(
       const harness = yield* makeHarness;
       const jobId = yield* Effect.gen(function* () {
         const service = yield* EventOrchestration.EventOrchestrationService;
+        assert.equal(yield* Ref.get(harness.scheduled), 0);
+        assert.isFalse(service.ownsThread(ThreadId.make("ordinary-thread")));
         yield* service.runDueWork;
         assert.equal((yield* service.submit(event).pipe(Effect.flip)).reason, "disabled");
+        yield* service.configure({ ...config, enabled: false });
+        assert.equal(yield* Ref.get(harness.scheduled), 0);
         yield* service.configure(config);
+        assert.equal(yield* Ref.get(harness.scheduled), 1);
         assert.equal(
           (yield* service.submit({ ...event, eventType: "issues.opened" }).pipe(Effect.flip))
             .reason,
           "not_allowed",
         );
         const job = yield* service.submit(event);
+        assert.isTrue(service.ownsThread(job.coordinatorThreadId));
         assert.equal((yield* service.submit({ ...event, text: "overridden" })).id, job.id);
         assert.equal((yield* service.get(job.id))?.event.text, event.text);
         yield* service.runDueWork;
@@ -316,6 +324,7 @@ it.effect(
         assert.equal(calls.length, 1);
         assert.include(calls[0]!.task, "PRIVATE-ROLE-INSTRUCTIONS-v1");
         const attempt = first.attempts[0]!;
+        assert.isTrue(service.ownsThread(attempt.threadId));
         assert.deepEqual(
           (yield* service.getForCaller(attempt.threadId)).tasks.map((task) => task.id),
           ["build"],
@@ -389,6 +398,8 @@ it.effect(
         yield* restarted.runDueWork;
         assert.equal((yield* harness.delegated).length, 2);
         const job = (yield* restarted.get(jobId))!;
+        assert.isTrue(restarted.ownsThread(job.coordinatorThreadId));
+        assert.isTrue(restarted.ownsThread(job.tasks[0]!.attempts[0]!.threadId));
         const attempt = job.tasks.find((task) => task.id === "verify")!.attempts[0]!;
         yield* harness.setStatus(attempt.threadId, "completed");
         yield* restarted.runDueWork;

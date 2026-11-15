@@ -28,10 +28,12 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Receipts from "../orchestration-v2/CommandReceiptStore.ts";
+import { InheritParentModes } from "../orchestration-v2/InheritParentModes.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderSessions from "../orchestration-v2/ProviderSessionManager.ts";
@@ -76,6 +78,7 @@ export class EventOrchestrationError extends Schema.TaggedError<EventOrchestrati
 export class EventOrchestrationService extends Context.Service<
   EventOrchestrationService,
   {
+    readonly ownsThread: (threadId: ThreadId) => boolean;
     readonly configure: (
       input: EventOrchestrationConfig,
     ) => Effect.Effect<EventOrchestrationConfig, EventOrchestrationError>;
@@ -158,6 +161,7 @@ const make = Effect.gen(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const scheduler = yield* Scheduler.Scheduler;
   const policy = yield* ManagedPolicy.ManagedPolicy;
+  const serviceScope = yield* Effect.scope;
   const permit = yield* Semaphore.make(1);
   const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
 
@@ -165,6 +169,13 @@ const make = Effect.gen(function* () {
     isEventOrchestrationError(cause)
       ? cause
       : new EventOrchestrationError({ operation: "read", reason: "storage", cause });
+  // Keep admission checks off ordinary threads' database and execution paths.
+  const ownedRows = yield* sql<{ thread_id: string }>`
+    SELECT coordinator_thread_id AS thread_id FROM event_orchestration_jobs
+    UNION SELECT thread_id FROM event_orchestration_attempts
+  `.pipe(Effect.mapError(storageError));
+  const ownedThreads = new Set(ownedRows.map((row) => row.thread_id));
+  const ownsThread = (threadId: ThreadId) => ownedThreads.has(threadId);
   const encodeJob = Schema.encodeEffect(Schema.fromJsonString(EventOrchestrationJob));
   const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
   const json = Effect.fn("EventOrchestrationService.encodeJson")(function* (value: unknown) {
@@ -290,6 +301,7 @@ const make = Effect.gen(function* () {
         yield* sql`INSERT INTO event_orchestration_attempts ${sql.insert({ attempt_id: attempt.id, job_id: task.jobId, task_id: task.id, ordinal: attempt.ordinal, thread_id: attempt.threadId, status: attempt.status, state_json: yield* json(attempt) })} ON CONFLICT(attempt_id) DO UPDATE SET status = excluded.status, state_json = excluded.state_json`.pipe(
           Effect.mapError(storageError),
         );
+        ownedThreads.add(attempt.threadId);
       }
       yield* change(task.jobId, "task", task.status, task.id, task.attempts.at(-1)?.id ?? null);
     },
@@ -381,6 +393,7 @@ const make = Effect.gen(function* () {
     yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json) VALUES (1, ${yield* json({ config, instructions, hashes })}) ON CONFLICT(id) DO UPDATE SET snapshot_json = excluded.snapshot_json`.pipe(
       Effect.mapError(storageError),
     );
+    if (config.enabled) yield* startScheduler;
     return config;
   }, permit.withPermits(1));
   const submit = Effect.fn("EventOrchestrationService.submit")(function* (
@@ -431,6 +444,7 @@ const make = Effect.gen(function* () {
         }),
       )
       .pipe(Effect.mapError(storageError));
+    ownedThreads.add(job.coordinatorThreadId);
     return { ...job, tasks: [] };
   }, permit.withPermits(1));
   const list = Effect.fn("EventOrchestrationService.list")(function* () {
@@ -1060,7 +1074,7 @@ const make = Effect.gen(function* () {
         createdBy: "agent",
         creationSource: "mcp",
       })
-      .pipe(Effect.result);
+      .pipe(Effect.provideService(InheritParentModes, true), Effect.result);
     const at = yield* now;
     if (Result.isSuccess(outcome)) {
       yield* saveTask({
@@ -1593,8 +1607,18 @@ const make = Effect.gen(function* () {
     }
   }).pipe(permit.withPermits(1), Effect.withSpan("EventOrchestrationService.runDueWork"));
 
-  yield* scheduler.register("event-orchestration", runDueWork);
+  let scheduled = false;
+  const startScheduler = Effect.gen(function* () {
+    if (scheduled) return;
+    yield* scheduler
+      .register("event-orchestration", runDueWork)
+      .pipe(Effect.provideService(Scope.Scope, serviceScope));
+    scheduled = true;
+  });
+  if (ownedThreads.size > 0 || (yield* readRegistry())?.config.enabled === true)
+    yield* startScheduler;
   return EventOrchestrationService.of({
+    ownsThread,
     configure,
     submit,
     get,

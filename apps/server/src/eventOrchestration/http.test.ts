@@ -46,6 +46,7 @@ it.effect("HTTP grants protect configuration and submission before any execution
   Effect.gen(function* () {
     const writes = yield* Ref.make(0);
     const dependencies = Layer.mock(EventOrchestrationService.EventOrchestrationService)({
+      ownsThread: () => false,
       configure: (input) => Ref.update(writes, (count) => count + 1).pipe(Effect.as(input)),
       list: () => Effect.succeed([]),
       submit: (event) =>

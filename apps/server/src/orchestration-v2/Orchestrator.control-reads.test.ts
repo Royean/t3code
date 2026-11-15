@@ -43,6 +43,7 @@ import * as DelegatedTaskQuestionReactor from "./DelegatedTaskQuestionReactor.ts
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { InheritParentModes } from "./InheritParentModes.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -1206,9 +1207,13 @@ it.effect("settles only the stopped run's background work, once", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect.each(["runtime", "interaction"] as const)(
-  "refuses delegated permission escalation after a parent %s downgrade",
-  (mode) =>
+it.effect.each(
+  (["runtime", "interaction"] as const).flatMap((mode) =>
+    [false, true].map((inherit) => ({ mode, inherit })),
+  ),
+)(
+  "parent $mode downgrade only restricts delegation when opted in ($inherit)",
+  ({ mode, inherit }) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -1268,9 +1273,12 @@ it.effect.each(["runtime", "interaction"] as const)(
           createdBy: "agent",
           creationSource: "mcp",
         })
-        .pipe(Effect.result);
-      assert.isTrue(Result.isFailure(rejected));
-      assert.isEmpty((yield* projections.getThreadProjection(parentThreadId)).subagents);
+        .pipe(Effect.provideService(InheritParentModes, inherit), Effect.result);
+      assert.equal(Result.isFailure(rejected), inherit);
+      assert.lengthOf(
+        (yield* projections.getThreadProjection(parentThreadId)).subagents,
+        inherit ? 0 : 1,
+      );
       yield* orchestrator.dispatch({
         type: "delegated_task.request",
         commandId: CommandId.make(`delegate-narrow-${mode}`),
@@ -1284,7 +1292,10 @@ it.effect.each(["runtime", "interaction"] as const)(
         createdBy: "agent",
         creationSource: "mcp",
       });
-      assert.lengthOf((yield* projections.getThreadProjection(parentThreadId)).subagents, 1);
+      assert.lengthOf(
+        (yield* projections.getThreadProjection(parentThreadId)).subagents,
+        inherit ? 1 : 2,
+      );
     }).pipe(Effect.provide(layerTest)),
 );
 

@@ -2,7 +2,9 @@
 
 This fork can accept gated GitHub events from an event hub. The event hub receives, normalizes, deduplicates and delivers events. T3 independently owns the task records and execution: it starts a coordinator thread, assigns professional roles to real T3 child agents, and persists attempts, progress, checkpoints and outcomes. The event hub's acknowledgement tracks delivery only; it is not a task status record.
 
-The feature is off until configured. It currently targets one project in one T3 environment. Web, desktop and mobile can follow the resulting normal threads. The control API is intended for an authenticated integration, rather than a new client settings screen.
+The feature is an opt-in module, off until configured. An unconfigured installation starts no event scheduler. Event tools are visible only to threads admitted by this module; ordinary chats, delegations, tools and permission policies retain their upstream behavior even when the module is enabled for other threads. Its tables are additive and do not rewrite existing conversation records. Disabling admission stops new dispatches while existing work remains observable and cancellable.
+
+It currently targets one project in one T3 environment. Web, desktop and mobile can follow the resulting normal threads. The control API is intended for an authenticated integration, rather than a new client settings screen.
 
 ## Configure roles and executors
 

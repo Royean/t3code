@@ -162,6 +162,7 @@ import {
   runtimeModeCeilingRefusal,
   threadsStartingWork,
 } from "./DispatchModeLimit.ts";
+import { InheritParentModes } from "./InheritParentModes.ts";
 import {
   applyToProjection,
   emptyProjection,
@@ -9384,7 +9385,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Parent run ${command.parentRunId} is stopping.`,
         });
       }
-      if (exceededDispatchModeLimit(parentProjection.thread, command) !== undefined) {
+      if (
+        (yield* InheritParentModes) &&
+        exceededDispatchModeLimit(parentProjection.thread, command) !== undefined
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,

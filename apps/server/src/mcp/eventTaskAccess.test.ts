@@ -61,7 +61,7 @@ it.effect("managed events cannot bypass role admission through ordinary handoff 
     Effect.provide(
       Layer.mergeAll(
         Layer.mock(EventOrchestrationService.EventOrchestrationService)({
-          getForCaller: () => Effect.succeed(job),
+          ownsThread: (caller) => caller === job.coordinatorThreadId,
         }),
         Layer.succeed(McpInvocationContext.McpInvocationContext, {
           environmentId: EnvironmentId.make("environment:event-test"),
@@ -80,21 +80,22 @@ it.effect("managed events cannot bypass role admission through ordinary handoff 
   ),
 );
 
-it.effect.each(["forbidden", "storage"] as const)(
-  "ordinary delegation only bypasses an event lookup refusal of %s",
-  (reason) =>
+it.effect.each([false, true])(
+  "ordinary delegation remains available without event storage (managed: %s)",
+  (managed) =>
     Effect.gen(function* () {
       const result = yield* requireManagedEventHandoff("delegate_task").pipe(Effect.result);
-      expect(Result.isSuccess(result)).toBe(reason === "forbidden");
+      expect(Result.isSuccess(result)).toBe(!managed);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
           Layer.mock(EventOrchestrationService.EventOrchestrationService)({
+            ownsThread: () => managed,
             getForCaller: () =>
               Effect.fail(
                 new EventOrchestrationService.EventOrchestrationError({
                   operation: "read",
-                  reason,
+                  reason: "storage",
                 }),
               ),
           }),

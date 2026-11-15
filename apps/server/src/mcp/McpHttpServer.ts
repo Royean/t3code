@@ -3,6 +3,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -47,6 +48,7 @@ import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
+import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import { requireManagedEventHandoff } from "./eventTaskAccess.ts";
 import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
@@ -1157,9 +1159,8 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
             },
             () =>
               requireManagedEventHandoff(name).pipe(
-                Effect.andThen(options.handle(payload)),
-                Effect.catchTags({
-                  OrchestratorMcpFailure: (error) =>
+                Effect.matchEffect({
+                  onFailure: (error) =>
                     Effect.succeed(
                       new McpSchema.CallToolResult({
                         isError: true,
@@ -1171,6 +1172,7 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
                         ],
                       }),
                     ),
+                  onSuccess: () => options.handle(payload),
                 }),
               ),
           ),
@@ -1302,10 +1304,23 @@ const layerThemeToolkit = toolkitRegistration(ThemeToolkit, ThemeHandlers.layer)
   Layer.provide(ThreadCommandExecutor.layer),
 );
 
-const layerEventOrchestrationToolkit = toolkitRegistration(
+/** Only this toolkit receives the visibility; ordinary tools keep their existing policy. */
+const managedEventVisibility = McpServer.visibility(
+  Effect.gen(function* () {
+    const service = yield* EventOrchestrationService.EventOrchestrationService;
+    // Listing runs this once per tool; admission is an in-memory lookup.
+    return Effect.fnUntraced(function* () {
+      const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
+      const threadId = Option.getOrUndefined(scope)?.thread?.threadId;
+      return threadId !== undefined && service.ownsThread(threadId);
+    });
+  }),
+);
+
+export const layerEventOrchestrationToolkit = toolkitRegistration(
   EventOrchestrationToolkit,
   EventOrchestrationHandlers.layer,
-);
+).pipe(Layer.provide(managedEventVisibility.layer));
 
 export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
 
@@ -1386,9 +1401,23 @@ const layerToolExposure = Layer.effect(
   McpToolExposure.McpToolExposure,
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
+    const events = Option.getOrUndefined(
+      yield* Effect.serviceOption(EventOrchestrationService.EventOrchestrationService),
+    );
     return McpToolExposure.make(
-      () =>
-        server.tools.map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+      () => {
+        // Search is discovery too; keep the new catalog entries out of ordinary sessions.
+        const fiber = Fiber.getCurrent();
+        const caller =
+          fiber && Context.getOrUndefined(fiber.context, McpInvocationContext.McpInvocationContext);
+        const managed =
+          caller?.thread !== undefined && events?.ownsThread(caller.thread.threadId) === true;
+        return server.tools
+          .filter(
+            ({ tool }) => managed || !Object.hasOwn(EventOrchestrationToolkit.tools, tool.name),
+          )
+          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" }));
+      },
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),

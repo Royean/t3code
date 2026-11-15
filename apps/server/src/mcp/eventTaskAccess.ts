@@ -27,21 +27,7 @@ export const requireManagedEventHandoff = Effect.fn("McpEventTasks.requireManage
     const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
     const threadId = Option.getOrUndefined(scope)?.thread?.threadId;
     if (Option.isNone(service) || threadId === undefined) return;
-    const job = yield* service.value.getForCaller(threadId).pipe(
-      Effect.asSome,
-      Effect.catchTags({
-        EventOrchestrationError: (cause) =>
-          cause.reason === "forbidden"
-            ? Effect.succeedNone
-            : Effect.fail(
-                new OrchestratorMcpFailure({
-                  code: "orchestration_error",
-                  message: cause.message,
-                }),
-              ),
-      }),
-    );
-    if (Option.isSome(job)) {
+    if (service.value.ownsThread(threadId)) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
         message:
