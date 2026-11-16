@@ -231,6 +231,9 @@ jobs:
       T3CODE_TELEMETRY_CHANNEL: dev
       T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
       T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+      # Match upstream's Windows cross build: runtime cache stays on demand,
+      # rather than adding 23 loose prewarm files above the NSIS file budget.
+      T3CODE_DESKTOP_PREPARE_SERVER_CACHE: "false"
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       # Public fetch avoids checkout's auth cleanup, which traverses orphan

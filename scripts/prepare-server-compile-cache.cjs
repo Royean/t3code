@@ -15,6 +15,14 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
     console.log("[server-compile-cache] Skipping untrusted bundle");
     return;
   }
+  // Native Windows packaging can omit the optional loose cache files, as the
+  // official cross build does, to stay within NSIS's installation file budget.
+  if (process.env.T3CODE_DESKTOP_PREPARE_SERVER_CACHE === "false") {
+    console.log(
+      "[server-compile-cache] Skipping cache preparation disabled by build configuration",
+    );
+    return;
+  }
   const targetArch = ["ia32", "x64", "armv7l", "arm64", "universal"][arch];
   const runsWithRosetta =
     electronPlatformName === "darwin" &&
