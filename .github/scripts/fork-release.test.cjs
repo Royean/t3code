@@ -7,6 +7,7 @@ const test = require("node:test");
 const {
   resolveRelease,
   assertAllowedCommit,
+  resolveSourceCommit,
   findReleaseByTag,
   writeChecksums,
   publishRelease,
@@ -255,5 +256,34 @@ test("source ancestry uses captured remote commits and rejects ahead or divergen
   await assert.rejects(
     assertAllowedCommit({ ...input, branchCommits: { main: "forged-ref" } }),
     /Missing trusted ref/,
+  );
+});
+
+test("source resolution peels annotated tags and refuses tag movement before building", async () => {
+  const github = {
+    rest: {
+      git: {
+        async getRef() {
+          return { data: { object: { type: "tag", sha: "annotation" } } };
+        },
+        async getTag() {
+          return { data: { object: { type: "commit", sha: "commit" } } };
+        },
+      },
+    },
+  };
+  const input = {
+    github,
+    repository: "Royean/t3code",
+    eventName: "push",
+    ref: "refs/tags/v1.2.3",
+    sha: "annotation",
+  };
+  assert.equal(await resolveSourceCommit(input), "commit");
+  assert.equal(await resolveSourceCommit({ ...input, sha: "commit" }), "commit");
+  await assert.rejects(resolveSourceCommit({ ...input, sha: "old-commit" }), /tag moved/);
+  assert.equal(
+    await resolveSourceCommit({ ...input, eventName: "workflow_dispatch", sha: "branch-commit" }),
+    "branch-commit",
   );
 });

@@ -53,6 +53,21 @@ async function assertAllowedCommit({ github, repository, sha, branchCommits }) {
   throw new Error("Commit must belong to main or feat/event-orchestration.");
 }
 
+async function resolveSourceCommit({ github, repository, eventName, ref, sha }) {
+  if (eventName !== "push" || !ref.startsWith("refs/tags/")) return sha;
+  const [owner, repo] = repository.split("/");
+  const { data } = await github.rest.git.getRef({ owner, repo, ref: ref.slice("refs/".length) });
+  let object = data.object;
+  const tagSha = object.sha;
+  for (let depth = 0; object.type === "tag" && depth < 8; depth++) {
+    object = (await github.rest.git.getTag({ owner, repo, tag_sha: object.sha })).data.object;
+  }
+  if (object.type !== "commit" || (sha !== tagSha && sha !== object.sha)) {
+    throw new Error("Release tag moved away from the triggering commit.");
+  }
+  return object.sha;
+}
+
 async function findReleaseByTag({ github, repository, tag }) {
   const [owner, repo] = repository.split("/");
   // Listing with the repository token includes drafts; getReleaseByTag only
@@ -170,6 +185,7 @@ module.exports = {
   FORK_REPOSITORY,
   resolveRelease,
   assertAllowedCommit,
+  resolveSourceCommit,
   findReleaseByTag,
   writeChecksums,
   publishRelease,
