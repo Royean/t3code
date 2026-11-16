@@ -11,9 +11,16 @@ it.each([
   { platform: "linux", hostArch: "x64", arch: 3, reason: "unexecutable target linux/arm64" },
   { platform: "linux", hostArch: "arm64", arch: 1, reason: "unexecutable target linux/x64" },
   { platform: "darwin", hostArch: "arm64", arch: 3, reason: "untrusted bundle", untrusted: true },
+  {
+    platform: "win32",
+    hostArch: "x64",
+    arch: 1,
+    reason: "cache preparation disabled by build configuration",
+    disabled: true,
+  },
 ])(
   "skips cache generation for $reason",
-  async ({ platform, hostArch, arch, reason, untrusted }) => {
+  async ({ platform, hostArch, arch, reason, untrusted, disabled }) => {
     const { spawnSync } = await import("node:child_process");
     const hook = NodeURL.fileURLToPath(
       new URL("../prepare-server-compile-cache.cjs", import.meta.url),
@@ -28,7 +35,11 @@ it.each([
       ],
       {
         encoding: "utf8",
-        env: { ...process.env, T3CODE_DESKTOP_UNTRUSTED_BUNDLE: untrusted ? "true" : "" },
+        env: {
+          ...process.env,
+          T3CODE_DESKTOP_UNTRUSTED_BUNDLE: untrusted ? "true" : "",
+          T3CODE_DESKTOP_PREPARE_SERVER_CACHE: disabled ? "false" : "",
+        },
       },
     );
     expect(result.status, result.stderr).toBe(0);
@@ -47,6 +58,13 @@ it.each([
   },
   { platform: "linux", hostArch: "x64", arch: 1, resources: "resources", executable: "fixture" },
   { platform: "linux", hostArch: "arm64", arch: 3, resources: "resources", executable: "fixture" },
+  {
+    platform: "win32",
+    hostArch: "x64",
+    arch: 1,
+    resources: "resources",
+    executable: "Fixture.exe",
+  },
 ])("prepares $platform/$hostArch cache", async ({ platform, hostArch, arch, ...layout }) => {
   const { spawnSync } = await import("node:child_process");
   const root = NodeFS.realpathSync(
@@ -88,7 +106,10 @@ it.each([
       }).catch(error => { console.error(error); process.exitCode = 1; });
     `,
       ],
-      { encoding: "utf8" },
+      {
+        encoding: "utf8",
+        env: { ...process.env, TEMP: root, TMP: root, T3CODE_DESKTOP_PREPARE_SERVER_CACHE: "" },
+      },
     );
     expect(result.status, result.stderr).toBe(0);
     const manifest = JSON.parse(
