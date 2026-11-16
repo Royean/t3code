@@ -4,7 +4,13 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { resolveRelease, writeChecksums, publishRelease } = require("./fork-release.cjs");
+const {
+  resolveRelease,
+  assertAllowedCommit,
+  findReleaseByTag,
+  writeChecksums,
+  publishRelease,
+} = require("./fork-release.cjs");
 
 const source = {
   repository: "Royean/t3code",
@@ -61,23 +67,33 @@ function distribution(t) {
   for (const name of [
     "t3-1.2.3-darwin-arm64.tar.gz",
     "t3-1.2.3-linux-x64.tar.gz",
+    "t3-1.2.3-win32-x64.zip",
+    "t3-1.2.3-android-arm64.apk",
+    "ANDROID-SIGNING.json",
     "BUILD-INFO.json",
     "T3-Code.dmg",
     "T3-Code.zip",
     "T3-Code.AppImage",
     "T3-Code.deb",
+    "T3-Code.exe",
   ]) {
     fs.writeFileSync(path.join(directory, name), `fixture ${name}`);
   }
   return directory;
 }
 
-test("distribution requires both platforms and hashes the actual bytes of every asset", (t) => {
+test("distribution requires every platform and hashes both ZIP archives and every asset", (t) => {
   const directory = distribution(t);
-  const required = path.join(directory, "t3-1.2.3-linux-x64.tar.gz");
-  fs.unlinkSync(required);
-  assert.throws(() => writeChecksums(directory, "1.2.3"), /Missing release asset/);
-  fs.writeFileSync(required, "linux bytes");
+  for (const name of [
+    "t3-1.2.3-linux-x64.tar.gz",
+    "t3-1.2.3-win32-x64.zip",
+    "t3-1.2.3-android-arm64.apk",
+  ]) {
+    const required = path.join(directory, name);
+    fs.unlinkSync(required);
+    assert.throws(() => writeChecksums(directory, "1.2.3"), /Missing release asset/);
+    fs.writeFileSync(required, `fixture ${name}`);
+  }
   const names = writeChecksums(directory, "1.2.3");
   const checksums = fs.readFileSync(path.join(directory, "SHA256SUMS"), "utf8").trim().split("\n");
   assert.equal(checksums.length, names.length - 1);
@@ -131,9 +147,8 @@ function api({
         },
       },
       repos: {
-        async getReleaseByTag() {
-          if (exists) return { data: { id: 99 } };
-          throw Object.assign(new Error("not found"), { status: 404 });
+        async listReleases() {
+          return { data: exists ? [{ id: 99, tag_name: "v1.2.3", draft: true }] : [] };
         },
         async createRelease(params) {
           state.created = params;
@@ -187,4 +202,58 @@ test("publication refuses existing versions and moved tags, leaving failed uploa
   assert.equal(state.created.draft, true);
   assert.equal(state.published.draft, false);
   assert.equal(state.published.make_latest, "true");
+});
+
+test("release lookup finds old drafts with pagination and fails closed on API errors", async () => {
+  const pages = [];
+  const github = {
+    rest: {
+      repos: {
+        async listReleases({ page }) {
+          pages.push(page);
+          return {
+            data:
+              page === 1
+                ? Array.from({ length: 100 }, (_, i) => ({ tag_name: `v0.0.${i}` }))
+                : [{ tag_name: "v1.2.3", draft: true }],
+          };
+        },
+      },
+    },
+  };
+  const input = { github, repository: "Royean/t3code", tag: "v1.2.3" };
+  assert.equal((await findReleaseByTag(input)).draft, true);
+  assert.deepEqual(pages, [1, 2]);
+  github.rest.repos.listReleases = async () => {
+    throw Object.assign(new Error("forbidden"), { status: 403 });
+  };
+  await assert.rejects(findReleaseByTag(input), /forbidden/);
+});
+
+test("source ancestry uses captured remote commits and rejects ahead or divergent candidates", async () => {
+  const branchCommits = { main: "1".repeat(40), "feat/event-orchestration": "2".repeat(40) };
+  const calls = [];
+  let statuses = ["behind", "ahead"];
+  const github = {
+    rest: {
+      repos: {
+        async compareCommitsWithBasehead({ basehead }) {
+          calls.push(basehead);
+          return { data: { status: statuses.shift() } };
+        },
+      },
+    },
+  };
+  const input = { github, repository: "Royean/t3code", sha: "candidate", branchCommits };
+  assert.equal(await assertAllowedCommit(input), "feat/event-orchestration");
+  assert.deepEqual(calls, [
+    `candidate...${branchCommits.main}`,
+    `candidate...${branchCommits["feat/event-orchestration"]}`,
+  ]);
+  statuses = ["behind", "diverged"];
+  await assert.rejects(assertAllowedCommit(input), /Commit must belong/);
+  await assert.rejects(
+    assertAllowedCommit({ ...input, branchCommits: { main: "forged-ref" } }),
+    /Missing trusted ref/,
+  );
 });

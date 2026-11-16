@@ -24,52 +24,55 @@ jobs:
       publish: ${{ steps.source.outputs.publish }}
       prerelease: ${{ steps.source.outputs.prerelease }}
       sha: ${{ steps.source.outputs.sha }}
-      publisher_sha: ${{ steps.source.outputs.publisher_sha }}
+      publisher_sha: ${{ steps.trusted_refs.outputs.main_sha }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Validate version and allowed branch ancestry
-        id: source
-        run: |
-          node <<'NODE'
-          const fs = require('node:fs');
-          const { execFileSync, spawnSync } = require('node:child_process');
-          const { ALLOWED_BRANCHES, resolveRelease } = require('./.github/scripts/fork-release.cjs');
-          const metadata = resolveRelease({
-            repository: process.env.GITHUB_REPOSITORY,
-            eventName: process.env.GITHUB_EVENT_NAME,
-            ref: process.env.GITHUB_REF,
-            runId: process.env.GITHUB_RUN_ID,
-            date: new Date(),
-            baseVersion: JSON.parse(fs.readFileSync('apps/server/package.json', 'utf8')).version,
-          });
-          const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-          if (sha !== process.env.GITHUB_SHA) throw new Error('Checkout does not match the triggering commit.');
-          const branches = ALLOWED_BRANCHES.filter((branch) =>
-            spawnSync('git', ['merge-base', '--is-ancestor', sha, `refs/remotes/origin/${branch}`]).status === 0);
-          if (!branches.length) throw new Error('Commit must belong to main or feat/event-orchestration.');
-          const publisher_sha = execFileSync('git', ['rev-parse', 'refs/remotes/origin/main'], { encoding: 'utf8' }).trim();
-          fs.appendFileSync(process.env.GITHUB_OUTPUT,
-            Object.entries({ ...metadata, sha, publisher_sha }).map(([key, value]) => `${key}=${value}\n`).join(''));
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-            `Source: ${sha}\n\nVersion: ${metadata.version}\n\nAllowed branches: ${branches.join(', ')}\n\nPublish: ${metadata.publish}\n`);
-          NODE
-      - name: Reject an existing release
-        if: steps.source.outputs.publish == 'true'
+      # Resolve GitHub's real branch refs before loading any repository helper.
+      - name: Capture trusted main and allowed branch commits
+        id: trusted_refs
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        env:
-          RELEASE_TAG: ${{ steps.source.outputs.tag }}
         with:
           script: |
-            // A draft also reserves the version. Fail closed on API errors.
-            try {
-              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: process.env.RELEASE_TAG });
-              throw new Error('This release already exists. Inspect any draft and use a new version.');
-            } catch (error) {
-              if (error.status !== 404) throw error;
+            const commits = {};
+            for (const branch of ['main', 'feat/event-orchestration']) {
+              const { data } = await github.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` });
+              if (data.object.type !== 'commit') throw new Error(`Invalid branch ref: ${branch}`);
+              commits[branch] = data.object.sha;
             }
+            core.setOutput('main_sha', commits.main);
+            core.setOutput('commits', JSON.stringify(commits));
+      - name: Checkout trusted policy only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_refs.outputs.main_sha }}
+          path: trusted-policy
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/scripts/fork-release.cjs
+            /apps/server/package.json
+          sparse-checkout-cone-mode: false
+      - name: Validate version and allowed branch ancestry
+        id: source
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          TRUSTED_BRANCH_COMMITS: ${{ steps.trusted_refs.outputs.commits }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { resolveRelease, assertAllowedCommit, findReleaseByTag } = require('./trusted-policy/.github/scripts/fork-release.cjs');
+            const metadata = resolveRelease({
+              repository: process.env.GITHUB_REPOSITORY, eventName: context.eventName,
+              ref: context.ref, runId: context.runId, date: new Date(),
+              baseVersion: JSON.parse(fs.readFileSync('trusted-policy/apps/server/package.json', 'utf8')).version,
+            });
+            const branch = await assertAllowedCommit({ github,
+              repository: process.env.GITHUB_REPOSITORY, sha: context.sha,
+              branchCommits: JSON.parse(process.env.TRUSTED_BRANCH_COMMITS),
+            });
+            if (metadata.publish && await findReleaseByTag({ github,
+              repository: process.env.GITHUB_REPOSITORY, tag: metadata.tag,
+            })) throw new Error('This release or draft already exists. Use a fresh version.');
+            for (const [key, value] of Object.entries({ ...metadata, sha: context.sha })) core.setOutput(key, value);
+            await core.summary.addRaw(`Source: ${context.sha}\n\nVersion: ${metadata.version}\n\nAllowed branch: ${branch}\n\nPublish: ${metadata.publish}\n`).write();
 
   checks:
     name: Full CI
@@ -193,9 +196,228 @@ jobs:
           path: ${{ runner.temp }}/desktop-launch-check
           if-no-files-found: ignore
 
+  windows:
+    name: Package Windows x64
+    needs: [prepare, build]
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      APP_VERSION: ${{ needs.prepare.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter @t3tools/desktop... --filter t3... --filter @t3tools/scripts...
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fork-linux-x64
+          path: wsl-runtime
+      - name: Build desktop and native CLI
+        run: |
+          node scripts/update-release-package-versions.ts "$APP_VERSION"
+          vp run build:desktop
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-pc-windows-msvc
+          mkdir -p "$RUNNER_TEMP/cli-resource-monitor/win32-x64"
+          cp native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe "$RUNNER_TEMP/cli-resource-monitor/win32-x64/"
+          node apps/server/scripts/cli.ts build-exe --verbose
+          node scripts/build-cli-archive.ts --platform win --arch x64 --version "$APP_VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$APP_VERSION"
+      - name: Package unsigned Windows installer with WSL runtime
+        run: |
+          node scripts/build-desktop-artifact.ts --platform win --arch x64 --target nsis \
+            --build-version "$APP_VERSION" --skip-build --keep-stage --verbose \
+            --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-$APP_VERSION-linux-x64.tar.gz"
+      - name: Launch packaged Windows desktop
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { resolveDesktopProductName } from './scripts/build-desktop-artifact.ts';
+          const stages = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('t3code-desktop-win-stage-'));
+          if (stages.length !== 1) throw new Error('Expected one Windows package staging directory.');
+          const appDir = path.join(os.tmpdir(), stages[0], 'app/dist/win-unpacked');
+          const executable = path.join(appDir, `${resolveDesktopProductName(process.env.APP_VERSION)}.exe`);
+          const child = spawnSync(process.execPath, ['scripts/smoke-desktop-app.ts', '--executable', executable,
+            '--artifacts-dir', path.join(process.env.RUNNER_TEMP, 'desktop-launch-check')], { stdio: 'inherit' });
+          if (child.error) throw child.error;
+          process.exitCode = child.status ?? 1;
+          NODE
+      - name: Collect Windows distribution files
+        run: |
+          mkdir release-publish
+          cp release-cli/* release-publish/
+          shopt -s nullglob
+          for file in release/*.exe release/*.blockmap release/*.yml; do
+            [[ "$file" == */builder-debug.yml ]] && continue
+            cp "$file" release-publish/
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-win-x64
+          path: release-publish/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload Windows launch failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-launch-failure-win-x64
+          path: ${{ runner.temp }}/desktop-launch-check
+          if-no-files-found: ignore
+
+  android:
+    name: Build standalone Android arm64 APK
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CI: "1"
+      APP_VARIANT: production
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      NODE_OPTIONS: --max-old-space-size=6144
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Reclaim runner SDK space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter @t3tools/mobile...
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+      - name: Configure fork identity and public account identifiers
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { parseEnv } = require('node:util');
+          const { patchExpoConfig } = require('./.github/scripts/fork-android.cjs');
+          const publicConfig = parseEnv(fs.readFileSync('.env.example', 'utf8'));
+          const names = ['T3CODE_CLERK_PUBLISHABLE_KEY', 'T3CODE_CLERK_JWT_TEMPLATE',
+            'T3CODE_CLERK_CLI_OAUTH_CLIENT_ID', 'T3CODE_RELAY_URL'];
+          fs.writeFileSync('.env', names.filter((name) => publicConfig[name])
+            .map((name) => `${name}=${publicConfig[name]}\n`).join(''));
+          const file = 'apps/mobile/app.config.ts';
+          fs.writeFileSync(file, patchExpoConfig(fs.readFileSync(file, 'utf8'), {
+            version: process.env.VERSION, versionCode: Number(process.env.GITHUB_RUN_NUMBER),
+          }));
+          NODE
+      - name: Generate production native project
+        working-directory: apps/mobile
+        run: vp exec expo prebuild --clean --platform android --no-install
+      - name: Disable generated debug signing for release
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { disableDebugSigning } = require('./.github/scripts/fork-android.cjs');
+          const file = 'apps/mobile/android/app/build.gradle';
+          fs.writeFileSync(file, disableDebugSigning(fs.readFileSync(file, 'utf8')));
+          NODE
+      - name: Build release APK with embedded JavaScript
+        working-directory: apps/mobile/android
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --max-workers=2 \
+            -PreactNativeArchitectures=arm64-v8a -Dorg.gradle.jvmargs='-Xmx4096m -XX:MaxMetaspaceSize=1024m'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-android-unsigned
+          path: apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  android_sign:
+    name: Sign and verify standalone Android APK
+    needs: [prepare, android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # The keystore never shares a job with candidate Gradle or JavaScript.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.publisher_sha }}
+          persist-credentials: false
+          sparse-checkout: /.github/scripts/fork-android.cjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fork-android-unsigned
+          path: unsigned
+      - name: Sign with persistent fork key and validate the APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.FORK_ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.FORK_ANDROID_KEYSTORE_PASSWORD }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD"
+          key="$RUNNER_TEMP/fork-android.p12"
+          trap 'rm -f "$key" "$RUNNER_TEMP/fork-android-cert.der"' EXIT
+          (umask 077 && printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$key")
+          tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          test -x "$tools/apksigner" && test -x "$tools/aapt2"
+          mkdir release-publish
+          apk="release-publish/t3-$VERSION-android-arm64.apk"
+          "$tools/zipalign" -P 16 -f 4 unsigned/app-release-unsigned.apk "$RUNNER_TEMP/android-aligned.apk"
+          "$tools/apksigner" sign --ks "$key" --ks-key-alias t3code-fork \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --out "$apk" "$RUNNER_TEMP/android-aligned.apk"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/android-signature.txt"
+          keytool -exportcert -keystore "$key" -storepass:env ANDROID_KEYSTORE_PASSWORD \
+            -alias t3code-fork -file "$RUNNER_TEMP/fork-android-cert.der"
+          expected=$(sha256sum "$RUNNER_TEMP/fork-android-cert.der" | cut -d' ' -f1)
+          grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/android-signature.txt"
+          "$tools/aapt2" dump badging "$apk" > "$RUNNER_TEMP/android-badging.txt"
+          python3 - "$apk" > "$RUNNER_TEMP/android-entries.json" <<'PY'
+          import json, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              print(json.dumps([{"name": item.filename, "size": item.file_size} for item in apk.infolist()]))
+          PY
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { verifyApkMetadata } = require('./.github/scripts/fork-android.cjs');
+          const metadata = verifyApkMetadata({
+            badging: fs.readFileSync(`${process.env.RUNNER_TEMP}/android-badging.txt`, 'utf8'),
+            entries: JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/android-entries.json`, 'utf8')),
+            version: process.env.VERSION,
+          });
+          const signature = fs.readFileSync(`${process.env.RUNNER_TEMP}/android-signature.txt`, 'utf8');
+          metadata.certificateSha256 = /Signer #1 certificate SHA-256 digest: ([0-9a-f]+)/.exec(signature)[1];
+          fs.writeFileSync('release-publish/ANDROID-SIGNING.json', JSON.stringify(metadata, null, 2) + '\n');
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-android-arm64
+          path: release-publish/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   release:
     name: Verify checksums and publish
-    needs: [prepare, checks, build]
+    needs: [prepare, checks, build, windows, android_sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -221,7 +443,7 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs');
           fs.mkdirSync('release-publish');
-          for (const artifact of ['fork-mac-arm64', 'fork-linux-x64']) {
+          for (const artifact of ['fork-mac-arm64', 'fork-linux-x64', 'fork-win-x64', 'fork-android-arm64']) {
             for (const name of fs.readdirSync(`artifacts/${artifact}`)) {
               fs.copyFileSync(`artifacts/${artifact}/${name}`, `release-publish/${name}`, fs.constants.COPYFILE_EXCL);
             }
@@ -232,8 +454,8 @@ jobs:
             version: process.env.VERSION,
             run: `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
             builtAt: new Date().toISOString(),
-            platforms: ['darwin-arm64', 'linux-x64'],
-            signing: 'No Developer ID signature or Apple notarization; macOS CLI is signed ad hoc.',
+            platforms: ['darwin-arm64', 'linux-x64', 'win32-x64', 'android-arm64'],
+            signing: 'Desktop and Windows CLI unsigned; macOS CLI ad hoc; Android signed with persistent fork key (see ANDROID-SIGNING.json).',
           }, null, 2) + '\n');
           require('./.github/scripts/fork-release.cjs').writeChecksums('release-publish', process.env.VERSION);
           NODE
@@ -258,12 +480,13 @@ jobs:
             const body = [
               `Fork build of ${process.env.SOURCE_SHA}.`,
               '',
-              'macOS Apple Silicon: DMG/ZIP desktop and standalone CLI. Linux x64: AppImage/DEB desktop and standalone CLI.',
+              'macOS Apple Silicon: DMG/ZIP desktop and standalone CLI. Linux x64: AppImage/DEB desktop and standalone CLI. Windows x64: NSIS desktop and standalone CLI ZIP. Android arm64: standalone release APK.',
               'CLI archives include the web client and need no Node installation. Verify downloads against SHA256SUMS.',
               '',
-              'Unsigned personal fork: macOS desktop is not Developer ID signed or notarized, so Gatekeeper may require explicit approval. CLI is signed ad hoc. Install and update these builds manually; built-in CLI release discovery still uses upstream.',
-              'Desktop update configuration points to this fork. No upstream relay/Clerk credentials or deployment services are configured.',
-              'Windows, Intel macOS, Linux arm64 and mobile store builds are not included.',
+              'Unsigned desktop fork: macOS is not Developer ID signed or notarized, so Gatekeeper may require explicit approval; macOS CLI is signed ad hoc. Windows packages have no Authenticode signature and may trigger SmartScreen. Install and update manually; CLI release discovery still uses upstream.',
+              'Android uses its own package com.royean.t3code and persistent signing key, embeds JavaScript and has upstream EAS OTA disabled. It connects using the existing public T3 account configuration; Google native sign-in and push notifications need separate provider registration and device validation.',
+              'Desktop update configuration points to this fork. No npm publication or upstream service deployment occurs.',
+              'Intel macOS, Linux arm64 and mobile store publication are not included.',
               '',
               `[Build and full CI](https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`,
             ].join('\n');

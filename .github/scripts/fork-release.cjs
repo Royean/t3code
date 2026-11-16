@@ -37,6 +37,34 @@ function resolveRelease({ repository, eventName, ref, runId, date, baseVersion }
   };
 }
 
+async function assertAllowedCommit({ github, repository, sha, branchCommits }) {
+  if (repository !== FORK_REPOSITORY) throw new Error("Invalid release repository.");
+  const [owner, repo] = repository.split("/");
+  for (const branch of ALLOWED_BRANCHES) {
+    const head = branchCommits[branch];
+    if (!/^[0-9a-f]{40}$/.test(head ?? "")) throw new Error(`Missing trusted ref: ${branch}`);
+    const { data } = await github.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${sha}...${head}`,
+    });
+    if (data.status === "identical" || data.status === "ahead") return branch;
+  }
+  throw new Error("Commit must belong to main or feat/event-orchestration.");
+}
+
+async function findReleaseByTag({ github, repository, tag }) {
+  const [owner, repo] = repository.split("/");
+  // Listing with the repository token includes drafts; getReleaseByTag only
+  // promises published releases. Keep walking so an old draft reserves its tag.
+  for (let page = 1; ; page++) {
+    const { data } = await github.rest.repos.listReleases({ owner, repo, page, per_page: 100 });
+    const match = data.find((release) => release.tag_name === tag);
+    if (match) return match;
+    if (data.length < 100) return undefined;
+  }
+}
+
 function writeChecksums(directory, version) {
   const entries = fs.readdirSync(directory, { withFileTypes: true });
   if (entries.some((entry) => !entry.isFile() || !/^[0-9A-Za-z._+-]+$/.test(entry.name))) {
@@ -46,13 +74,19 @@ function writeChecksums(directory, version) {
   const required = [
     `t3-${version}-darwin-arm64.tar.gz`,
     `t3-${version}-linux-x64.tar.gz`,
+    `t3-${version}-win32-x64.zip`,
+    `t3-${version}-android-arm64.apk`,
+    "ANDROID-SIGNING.json",
     "BUILD-INFO.json",
   ];
   for (const name of required) {
     if (!names.includes(name)) throw new Error(`Missing release asset: ${name}`);
   }
-  for (const extension of [".dmg", ".zip", ".AppImage", ".deb"]) {
-    if (names.filter((name) => name.endsWith(extension)).length !== 1) {
+  for (const extension of [".dmg", ".zip", ".AppImage", ".deb", ".exe", ".apk"]) {
+    if (
+      names.filter((name) => name.endsWith(extension) && name !== `t3-${version}-win32-x64.zip`)
+        .length !== 1
+    ) {
       throw new Error(`Expected exactly one desktop ${extension} asset.`);
     }
   }
@@ -83,11 +117,8 @@ async function publishRelease({ github, repository, tag, sha, prerelease, direct
     }
   }
   await verifyTag();
-  try {
-    await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+  if (await findReleaseByTag({ github, repository, tag })) {
     throw new Error(`Release ${tag} already exists; use a new version.`);
-  } catch (error) {
-    if (error.status !== 404) throw error;
   }
   const { data: release } = await github.rest.repos.createRelease({
     owner,
@@ -138,6 +169,8 @@ module.exports = {
   ALLOWED_BRANCHES,
   FORK_REPOSITORY,
   resolveRelease,
+  assertAllowedCommit,
+  findReleaseByTag,
   writeChecksums,
   publishRelease,
 };
