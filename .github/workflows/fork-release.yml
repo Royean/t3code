@@ -437,11 +437,9 @@ jobs:
           "$tools/apksigner" sign --ks "$key" --ks-key-alias t3code-fork \
             --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEYSTORE_PASSWORD \
             --out "$apk" "$RUNNER_TEMP/android-aligned.apk"
-          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/android-signature.txt"
+          "$tools/apksigner" verify --verbose --print-certs-pem "$apk" > "$RUNNER_TEMP/android-signature.txt"
           keytool -exportcert -keystore "$key" -storepass:env ANDROID_KEYSTORE_PASSWORD \
             -alias t3code-fork -file "$RUNNER_TEMP/fork-android-cert.der"
-          expected=$(sha256sum "$RUNNER_TEMP/fork-android-cert.der" | cut -d' ' -f1)
-          grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/android-signature.txt"
           "$tools/aapt2" dump badging "$apk" > "$RUNNER_TEMP/android-badging.txt"
           python3 - "$apk" > "$RUNNER_TEMP/android-entries.json" <<'PY'
           import json, sys, zipfile
@@ -450,14 +448,16 @@ jobs:
           PY
           node <<'NODE'
           const fs = require('node:fs');
-          const { verifyApkMetadata } = require('./.github/scripts/fork-android.cjs');
+          const { verifyApkMetadata, verifyApkSigningCertificates } = require('./.github/scripts/fork-android.cjs');
           const metadata = verifyApkMetadata({
             badging: fs.readFileSync(`${process.env.RUNNER_TEMP}/android-badging.txt`, 'utf8'),
             entries: JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/android-entries.json`, 'utf8')),
             version: process.env.VERSION,
           });
           const signature = fs.readFileSync(`${process.env.RUNNER_TEMP}/android-signature.txt`, 'utf8');
-          metadata.certificateSha256 = /Signer #1 certificate SHA-256 digest: ([0-9a-f]+)/.exec(signature)[1];
+          metadata.certificateSha256 = verifyApkSigningCertificates({ output: signature,
+            expectedCertificate: fs.readFileSync(`${process.env.RUNNER_TEMP}/fork-android-cert.der`),
+          });
           fs.writeFileSync('release-publish/ANDROID-SIGNING.json', JSON.stringify(metadata, null, 2) + '\n');
           NODE
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

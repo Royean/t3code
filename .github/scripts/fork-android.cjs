@@ -1,3 +1,5 @@
+const { createHash, X509Certificate } = require("node:crypto");
+
 const ANDROID_PACKAGE = "com.royean.t3code";
 
 function patchExpoConfig(source, { version, versionCode }) {
@@ -62,4 +64,38 @@ function verifyApkMetadata({ badging, entries, version }) {
   };
 }
 
-module.exports = { ANDROID_PACKAGE, patchExpoConfig, disableDebugSigning, verifyApkMetadata };
+function verifyApkSigningCertificates({ output, expectedCertificate }) {
+  // SDK 37 changed human-readable signer labels. Compare every printed X.509
+  // certificate with keytool's exported DER instead of relying on those labels.
+  const certificates =
+    output.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  const beginCount = output.match(/-----BEGIN CERTIFICATE-----/g)?.length ?? 0;
+  const endCount = output.match(/-----END CERTIFICATE-----/g)?.length ?? 0;
+  if (
+    !certificates.length ||
+    beginCount !== certificates.length ||
+    endCount !== certificates.length
+  ) {
+    throw new Error("APK signing certificate output is missing or incomplete.");
+  }
+  let expected;
+  try {
+    expected = new X509Certificate(expectedCertificate).raw;
+    for (const certificate of certificates) {
+      if (!new X509Certificate(certificate).raw.equals(expected)) {
+        throw new Error("Unexpected signing certificate.");
+      }
+    }
+  } catch (cause) {
+    throw new Error("APK signing certificate does not match the configured keystore.", { cause });
+  }
+  return createHash("sha256").update(expected).digest("hex");
+}
+
+module.exports = {
+  ANDROID_PACKAGE,
+  patchExpoConfig,
+  disableDebugSigning,
+  verifyApkMetadata,
+  verifyApkSigningCertificates,
+};

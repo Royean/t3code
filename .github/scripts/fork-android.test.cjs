@@ -1,6 +1,12 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { patchExpoConfig, disableDebugSigning, verifyApkMetadata } = require("./fork-android.cjs");
+const { X509Certificate, createHash } = require("node:crypto");
+const {
+  patchExpoConfig,
+  disableDebugSigning,
+  verifyApkMetadata,
+  verifyApkSigningCertificates,
+} = require("./fork-android.cjs");
 
 test("fork Android prebuild uses its own identity, embedded runtime version and disabled upstream OTA", () => {
   const source = "const config = {};\nexport default config;";
@@ -65,4 +71,91 @@ test("standalone APK verification rejects debug, missing JS, wrong identity and 
       }),
     /Unexpected APK architecture/,
   );
+});
+
+// Public certificates generated for these tests; their private keys were discarded.
+const SIGNING_CERTIFICATE = `-----BEGIN CERTIFICATE-----
+MIIDMTCCAhmgAwIBAgIUH0nDm0QeNcA1OY6Trm1j7W9Y2TkwDQYJKoZIhvcNAQEL
+BQAwKDEmMCQGA1UEAwwdRm9ya1NpZ25hdHVyZUZpeHR1cmUtZXhwZWN0ZWQwHhcN
+MjYxMTE2MDEzODM5WhcNMjYxMTE3MDEzODM5WjAoMSYwJAYDVQQDDB1Gb3JrU2ln
+bmF0dXJlRml4dHVyZS1leHBlY3RlZDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
+AQoCggEBAJQx2DaeQ3EWbNt+0c2xWilXoN8Jm47UdvctCex+xhUeIaHluR1/jX7N
+7tbzG+cWlWAKN1olo2oJBY0DWUNe0fOULDxwgBpiDSTGqslvf0LVw0womu1JXr+x
+VRRgeXk03+pcTVvVAFjOFid+DrKstjJB/l/FsK7xY23/DcLGaggLwiqCgie+utuz
+cJ3AXEqsOY8q25aBP8omhVYCuDploU9eUQ3tGwNY6htQ8T2HaYFOvvQdin6oYtdN
++jDFzWMhUKuLe/hvKyzv1wJH6s9yDIiPexQ9oIUHQ2iaVnx6cTwcQwE624yIJU5w
+5X5Qt2ICwqJxLMX1nLG8FiSmTl34c80CAwEAAaNTMFEwHQYDVR0OBBYEFAjVTw4R
+U4b3HFQI75APXCsWcV0RMB8GA1UdIwQYMBaAFAjVTw4RU4b3HFQI75APXCsWcV0R
+MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBACKuCt8c2t4qkILc
+KEOGLYwJVoa83ZdnPGV2lGEzhXZoBguuIaI3XXTiqtzYGCYKCmi5le7qHJ6sqfmz
+dtPvyRXJGD/vsh1H9aGM9AISmDFKa1fYPNzb5mupaNwxIMen2hc3tyLh2xyZKHWf
+UKj49G+Aq/d7JTO5IPh1TKvFPUH5rrRG+OdAiTlByt4wODkGme2BfjAxy4T2BBse
+EzeVv0Qv3HVJQQ/M/hDcyE7Q8WeBOGVa1KCBM88qJ1oRBZjRnDX6Z7q6gyoY+Z7t
+ykq3Hyo6c6HzT+BhilkQ/6tkfd0wtCU6MsNe2h7wKhanhHzxRlerX+o6F7VyckvR
+GXu3mgo=
+-----END CERTIFICATE-----
+`;
+const OTHER_CERTIFICATE = `-----BEGIN CERTIFICATE-----
+MIIDKzCCAhOgAwIBAgIUMusv1H/L6hWlTfawVeoeuUt/u0YwDQYJKoZIhvcNAQEL
+BQAwJTEjMCEGA1UEAwwaRm9ya1NpZ25hdHVyZUZpeHR1cmUtb3RoZXIwHhcNMjYx
+MTE2MDEzODM5WhcNMjYxMTE3MDEzODM5WjAlMSMwIQYDVQQDDBpGb3JrU2lnbmF0
+dXJlRml4dHVyZS1vdGhlcjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+AMZIL6/eM29VaLKJ81h+pFU+MHG17YgqbSTDtRpUBanIasMSQNXL6IQTBAF7UUAh
+QZ1FiuII70gR1v6aXwgTy919oD3r84sj5cVbyTj7Cemgu5vU9I1qNh1LERwgPHMz
+VBFlBZ2XPAamfx9wZ5q1GoRGYmK3EsZ7Mojg+eHhckp6L6MOsNppkzXKSKWQEXGh
+C1JrB0YM2nRQO5yurA4XrwvFlmaPltZ3/dNCUh390dYX/jCivIHDetM2SEWm1YnS
+tcqUNr//1XWUWkjz545zWNGJRsuPnSUB6EiUVBw5qcMsvlYHEFx2TTl8Wz23jv8x
+SrCMOC4kqCMFzPJWX6/qotkCAwEAAaNTMFEwHQYDVR0OBBYEFFqQh31M8hE+a9z5
+vxMhzUZAZYwlMB8GA1UdIwQYMBaAFFqQh31M8hE+a9z5vxMhzUZAZYwlMA8GA1Ud
+EwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAGEjcDbvREdqtxWMeSvFdkZd
+iRX5rwomfJfpEsPILGH4fzuSeSL2dgjbgdVlJw7npmDNTC5BAZsFhQvSk23IPakP
+mmaPCcyjp9LrFA6jF/wFEErvfFzEHdBSbLc6alq/TAAWLCFFydv8dGXWCkG3AFQ7
+Z2M2NljYIJvSMCQpry+SdJXGSA9TpY8Fk6wkzMBy+Wcv49icjGmXTxWp655h0lv6
+pJA6iY7tqr3xGVZX5ntQo/AZ4HD9Gm2H1Rfj7w2smeTODdnEjt8SXWERmSt7lZA7
+E0dIzz/SqBcdbpEPYCs8eB6bWcCs0ec3K7Olcy3n93Q13GAuBNDlaVb/EUegldU=
+-----END CERTIFICATE-----
+`;
+
+test("APK certificate matching handles SDK 37 scheme labels and legacy labels using verified PEM", () => {
+  const expectedCertificate = new X509Certificate(SIGNING_CERTIFICATE).raw;
+  const expectedHash = createHash("sha256").update(expectedCertificate).digest("hex");
+  for (const label of [
+    "Signer #1",
+    "V2 Signer:",
+    "V3.0 Signer:",
+    "Signer (minSdkVersion=24, maxSdkVersion=32)",
+  ]) {
+    assert.equal(
+      verifyApkSigningCertificates({
+        output: `${label} certificate SHA-256 digest: ${expectedHash}\n${SIGNING_CERTIFICATE}`,
+        expectedCertificate,
+      }),
+      expectedHash,
+    );
+  }
+  assert.equal(
+    verifyApkSigningCertificates({
+      output: `V2 Signer:\n${SIGNING_CERTIFICATE}V3 Signer:\n${SIGNING_CERTIFICATE}`,
+      expectedCertificate,
+    }),
+    expectedHash,
+  );
+});
+
+test("APK certificate matching rejects missing, malformed, truncated and unexpected signers", () => {
+  const expectedCertificate = new X509Certificate(SIGNING_CERTIFICATE).raw;
+  for (const output of [
+    "Signer #1 certificate SHA-256 digest: " +
+      createHash("sha256").update(expectedCertificate).digest("hex"),
+    OTHER_CERTIFICATE,
+    SIGNING_CERTIFICATE + OTHER_CERTIFICATE,
+    "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----",
+    SIGNING_CERTIFICATE + "-----BEGIN CERTIFICATE-----\nZm9v",
+    SIGNING_CERTIFICATE + "-----END CERTIFICATE-----",
+  ]) {
+    assert.throws(
+      () => verifyApkSigningCertificates({ output, expectedCertificate }),
+      /^Error: APK signing certificate/,
+    );
+  }
 });
