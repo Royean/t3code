@@ -1,16 +1,22 @@
 name: CI
 
 on:
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      T3_TASK_CACHE_READ_TOKEN:
+        required: false
   pull_request:
   push:
     branches:
       - main
+      - feat/event-orchestration
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -22,7 +28,7 @@ jobs:
   # open: if the diff cannot be resolved, everything runs.
   changes:
     name: Changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       typecheck: ${{ steps.detect.outputs.typecheck }}
@@ -64,8 +70,8 @@ jobs:
       contents: read
       id-token: write
     name: Lint
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -120,8 +126,8 @@ jobs:
     name: Build and Typecheck
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -133,7 +139,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/setup-apt-mirrors
-        if: needs.changes.outputs.build != 'false'
+        if: github.repository == 'pingdotgg/t3code' && needs.changes.outputs.build != 'false'
 
       # Runs in the background while Vite+ installs; the step before the build waits for it.
       # Xvfb is for the desktop launch check below.
@@ -142,8 +148,12 @@ jobs:
         run: |
           # Fetch only the indexes these main and universe packages need. The full set is ~42 MB,
           # which a slow mirror can stretch past the wait below.
+          apt_sources=(/etc/apt/sources.list.d/ubuntu.sources)
+          if test -f /etc/apt/blacksmith-ubuntu-mirrors.txt; then
+            apt_sources+=(/etc/apt/blacksmith-ubuntu-mirrors.txt)
+          fi
           sudo sed -i -e 's|http://|https://|g' -e 's/^Components: .*/Components: main universe/' \
-            /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
+            "${apt_sources[@]}"
           (
             set +e
             sudo apt-get update -o Acquire::Languages=none \
@@ -275,8 +285,8 @@ jobs:
     name: Test
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -288,6 +298,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/setup-apt-mirrors
+        if: github.repository == 'pingdotgg/t3code'
 
       # The desktop tests compile the browser secret helper. The install runs in
       # the background while Vite+ installs; the step before the tests waits for it.
@@ -295,8 +306,12 @@ jobs:
         run: |
           # Fetch only the indexes these main and universe packages need. The full set is ~42 MB,
           # which a slow mirror can stretch past the wait below.
+          apt_sources=(/etc/apt/sources.list.d/ubuntu.sources)
+          if test -f /etc/apt/blacksmith-ubuntu-mirrors.txt; then
+            apt_sources+=(/etc/apt/blacksmith-ubuntu-mirrors.txt)
+          fi
           sudo sed -i -e 's|http://|https://|g' -e 's/^Components: .*/Components: main universe/' \
-            /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
+            "${apt_sources[@]}"
           (
             set +e
             sudo apt-get update -o Acquire::Languages=none \
@@ -326,7 +341,7 @@ jobs:
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
       - name: Test release checks
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/fork-release.test.cjs .github/scripts/fork-android.test.cjs
 
       - name: Finish installing browser secret helper build libraries
         timeout-minutes: 5
@@ -365,8 +380,8 @@ jobs:
     name: Test Web ${{ matrix.shard }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -427,10 +442,10 @@ jobs:
       contents: read
       id-token: write
     name: Test Server ${{ matrix.shard }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     # Shards take 2-5 minutes. When the shared task cache throttles reads, each
     # failed fetch stalls vp for 15-90s, which pushed shards past 10 minutes.
-    timeout-minutes: 20
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 20 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -557,8 +572,8 @@ jobs:
     name: Rust
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -591,8 +606,8 @@ jobs:
     name: Mobile Native Static Analysis
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
-    runs-on: blacksmith-6vcpu-macos-27
-    timeout-minutes: 10
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-6vcpu-macos-27' || 'macos-15' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 10 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -624,8 +639,8 @@ jobs:
     name: Release Smoke
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 15
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'pingdotgg/t3code' && 15 || 35 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -664,7 +679,7 @@ jobs:
         mobile_native_static_analysis,
         release_smoke,
       ]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Require every job to pass
