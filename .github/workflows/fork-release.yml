@@ -58,21 +58,25 @@ jobs:
         with:
           script: |
             const fs = require('node:fs');
-            const { resolveRelease, assertAllowedCommit, findReleaseByTag } = require('./trusted-policy/.github/scripts/fork-release.cjs');
+            const { resolveRelease, resolveSourceCommit, assertAllowedCommit, findReleaseByTag } = require('./trusted-policy/.github/scripts/fork-release.cjs');
             const metadata = resolveRelease({
               repository: process.env.GITHUB_REPOSITORY, eventName: context.eventName,
               ref: context.ref, runId: context.runId, date: new Date(),
               baseVersion: JSON.parse(fs.readFileSync('trusted-policy/apps/server/package.json', 'utf8')).version,
             });
+            const sha = await resolveSourceCommit({ github,
+              repository: process.env.GITHUB_REPOSITORY, eventName: context.eventName,
+              ref: context.ref, sha: context.sha,
+            });
             const branch = await assertAllowedCommit({ github,
-              repository: process.env.GITHUB_REPOSITORY, sha: context.sha,
+              repository: process.env.GITHUB_REPOSITORY, sha,
               branchCommits: JSON.parse(process.env.TRUSTED_BRANCH_COMMITS),
             });
             if (metadata.publish && await findReleaseByTag({ github,
               repository: process.env.GITHUB_REPOSITORY, tag: metadata.tag,
             })) throw new Error('This release or draft already exists. Use a fresh version.');
-            for (const [key, value] of Object.entries({ ...metadata, sha: context.sha })) core.setOutput(key, value);
-            await core.summary.addRaw(`Source: ${context.sha}\n\nVersion: ${metadata.version}\n\nAllowed branch: ${branch}\n\nPublish: ${metadata.publish}\n`).write();
+            for (const [key, value] of Object.entries({ ...metadata, sha })) core.setOutput(key, value);
+            await core.summary.addRaw(`Source: ${sha}\n\nVersion: ${metadata.version}\n\nAllowed branch: ${branch}\n\nPublish: ${metadata.publish}\n`).write();
 
   checks:
     name: Full CI
@@ -420,6 +424,8 @@ jobs:
     needs: [prepare, checks, build, windows, android_sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      linux_sha256: ${{ steps.distribution.outputs.linux_sha256 }}
     permissions:
       contents: write
     steps:
@@ -436,6 +442,7 @@ jobs:
           pattern: fork-*-*
           path: artifacts
       - name: Combine unique assets and record provenance
+        id: distribution
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
@@ -458,6 +465,10 @@ jobs:
             signing: 'Desktop and Windows CLI unsigned; macOS CLI ad hoc; Android signed with persistent fork key (see ANDROID-SIGNING.json).',
           }, null, 2) + '\n');
           require('./.github/scripts/fork-release.cjs').writeChecksums('release-publish', process.env.VERSION);
+          const archive = `t3-${process.env.VERSION}-linux-x64.tar.gz`;
+          const checksum = require('node:crypto').createHash('sha256')
+            .update(fs.readFileSync(`release-publish/${archive}`)).digest('hex');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `linux_sha256=${checksum}\n`);
           NODE
           (cd release-publish && sha256sum -c SHA256SUMS)
       - name: Upload complete build-only distribution
@@ -496,3 +507,44 @@ jobs:
               directory: 'release-publish', body,
             });
             await core.summary.addLink('Published fork release', url).write();
+
+  deploy:
+    name: Deploy verified T3 runtime to Tencent server
+    needs: [prepare, checks, release]
+    if: github.repository == 'Royean/t3code' && github.event_name == 'push' && needs.prepare.outputs.publish == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # No repository checkout: only this run's checked and published archive is
+      # passed to the server's separately installed, restricted deployment helper.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fork-linux-x64
+          path: deploy-artifact
+      - name: Verify archive and send through restricted SSH command
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.linux_sha256 }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$DEPLOY_USER" != root ]]
+          test -n "$DEPLOY_SSH_KEY" && test -n "$DEPLOY_KNOWN_HOSTS"
+          archive="deploy-artifact/t3-$VERSION-linux-x64.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum -c -
+          key="$RUNNER_TEMP/t3-deploy-key"
+          known_hosts="$RUNNER_TEMP/t3-deploy-known-hosts"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > "$key" && printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$known_hosts")
+          chmod 600 "$key" "$known_hosts"
+          ssh -T -i "$key" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            -- "$DEPLOY_USER@$DEPLOY_HOST" "t3code $RELEASE_TAG $SOURCE_SHA $EXPECTED_SHA256" < "$archive"
