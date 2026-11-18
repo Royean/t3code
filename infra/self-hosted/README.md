@@ -25,7 +25,7 @@ Create a private configuration outside the checkout, owned by the service user w
       "credential": "REPLACE_WITH_PRIVATE_ENVIRONMENT_BEARER"
     }
   ],
-  "allowedOrigins": ["https://app.example.com"]
+  "allowedOrigins": ["https://app.example.com", "t3code://app", "t3code-dev://app"]
 }
 ```
 
@@ -44,7 +44,7 @@ The password must contain at least 12 characters and at most 1024 bytes. Copy th
 node dist/bin.mjs --config /etc/t3-connect/config.json
 ```
 
-Put an HTTPS reverse proxy in front of the loopback listener. Add every browser app origin to `allowedOrigins`; native requests without an Origin header are accepted. The service does not trust forwarded headers for login limits, so a reverse proxy shares the conservative five-attempts-per-minute budget. Avoid logging request bodies or Authorization headers in the proxy.
+Put an HTTPS reverse proxy in front of the loopback listener. Add every browser app origin to `allowedOrigins`, plus `t3code://app` for desktop releases and `t3code-dev://app` for desktop development builds; native requests without an Origin header are accepted. Only these exact desktop custom origins are supported. The service does not trust forwarded headers for login limits, so a reverse proxy shares the conservative five-attempts-per-minute budget. Avoid logging request bodies or Authorization headers in the proxy.
 
 Optional settings are `requestTimeoutMs` (default 5000, range 100–30000), `accessTokenTtlSeconds` (default 900, range 60–3600), and `refreshTokenTtlSeconds` (default 2592000, range 60–7776000). Refresh tokens rotate without extending the original expiry. Reusing a consumed refresh token revokes its entire session family; logout also revokes the family. SQLite stores only SHA-256 token hashes. Restarting preserves sessions.
 

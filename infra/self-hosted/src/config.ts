@@ -61,6 +61,13 @@ function normalizeOrigin(value: string, allowLoopback: boolean): string {
   return url.origin;
 }
 
+function normalizeCorsOrigin(value: string): string {
+  // Electron registers these exact secure, standard origins for the desktop app.
+  // URL.origin is "null" for custom schemes outside Electron, so preserve them explicitly.
+  if (/^t3code(?:-dev)?:\/\/app\/?$/.test(value)) return value.replace(/\/$/, "");
+  return normalizeOrigin(value, true);
+}
+
 export function decodeConfig(input: unknown): SelfHostedConfig {
   const config = decodeSelfHostedConfig(input);
   if (!NodePath.isAbsolute(config.databasePath) || !isPasswordHash(config.account.passwordHash)) {
@@ -81,7 +88,7 @@ export function decodeConfig(input: unknown): SelfHostedConfig {
   return {
     ...config,
     environments,
-    allowedOrigins: (config.allowedOrigins ?? []).map((origin) => normalizeOrigin(origin, true)),
+    allowedOrigins: (config.allowedOrigins ?? []).map(normalizeCorsOrigin),
   };
 }
 

@@ -28,7 +28,7 @@ const config: SelfHostedConfig = {
       credential: "private-environment-credential",
     },
   ],
-  allowedOrigins: ["https://app.example.com"],
+  allowedOrigins: ["https://app.example.com", "t3code://app", "t3code-dev://app"],
 };
 
 it.live(
@@ -89,6 +89,15 @@ it.live(
         expect(preflight.headers.get("access-control-allow-origin")).toBe(
           "https://app.example.com",
         );
+        for (const desktopOrigin of ["t3code://app", "t3code-dev://app"]) {
+          // @effect-diagnostics-next-line globalFetchInEffect:off -- Electron sends its registered custom origin on account API requests.
+          const desktopPreflight = await fetch(origin, {
+            method: "OPTIONS",
+            headers: { Origin: desktopOrigin },
+          });
+          expect(desktopPreflight.status).toBe(204);
+          expect(desktopPreflight.headers.get("access-control-allow-origin")).toBe(desktopOrigin);
+        }
         const client = createSelfHostedConnectClient({ serverUrl: origin });
         const session = await client.login("owner", "test-password-123");
         expect(
