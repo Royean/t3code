@@ -14,6 +14,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
+import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import { Argument, Command, Flag } from "effect/cli";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
@@ -377,7 +378,21 @@ export const installedBinary = Effect.fn("installedBinary")(function* (
       yield* run("xcrun", ["simctl", "get_app_container", device, bundleId, "app"]),
     );
   }
-  const installed = yield* run("adb", ["-s", device, "shell", "pm", "list", "packages", bundleId]);
+  const installed = yield* run("adb", [
+    "-s",
+    device,
+    "shell",
+    "pm",
+    "list",
+    "packages",
+    bundleId,
+  ]).pipe(
+    Effect.retry({
+      times: 24,
+      schedule: Schedule.spaced("5 seconds"),
+      while: (error) => error.message.includes("Can't find service: package"),
+    }),
+  );
   if (!installed.split("\n").some((line) => line.trim() === `package:${bundleId}`)) return null;
   const packages = yield* run("adb", ["-s", device, "shell", "pm", "path", bundleId]);
   const apks = packages

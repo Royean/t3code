@@ -1,19 +1,75 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   androidSdk,
   buildRunTitle,
+  installedBinary,
   NativeClientError,
   prebuildAndroid,
   remoteBuildState,
 } from "./mobile-native-client.ts";
 
 const caches = [".gradle/history", "app/.cxx/object"];
+
+it.effect("waits for Android's package service during cold boot", () =>
+  Effect.gen(function* () {
+    let attempts = 0;
+    const run = () =>
+      Effect.suspend(() =>
+        ++attempts < 3
+          ? Effect.fail(new NativeClientError({ message: "cmd: Can't find service: package" }))
+          : Effect.succeed(""),
+      );
+    const fiber = yield* installedBinary("android", "emulator-5554", run).pipe(Effect.forkChild);
+    yield* TestClock.adjust("10 seconds");
+    assert.strictEqual(yield* Fiber.join(fiber), null);
+    assert.strictEqual(attempts, 3);
+  }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layerDigest])),
+);
+
+it.effect("stops waiting when Android's package service never starts", () =>
+  Effect.gen(function* () {
+    let attempts = 0;
+    const failure = new NativeClientError({ message: "cmd: Can't find service: package" });
+    const run = () =>
+      Effect.suspend(() => {
+        attempts++;
+        return Effect.fail(failure);
+      });
+    const fiber = yield* installedBinary("android", "emulator-5554", run).pipe(
+      Effect.flip,
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust("2 minutes");
+    assert.strictEqual(yield* Fiber.join(fiber), failure);
+    assert.strictEqual(attempts, 25);
+  }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layerDigest])),
+);
+
+it.effect("returns other Android installation errors immediately", () =>
+  Effect.gen(function* () {
+    let attempts = 0;
+    const failure = new NativeClientError({ message: "adb: device unauthorized" });
+    const run = () =>
+      Effect.suspend(() => {
+        attempts++;
+        return Effect.fail(failure);
+      });
+    assert.strictEqual(
+      yield* installedBinary("android", "emulator-5554", run).pipe(Effect.flip),
+      failure,
+    );
+    assert.strictEqual(attempts, 1);
+  }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layerDigest])),
+);
 
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
