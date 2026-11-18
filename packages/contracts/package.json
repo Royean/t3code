@@ -18,6 +18,10 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./self-hosted-connect": {
+      "types": "./src/selfHostedConnect.ts",
+      "import": "./src/selfHostedConnect.ts"
     }
   },
   "scripts": {

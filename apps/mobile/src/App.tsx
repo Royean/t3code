@@ -109,6 +109,7 @@ import {
 import { pruneNewTaskFlowStates } from "./features/threads/new-task-flow-state";
 import { pruneNewTaskBranchCheckouts } from "./features/threads/NewTaskDraftRouteScreen";
 import { installAppUpdateChecks } from "./features/updates/app-updates";
+import { selfHostedSession } from "./features/connection/selfHostedConnection";
 
 import "../global.css";
 
@@ -118,6 +119,7 @@ if (process.env.EXPO_PUBLIC_SHOWCASE === "1") {
 
 void SplashScreen.preventAutoHideAsync().catch(() => {});
 void hydrateWorkspaceSelections();
+void selfHostedSession.restore();
 
 const linkingConfig = {
   initialRouteName: "Home",

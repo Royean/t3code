@@ -29,6 +29,7 @@ import { useRemoteConnections } from "../../state/use-remote-environment-registr
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
 import { CloudEnvironmentRows } from "./CloudEnvironmentRows";
+import { SelfHostedConnectSection } from "./SelfHostedConnectSection";
 import { autoConnectReport, devAutoConnectAttemptAtom } from "./devAutoConnect";
 import { splitEnvironmentSections } from "./environmentSections";
 import { leaveSettingsPage } from "../settings/settings-navigation";
@@ -186,6 +187,14 @@ function PairingForm({
     }
   };
 
+  const handleSelfHostedConnected = () => {
+    if (!navigation.canGoBack()) {
+      navigation.dispatch(StackActions.replace("Home"));
+    } else {
+      leaveSettingsPage(navigation, workspaceHasColumns(), "SettingsEnvironments");
+    }
+  };
+
   return (
     <SettingsScreen
       title={gt("Add environment")}
@@ -270,6 +279,7 @@ function PairingForm({
           </View>
 
           {hasCloudPublicConfig() ? <T3ConnectSection /> : null}
+          <SelfHostedConnectSection onConnected={handleSelfHostedConnected} />
         </View>
       </ScrollView>
     </SettingsScreen>
