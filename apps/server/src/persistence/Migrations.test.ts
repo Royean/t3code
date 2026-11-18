@@ -8,6 +8,8 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { migrationManifest, runMigrations } from "./Migrations.ts";
+import EventOrchestrationMigration from "./ForkMigrations/001_EventOrchestration.ts";
+import { hasPendingForkMigrations } from "./ForkMigrations.ts";
 
 const v2Migrations = migrationManifest.filter(([id]) => id >= 55);
 const newerMigrationId = Math.max(...migrationManifest.map(([id]) => id)) + 1;
@@ -29,6 +31,47 @@ const v2TableCount = Effect.gen(function* () {
 });
 
 describe("runMigrations", () => {
+  it.effect(
+    "upgrades released fork migration 96 without losing event tasks or skipping upstream",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations({ toMigrationInclusive: 95 });
+        yield* EventOrchestrationMigration;
+        yield* sql`INSERT INTO effect_sql_migrations (migration_id, name)
+        VALUES (96, 'EventOrchestration')`;
+        yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json)
+        VALUES (1, '{"preserved":true}')`;
+
+        assert.isTrue(yield* hasPendingForkMigrations);
+        assert.deepStrictEqual(
+          yield* runMigrations(),
+          migrationManifest.filter(([id]) => id >= 96),
+        );
+        assert.deepStrictEqual(yield* history, migrationManifest);
+        const registry = yield* sql`SELECT snapshot_json FROM event_orchestration_registry`;
+        assert.deepStrictEqual(registry, [{ snapshot_json: '{"preserved":true}' }]);
+        const forkHistory = yield* sql`SELECT migration_id, name FROM t3_fork_migrations`;
+        assert.deepStrictEqual(forkHistory, [{ migration_id: 1, name: "EventOrchestration" }]);
+        assert.isFalse(yield* hasPendingForkMigrations);
+        assert.deepStrictEqual(yield* runMigrations(), []);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("adds fork tables to an upstream database without changing its migration ledger", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 98 });
+      assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.isTrue(yield* hasPendingForkMigrations);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json) VALUES (1, '{}')`;
+      assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.isFalse(yield* hasPendingForkMigrations);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("refuses to start when another migration took a V2 id", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -69,12 +112,18 @@ describe("runMigrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("upgrades a database at exactly 54", () =>
+  it.effect("upgrades a database at exactly 54, then rechecks it without a write lock", () =>
     Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 54 });
       assert.deepStrictEqual(yield* runMigrations(), v2Migrations);
       assert.deepStrictEqual(yield* history, migrationManifest);
       assert.isAbove(yield* v2TableCount, 0);
+
+      // query_only rejects BEGIN IMMEDIATE, which CLI startup would otherwise take on the live database.
+      yield* sql`PRAGMA query_only = ON`;
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* history, migrationManifest);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 

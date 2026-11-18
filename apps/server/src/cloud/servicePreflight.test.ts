@@ -67,6 +67,15 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
       expect(preflight().status).toBe("ready");
       expect(databaseMigrationHead(databasePath)).toBe(BUILD_MIGRATION_HEAD);
 
+      db.exec("DELETE FROM effect_sql_migrations WHERE migration_id >= 96");
+      insert.run(96, "EventOrchestration");
+      expect(preflight().status).toBe("ready");
+      expect(
+        db.prepare("SELECT name FROM effect_sql_migrations WHERE migration_id = 96").get(),
+      ).toMatchObject({ name: "EventOrchestration" });
+      db.exec("DELETE FROM effect_sql_migrations WHERE migration_id = 96");
+      for (const [id, name] of migrationManifest.filter(([id]) => id >= 96)) insert.run(id, name);
+
       db.prepare("UPDATE effect_sql_migrations SET name = ? WHERE migration_id = ?").run(
         "ForkMigration",
         BUILD_MIGRATION_HEAD,
