@@ -246,6 +246,15 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeServerConfig]: "server",
   [WS_METHODS.subscribeServerLifecycle]: "server",
   [WS_METHODS.subscribeAuthAccess]: "auth",
+  [WS_METHODS.alwaysOnSubscribe]: "alwaysOn",
+  [WS_METHODS.alwaysOnCreate]: "alwaysOn",
+  [WS_METHODS.alwaysOnSetEnabled]: "alwaysOn",
+  [WS_METHODS.alwaysOnSubmitEvent]: "alwaysOn",
+  [WS_METHODS.alwaysOnGet]: "alwaysOn",
+  [WS_METHODS.alwaysOnReadMemory]: "alwaysOn",
+  [WS_METHODS.alwaysOnResolveApproval]: "alwaysOn",
+  [WS_METHODS.alwaysOnConfirmUnknown]: "alwaysOn",
+  [WS_METHODS.alwaysOnCancel]: "alwaysOn",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

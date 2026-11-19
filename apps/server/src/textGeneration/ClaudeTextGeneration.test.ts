@@ -210,6 +210,29 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
       ),
   );
 
+  it.effect("always-on transcription completion sends an empty tool list", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({
+          structured_output: { transcription: '{"summary":"quiet","actions":[]}' },
+        }),
+        stdinMustContain: "Stay quiet",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.generateTranscriptionPostProcessing({
+            cwd: process.cwd(),
+            prompt: "Stay quiet",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(generated.transcription).toBe('{"summary":"quiet","actions":[]}');
+        }),
+    ),
+  );
+
   it.effect("sends thread title instructions to the provider prompt", () =>
     withFakeClaudeEnv(
       {

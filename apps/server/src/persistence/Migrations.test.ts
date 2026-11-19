@@ -51,8 +51,14 @@ describe("runMigrations", () => {
         assert.deepStrictEqual(yield* history, migrationManifest);
         const registry = yield* sql`SELECT snapshot_json FROM event_orchestration_registry`;
         assert.deepStrictEqual(registry, [{ snapshot_json: '{"preserved":true}' }]);
-        const forkHistory = yield* sql`SELECT migration_id, name FROM t3_fork_migrations`;
-        assert.deepStrictEqual(forkHistory, [{ migration_id: 1, name: "EventOrchestration" }]);
+        const forkHistory =
+          yield* sql`SELECT migration_id, name FROM t3_fork_migrations ORDER BY migration_id`;
+        assert.deepStrictEqual(forkHistory, [
+          { migration_id: 1, name: "EventOrchestration" },
+          { migration_id: 2, name: "AlwaysOn" },
+        ]);
+        const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
+        assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
         assert.isFalse(yield* hasPendingForkMigrations);
         assert.deepStrictEqual(yield* runMigrations(), []);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
@@ -66,9 +72,59 @@ describe("runMigrations", () => {
       assert.isTrue(yield* hasPendingForkMigrations);
       assert.deepStrictEqual(yield* runMigrations(), []);
       yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json) VALUES (1, '{}')`;
+      const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
+      assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
       assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE name = 'AlwaysOn'`,
+        [],
+      );
       assert.isFalse(yield* hasPendingForkMigrations);
       assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("adds always-on beside an existing event-orchestration migration", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`UPDATE event_orchestration_registry SET snapshot_json = '{"kept":true}'
+        WHERE id = 1`;
+      yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json)
+        SELECT 1, '{"kept":true}' WHERE NOT EXISTS (
+          SELECT 1 FROM event_orchestration_registry WHERE id = 1
+        )`;
+      yield* sql`DELETE FROM t3_fork_migrations WHERE migration_id = 2`;
+      for (const name of [
+        "always_on_delivery",
+        "always_on_outbox",
+        "always_on_approval",
+        "always_on_timer",
+        "always_on_memory",
+        "always_on_effect",
+        "always_on_run",
+        "always_on_inbox",
+        "always_on_session",
+        "always_on_agent",
+      ]) {
+        yield* sql`DROP TABLE ${sql(name)}`;
+      }
+      assert.isTrue(yield* hasPendingForkMigrations);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* sql`SELECT snapshot_json FROM event_orchestration_registry`, [
+        { snapshot_json: '{"kept":true}' },
+      ]);
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id, name FROM t3_fork_migrations ORDER BY migration_id`,
+        [
+          { migration_id: 1, name: "EventOrchestration" },
+          { migration_id: 2, name: "AlwaysOn" },
+        ],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`,
+        [{ name: "always_on_agent" }],
+      );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 

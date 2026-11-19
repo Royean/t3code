@@ -19,6 +19,8 @@ Use a dedicated key and account. Restrict its authorized key to the chosen loopb
 
 Generate the account service's environment credential with the environment's existing `auth session issue` command. Store it only in the private service configuration, with the configured expiry recorded for renewal. It must grant `AuthStandardClientScopes` to delegate ordinary clients. Account logout revokes the account session and removes that account's saved environments from the current client; environment session revocation remains an environment operation.
 
+The account service contacts an environment only to read `/.well-known/t3/environment` and to ask `/api/auth/pairing-token` for a one-time link. Always-on agents, memory, timers, and provider credentials stay in that environment's database. The directory cannot read or run them, and a directory session is not an environment session. A client uses always-on only after pairing, under `orchestration:read` or `orchestration:operate` on that environment. Official T3 Connect is a separate sign-in and is not replaced by this directory.
+
 ## Verify before exposing a real workspace
 
 Run a pilot T3 server with an explicit, separate home directory. A development server must not use the live `~/.t3/userdata` database. The [mobile testing workflow](../../.agents/skills/test-t3-mobile/SKILL.md) describes native-client installation and isolated fixtures.

@@ -1578,6 +1578,14 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:scheduled-tasks:live",
       tag: WS_METHODS.scheduledTasksSubscribe,
     }),
+    alwaysOnLive: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:always-on:live",
+      tag: WS_METHODS.alwaysOnSubscribe,
+    }),
+    alwaysOnDetail: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:always-on:detail",
+      tag: WS_METHODS.alwaysOnGet,
+    }),
     // A cold transcript scan is measured in seconds, so keep the result around
     // long enough that switching windows or re-rendering does not rescan. With
     // nothing to show yet, the server's last scan answers first, then a plain
@@ -1864,6 +1872,38 @@ export function createServerEnvironmentAtoms<R, E>(
     runScheduledTaskNow: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:scheduled-task:run-now",
       tag: WS_METHODS.scheduledTasksRunNow,
+    }),
+    createAlwaysOnAgent: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:create",
+      tag: WS_METHODS.alwaysOnCreate,
+      scheduler: configScheduler,
+      concurrency: configConcurrency,
+    }),
+    setAlwaysOnEnabled: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:set-enabled",
+      tag: WS_METHODS.alwaysOnSetEnabled,
+      scheduler: configScheduler,
+      concurrency: configConcurrency,
+    }),
+    submitAlwaysOnEvent: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:submit-event",
+      tag: WS_METHODS.alwaysOnSubmitEvent,
+    }),
+    readAlwaysOnMemory: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:read-memory",
+      tag: WS_METHODS.alwaysOnReadMemory,
+    }),
+    resolveAlwaysOnApproval: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:resolve-approval",
+      tag: WS_METHODS.alwaysOnResolveApproval,
+    }),
+    confirmAlwaysOnUnknown: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:confirm-unknown",
+      tag: WS_METHODS.alwaysOnConfirmUnknown,
+    }),
+    cancelAlwaysOnRun: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:always-on:cancel",
+      tag: WS_METHODS.alwaysOnCancel,
     }),
     rotateScheduledTaskWebhookToken: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:scheduled-task:rotate-webhook-token",

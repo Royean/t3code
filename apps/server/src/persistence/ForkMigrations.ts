@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import AlwaysOn from "./ForkMigrations/002_AlwaysOn.ts";
 import EventOrchestration from "./ForkMigrations/001_EventOrchestration.ts";
 
 const TABLE = "t3_fork_migrations";
@@ -29,15 +30,20 @@ export const hasPendingForkMigrations = Effect.gen(function* () {
   const tables = yield* sql`SELECT name FROM sqlite_master
     WHERE type = 'table' AND name = ${TABLE}`;
   if (tables.length === 0) return true;
-  const rows = yield* sql`SELECT 1 FROM ${sql(TABLE)}
-    WHERE migration_id = 1 AND name = 'EventOrchestration'`;
-  return rows.length === 0;
+  const rows = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+    SELECT migration_id, name FROM ${sql(TABLE)}
+  `;
+  const applied = new Set(rows.map((row) => `${row.migration_id}:${row.name}`));
+  return !applied.has("1:EventOrchestration") || !applied.has("2:AlwaysOn");
 });
 
 export const runForkMigrations = () =>
   run({
     table: TABLE,
-    loader: Migrator.fromRecord({ "1_EventOrchestration": EventOrchestration }),
+    loader: Migrator.fromRecord({
+      "1_EventOrchestration": EventOrchestration,
+      "2_AlwaysOn": AlwaysOn,
+    }),
   });
 
 // Released forks used upstream's id 96. Move only that exact record, preserving its tables and data.

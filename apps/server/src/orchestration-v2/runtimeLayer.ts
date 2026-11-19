@@ -11,6 +11,7 @@ import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as McpAppRequests from "../mcpApps/McpAppRequests.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import * as TextGenerators from "../textGeneration/TextGenerators.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
@@ -57,6 +58,8 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as AlwaysOnModel from "../alwaysOn/AlwaysOnModel.ts";
+import * as AlwaysOnService from "../alwaysOn/AlwaysOnService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -407,6 +410,9 @@ export const layerProduction = Layer.mergeAll(
   layerThreadLaunchProvided,
   layerScheduledTaskProvided,
   layerEventOrchestrationProvided,
+  AlwaysOnService.layer.pipe(
+    Layer.provide(AlwaysOnModel.layer.pipe(Layer.provide(TextGenerators.layer))),
+  ),
   layerScratchThreadPromotionProvided,
   layerSecretRequestsProvided,
   GuestShareService.layer.pipe(
