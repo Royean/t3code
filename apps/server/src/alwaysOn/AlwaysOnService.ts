@@ -151,9 +151,8 @@ const phaseFor = (
   now: string,
 ): AlwaysOnPhase => {
   if (needsConfirmation) return "needs_confirmation";
-  if (!enabled) return "paused";
   if (leaseExpiresAt !== null && leaseExpiresAt > now) return "running";
-  return "sleeping";
+  return enabled ? "sleeping" : "paused";
 };
 
 export class AlwaysOnService extends Context.Service<
@@ -197,6 +196,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
   const deliverAttempt = yield* AlwaysOnDeliveryAttempt;
   const scope = yield* Effect.scope;
   const permit = yield* Semaphore.make(1);
+  const publicationPermit = yield* Semaphore.make(1);
   const revision = yield* Ref.make(0);
   const changes = yield* PubSub.unbounded<AlwaysOnSnapshot>();
 
@@ -245,16 +245,18 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
   const snapshot = Effect.gen(function* () {
     const now = yield* clock;
     return {
-      revision: yield* Ref.get(revision),
       agents: yield* listSummaries(now.iso),
       providers: ALWAYS_ON_PROVIDER_POLICY,
     };
   });
 
-  const publish = Effect.gen(function* () {
-    yield* Ref.update(revision, (current) => current + 1);
-    yield* PubSub.publish(changes, yield* snapshot);
-  });
+  const publish = publicationPermit.withPermits(1)(
+    Effect.gen(function* () {
+      const value = yield* snapshot;
+      const next = yield* Ref.updateAndGet(revision, (current) => current + 1);
+      yield* PubSub.publish(changes, { ...value, revision: next });
+    }),
+  );
 
   const requireAgent = Effect.fnUntraced(function* (agentId: AlwaysOnAgentId) {
     const [agent] = yield* sql<AgentRow>`SELECT * FROM always_on_agent WHERE agent_id = ${agentId}`;
@@ -338,6 +340,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         SELECT run_id, agent_id, uncertain, cancel_requested, decision_json
         FROM always_on_run WHERE status = 'running'
       `;
+    let recovered = false;
     for (const run of runs) {
       const [agent] = yield* sql<{
         readonly lease_expires_at: string | null;
@@ -346,6 +349,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
       const holds = agent?.lease_run_id === run.run_id;
       const expired = holds && (agent?.lease_expires_at ?? "") <= now.iso;
       if (!startup && !expired) continue;
+      recovered = true;
       const uncertainEffects = yield* sql`
           SELECT 1 FROM always_on_effect
           WHERE run_id = ${run.run_id} AND status = 'uncertain' LIMIT 1
@@ -376,6 +380,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
           `;
       }
     }
+    return recovered;
   });
 
   // A restarted process owns this database alone, so a leftover lease belongs to a dead process.
@@ -549,13 +554,6 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         WHERE agent_id = ${claimed.agentId} AND lease_run_id = ${claimed.runId}
       `;
     yield* gate.afterClaim;
-    const [cancel] = yield* sql<{ readonly cancel_requested: number }>`
-        SELECT cancel_requested FROM always_on_run WHERE run_id = ${claimed.runId}
-      `;
-    if (cancel?.cancel_requested === 1) {
-      yield* finishRun(claimed.runId, claimed.agentId, "cancelled", null, now.iso);
-      return;
-    }
     const context = yield* loadContext(claimed.agentId);
     const prompt = alwaysOnPrompt({
       instructions: context.instructions,
@@ -568,41 +566,49 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
     yield* Ref.update(cancelSignals, (current) =>
       new Map(current).set(claimed.runId, cancelSignal),
     );
-    const decided = yield* model
-      .decide({
+    const cancellation = "The run was cancelled.";
+    const decided = yield* Effect.gen(function* () {
+      const [run] = yield* sql<{ readonly cancel_requested: number }>`
+          SELECT cancel_requested FROM always_on_run WHERE run_id = ${claimed.runId}
+        `;
+      if (run?.cancel_requested === 1) {
+        return yield* new AlwaysOnModel.AlwaysOnModelError({ detail: cancellation });
+      }
+      return yield* model.decide({
         providerKind: claimed.providerKind,
         instanceId: claimed.instanceId,
         model: claimed.model,
         prompt,
-      })
-      .pipe(
-        Effect.timeoutOrElse({
-          duration: MODEL_TIMEOUT,
-          orElse: () =>
-            Effect.fail(new AlwaysOnModel.AlwaysOnModelError({ detail: "The model timed out." })),
-        }),
-        Effect.raceFirst(
-          Deferred.await(cancelSignal).pipe(
-            Effect.andThen(
-              Effect.fail(
-                new AlwaysOnModel.AlwaysOnModelError({ detail: "The run was cancelled." }),
-              ),
-            ),
+      });
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: MODEL_TIMEOUT,
+        orElse: () =>
+          Effect.fail(new AlwaysOnModel.AlwaysOnModelError({ detail: "The model timed out." })),
+      }),
+      Effect.raceFirst(
+        Deferred.await(cancelSignal).pipe(
+          Effect.andThen(
+            Effect.fail(new AlwaysOnModel.AlwaysOnModelError({ detail: cancellation })),
           ),
         ),
-        Effect.ensuring(
-          Ref.update(cancelSignals, (current) => {
-            const next = new Map(current);
-            next.delete(claimed.runId);
-            return next;
-          }),
-        ),
-        Effect.exit,
-      );
+      ),
+      Effect.ensuring(
+        Ref.update(cancelSignals, (current) => {
+          const next = new Map(current);
+          next.delete(claimed.runId);
+          return next;
+        }),
+      ),
+      Effect.exit,
+    );
     if (decided._tag === "Failure") {
       const failed = Cause.findErrorOption(decided.cause);
-      const detail = Option.isSome(failed) ? failed.value.detail : "The model call failed.";
-      const interrupted = detail === "The run was cancelled.";
+      const detail =
+        Option.isSome(failed) && failed.value._tag === "AlwaysOnModelError"
+          ? failed.value.detail
+          : "The model call failed.";
+      const interrupted = detail === cancellation;
       yield* sql`
         UPDATE always_on_run SET model_error = ${detail} WHERE run_id = ${claimed.runId}
       `;
@@ -740,10 +746,15 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
               FROM always_on_inbox
               WHERE agent_id = ${agentId} AND status = 'pending'
               ORDER BY created_at, event_id
+              LIMIT ${MAX_BATCH}
             `;
           const batch = selectInboxBatch(
-            pending.map((row) => ({ ...row, relatedSessionId: row.related_session_id })),
-          ).slice(0, MAX_BATCH);
+            pending.map((row) => ({
+              ...row,
+              relatedSessionId: row.related_session_id,
+              text: row.body_text,
+            })),
+          );
           const first = batch[0];
           if (first === undefined) return yield* new ClaimAborted();
           let sessionId: string;
@@ -961,6 +972,9 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
       );
       if (claimed === null) continue;
       started = true;
+      yield* publish.pipe(
+        Effect.catch((cause) => Effect.logWarning("Always-on snapshot failed", { cause })),
+      );
       yield* applyRun(claimed).pipe(
         Effect.catch((cause) =>
           Effect.gen(function* () {
@@ -1097,8 +1111,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
   });
 
   const drainBody = Effect.gen(function* () {
-    yield* recover(false);
-    let worked = false;
+    let worked = yield* recover(false);
     for (let pass = 0; pass < MAX_PASSES; pass++) {
       const timers = yield* fireTimers();
       const resumed = yield* resumeStored();
@@ -1218,14 +1231,21 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         WHERE agent_id = ${input.agentId} AND kind = 'instruction'
         ORDER BY created_at LIMIT 1
       `;
-    const inbox = yield* sql<InboxRow>`
-        SELECT event_id, source, source_event_id, kind, status, session_policy, created_at,
-               related_session_id, body_text
-        FROM always_on_inbox
-        WHERE agent_id = ${input.agentId}
-        ORDER BY created_at DESC
-        LIMIT 50
+    const approvals = yield* sql<{
+      readonly approval_id: string;
+      readonly run_id: string;
+      readonly session_id: string;
+      readonly status: "pending" | "approved" | "rejected" | "cancelled";
+      readonly summary: string;
+      readonly created_at: string;
+    }>`
+        SELECT approval_id, run_id, session_id, status, summary, created_at
+        FROM always_on_approval WHERE agent_id = ${input.agentId}
+        ORDER BY (status = 'pending') DESC, created_at DESC, rowid DESC LIMIT 20
       `;
+    const pendingApprovalRuns = approvals
+      .filter((approval) => approval.status === "pending")
+      .map((approval) => approval.run_id);
     const runs = yield* sql<{
       readonly run_id: string;
       readonly session_id: string;
@@ -1243,8 +1263,42 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
     }>`
         SELECT * FROM always_on_run
         WHERE agent_id = ${input.agentId}
-        ORDER BY started_at DESC
-        LIMIT 20
+          AND (status IN ('running', 'unknown')
+            OR ${sql.in("run_id", pendingApprovalRuns)}
+            OR run_id IN (
+              SELECT run_id FROM always_on_run WHERE agent_id = ${input.agentId}
+              ORDER BY started_at DESC, rowid DESC LIMIT 20
+            ))
+        ORDER BY started_at, rowid
+      `;
+    const runEntries = runs.map((row) => ({
+      id: AlwaysOnRunId.make(row.run_id),
+      sessionId: AlwaysOnSessionId.make(row.session_id),
+      status: row.status,
+      outcome: row.outcome,
+      uncertain: row.uncertain === 1 || row.status === "unknown",
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      lastProgressAt: row.last_progress_at,
+      eventIds: stringArray(decodeJson(row.event_ids_json)).map((id) => AlwaysOnEventId.make(id)),
+      loadedContext: decodeStoredContext(row.context_json),
+      modelSummary: row.model_summary,
+      modelError: row.model_error,
+      executedActions: executedActions(decodeJson(row.executed_actions_json)),
+    }));
+    // A recovered event may be queued again with a different run_id.
+    const runEventIds = [...new Set(runEntries.flatMap((run) => run.eventIds))];
+    const inbox = yield* sql<InboxRow>`
+        SELECT event_id, source, source_event_id, kind, status, session_policy, created_at,
+               related_session_id, body_text
+        FROM always_on_inbox
+        WHERE agent_id = ${input.agentId}
+          AND (${sql.in("event_id", runEventIds)}
+            OR event_id IN (
+              SELECT event_id FROM always_on_inbox WHERE agent_id = ${input.agentId}
+              ORDER BY (status = 'pending') DESC, created_at DESC, rowid DESC LIMIT 50
+            ))
+        ORDER BY created_at, rowid
       `;
     const memory = yield* sql<{
       readonly memory_id: string;
@@ -1258,29 +1312,27 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         FROM always_on_memory WHERE agent_id = ${input.agentId}
         ORDER BY updated_at
       `;
-    const approvals = yield* sql<{
-      readonly approval_id: string;
-      readonly run_id: string;
-      readonly session_id: string;
-      readonly status: "pending" | "approved" | "rejected" | "cancelled";
-      readonly summary: string;
-      readonly created_at: string;
-    }>`
-        SELECT approval_id, run_id, session_id, status, summary, created_at
-        FROM always_on_approval WHERE agent_id = ${input.agentId}
-        ORDER BY (status = 'pending') DESC, created_at DESC, approval_id LIMIT 20
-      `;
     const deliveries = yield* sql<{
       readonly outbox_id: string;
+      readonly run_id: string;
       readonly session_id: string;
       readonly body: string;
       readonly status: "pending" | "delivered" | "failed";
       readonly attempts: number;
       readonly dedupe_key: string;
+      readonly created_at: string;
     }>`
-        SELECT outbox_id, session_id, body, status, attempts, dedupe_key
+        SELECT outbox_id, run_id, session_id, body, status, attempts, dedupe_key, created_at
         FROM always_on_outbox WHERE agent_id = ${input.agentId}
-        ORDER BY created_at DESC LIMIT 20
+          AND (${sql.in(
+            "run_id",
+            runs.map((run) => run.run_id),
+          )}
+            OR outbox_id IN (
+              SELECT outbox_id FROM always_on_outbox WHERE agent_id = ${input.agentId}
+              ORDER BY (status = 'pending') DESC, created_at DESC, rowid DESC LIMIT 20
+            ))
+        ORDER BY created_at, rowid
       `;
     const timers = yield* sql<{
       readonly timer_id: string;
@@ -1296,30 +1348,17 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
     return {
       agent,
       instructions: instruction?.body ?? "",
-      inbox: [...inbox].reverse().map((row) => ({
+      inbox: inbox.map((row) => ({
         id: AlwaysOnEventId.make(row.event_id),
         source: row.source,
         sourceEventId: row.source_event_id,
         kind: row.kind,
+        text: row.body_text,
         status: row.status,
         sessionPolicy: row.session_policy,
         createdAt: row.created_at,
       })),
-      runs: [...runs].reverse().map((row) => ({
-        id: AlwaysOnRunId.make(row.run_id),
-        sessionId: AlwaysOnSessionId.make(row.session_id),
-        status: row.status,
-        outcome: row.outcome,
-        uncertain: row.uncertain === 1 || row.status === "unknown",
-        startedAt: row.started_at,
-        finishedAt: row.finished_at,
-        lastProgressAt: row.last_progress_at,
-        eventIds: stringArray(decodeJson(row.event_ids_json)).map((id) => AlwaysOnEventId.make(id)),
-        loadedContext: decodeStoredContext(row.context_json),
-        modelSummary: row.model_summary,
-        modelError: row.model_error,
-        executedActions: executedActions(decodeJson(row.executed_actions_json)),
-      })),
+      runs: runEntries,
       memoryIndex: memory.map((row) => ({
         id: AlwaysOnMemoryId.make(row.memory_id),
         kind: row.kind,
@@ -1336,13 +1375,15 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         summary: row.summary,
         createdAt: row.created_at,
       })),
-      deliveries: [...deliveries].reverse().map((row) => ({
+      deliveries: deliveries.map((row) => ({
         id: row.outbox_id,
+        runId: AlwaysOnRunId.make(row.run_id),
         sessionId: AlwaysOnSessionId.make(row.session_id),
         body: row.body,
         status: row.status,
         attempts: row.attempts,
         dedupeKey: row.dedupe_key,
+        createdAt: row.created_at,
       })),
       timers: timers.map((row) => ({
         id: row.timer_id,
@@ -1499,11 +1540,18 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
         }),
       );
     } else if (run.status === "running") {
-      const signal = (yield* Ref.get(cancelSignals)).get(input.runId);
-      yield* sql`
+      const updated = yield* sql`
           UPDATE always_on_run SET cancel_requested = 1
           WHERE run_id = ${input.runId} AND status = 'running'
+          RETURNING run_id
         `;
+      if (updated.length === 0) {
+        return yield* new AlwaysOnError({
+          message: "This run can no longer be cancelled.",
+          reason: "conflict",
+        });
+      }
+      const signal = (yield* Ref.get(cancelSignals)).get(input.runId);
       if (signal !== undefined) yield* Deferred.succeed(signal, undefined);
     } else {
       return yield* new AlwaysOnError({
@@ -1517,11 +1565,13 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
 
   const subscribe = () =>
     Stream.unwrap(
-      Effect.gen(function* () {
-        const subscription = yield* PubSub.subscribe(changes);
-        const initial = yield* snapshot;
-        return Stream.concat(Stream.make(initial), Stream.fromSubscription(subscription));
-      }),
+      publicationPermit.withPermits(1)(
+        Effect.gen(function* () {
+          const subscription = yield* PubSub.subscribe(changes);
+          const initial = { ...(yield* snapshot), revision: yield* Ref.get(revision) };
+          return Stream.concat(Stream.make(initial), Stream.fromSubscription(subscription));
+        }),
+      ),
     );
 
   return AlwaysOnService.of({

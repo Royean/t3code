@@ -1,10 +1,11 @@
 import { uuidv4 } from "../../lib/uuid";
 import { ThreadUndoNotice } from "./ThreadUndoNotice";
-import { use } from "react";
+import { use, type ReactNode } from "react";
 import { NativePrimaryColumnContext } from "../../native/v5-workspace-context";
 import { useNavigation } from "@react-navigation/native";
 import { useMemo, useState } from "react";
-import { Platform } from "react-native";
+import { Platform, View } from "react-native";
+import { useAtomValue } from "@effect/atom-react";
 import { useGT, useMessages } from "gt-react-native";
 
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
@@ -41,8 +42,30 @@ import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspace
 import { WorkspaceListEmptyDetail } from "../layout/workspace/WorkspaceListEmptyDetail";
 import { WorkspaceListHeader } from "../layout/workspace/WorkspaceListHeader";
 import { buildHomeListFilterMenuItems, homeListFilterEnvironments } from "./home-list-filter-menu";
+import { AppText as Text } from "../../components/ui/AppText";
+import { AlwaysOnWorkspace } from "../always-on/AlwaysOnWorkspace";
+import { chatsWorkspaceTabAtom } from "../always-on/always-on-workspace-state";
 
 export function HomeRouteScreen() {
+  const gt = useGT();
+  const selected = useAtomValue(chatsWorkspaceTabAtom);
+  const nativePrimaryColumn = use(NativePrimaryColumnContext);
+  const { layout } = useAdaptiveWorkspaceLayout();
+  if (layout.usesSplitView && !nativePrimaryColumn) {
+    return selected === "alwaysOn" ? (
+      <View className="flex-1 items-center justify-center bg-screen px-6">
+        <Text className="text-center text-foreground-muted">
+          {gt("Choose an always-on agent.")}
+        </Text>
+      </View>
+    ) : (
+      <ThreadHomeRouteScreen />
+    );
+  }
+  return <AlwaysOnWorkspace renderThreads={(tabs) => <ThreadHomeRouteScreen tabs={tabs} />} />;
+}
+
+function ThreadHomeRouteScreen({ tabs }: { readonly tabs?: ReactNode }) {
   const gt = useGT();
   const m = useMessages();
   const nativePrimaryColumn = use(NativePrimaryColumnContext);
@@ -187,7 +210,7 @@ export function HomeRouteScreen() {
             ),
           }}
         />
-
+        {tabs}
         <HomeScreen
           catalogState={catalogState}
           environments={environments}

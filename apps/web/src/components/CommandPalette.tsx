@@ -70,6 +70,7 @@ import {
   FolderGit2Icon,
   FolderIcon,
   FolderPlusIcon,
+  InfinityIcon,
   MessageSquareDashedIcon,
   LinkIcon,
   MessageSquareIcon,
@@ -87,6 +88,7 @@ import {
 import { openThreadFind } from "./chat/threadFindStore";
 import { dispatchPreviewAction } from "./preview/previewActionBus";
 import { previewBridge } from "./preview/previewBridge";
+import { useNavigateToChatWorkspace } from "./sidebar/mainAppLocation";
 import {
   useDeferredValue,
   useEffect,
@@ -427,6 +429,7 @@ function OpenCommandPaletteDialog(props: {
   const gt = useGT();
   const messages = useMessages();
   const navigate = useNavigate();
+  const navigateToChatWorkspace = useNavigateToChatWorkspace();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { openChildSearch, setOpen } = props;
   // Keyed by palette session: the intent and restored search only seed this
@@ -1730,6 +1733,17 @@ function OpenCommandPaletteDialog(props: {
             ? paletteRouteTarget.threadRef.environmentId
             : null),
       );
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:always-on",
+    searchTerms: ["always on", "agents", "automations", "approvals"],
+    title: gt("Open Always On"),
+    icon: <InfinityIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigateToChatWorkspace("always-on");
     },
   });
 

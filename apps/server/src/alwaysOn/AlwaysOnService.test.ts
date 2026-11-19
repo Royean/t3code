@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { assert, expect, it } from "@effect/vitest";
 import { ProjectId, type AlwaysOnModelDecision } from "@t3tools/contracts";
@@ -95,11 +96,45 @@ it("rejects credential-shaped text and separates session batches", () => {
   expect(containsCredential({ text: "Check the inbox" })).toBe(false);
   expect(
     selectInboxBatch([
-      { kind: "user_reply", relatedSessionId: "session-1" },
-      { kind: "external", relatedSessionId: null },
+      { kind: "user_reply", relatedSessionId: "session-1", text: "Reply" },
+      { kind: "external", relatedSessionId: null, text: "Event" },
     ]).map((event) => event.kind),
   ).toEqual(["user_reply"]);
 });
+
+it.effect("processes queued messages in full even with long instructions", () =>
+  harness((service, _queue, prompts) =>
+    Effect.gen(function* () {
+      const { agent } = yield* service.create({
+        projectId,
+        title: "Build watcher",
+        instructions: "x".repeat(8_000),
+        providerKind: "textGenerator",
+        instanceId: "fixture-generator",
+        model: "fixture-model",
+      });
+      yield* service.setEnabled({ agentId: agent.id, enabled: false });
+      const messages = Array.from({ length: 3 }, (_, index) => "x".repeat(1_990) + `end-${index}`);
+      yield* Effect.forEach(messages, (text, index) =>
+        service.submitEvent({
+          agentId: agent.id,
+          source: "chats",
+          sourceEventId: `message-${index}`,
+          kind: "user_reply",
+          text,
+        }),
+      );
+      yield* service.setEnabled({ agentId: agent.id, enabled: true });
+      yield* service.drain();
+
+      const modelInputs = yield* Ref.get(prompts);
+      expect(modelInputs).toHaveLength(2);
+      for (const text of messages)
+        expect(modelInputs.some((prompt) => prompt.includes(text))).toBe(true);
+      expect(modelInputs.every((prompt) => prompt.length <= 8_000)).toBe(true);
+    }),
+  ),
+);
 
 it.effect("calls the model with memory, then runs only the decoded actions", () =>
   harness((service, queue, prompts) =>
@@ -142,7 +177,17 @@ it.effect("calls the model with memory, then runs only the decoded actions", () 
         "remember_note",
         "deliver",
       ]);
-      expect(detail.deliveries[0]?.body).toBe("Noted.");
+      expect(detail.inbox).toEqual([
+        expect.objectContaining({
+          id: submitted.eventId,
+          text: "Remember my role and tell me you did.",
+        }),
+      ]);
+      expect(detail.deliveries[0]).toMatchObject({
+        body: "Noted.",
+        runId: detail.runs[0]?.id,
+        createdAt: expect.any(String),
+      });
       expect((yield* Ref.get(prompts))[0]).toContain("Stay quiet unless asked.");
       expect((yield* Ref.get(prompts))[0]).toContain("Remember my role");
 
@@ -340,9 +385,33 @@ it.effect("keeps pending approvals visible after the recent history fills up", (
 
       const detail = yield* service.get({ agentId: agent.id });
       expect(detail.agent.pendingApprovalCount).toBe(1);
-      expect(
-        detail.approvals.filter((entry) => entry.status === "pending").map((entry) => entry.id),
-      ).toEqual([oldest]);
+      const pending = detail.approvals.filter((entry) => entry.status === "pending");
+      expect(pending.map((entry) => entry.id)).toEqual([oldest]);
+      expect(detail.runs.some((run) => run.id === pending[0]?.runId)).toBe(true);
+    }),
+  ),
+);
+
+it.effect("returns every event for the visible runs when batches exceed the inbox window", () =>
+  harness((service) =>
+    Effect.gen(function* () {
+      const { agent } = yield* createAgent(service);
+      const ids = yield* Effect.forEach(
+        Array.from({ length: 60 }, (_, index) => index),
+        (index) =>
+          service.submitEvent({
+            agentId: agent.id,
+            source: "fixture",
+            sourceEventId: `event-${index}`,
+            kind: "external",
+            text: `Event ${index}`,
+          }),
+      );
+      yield* service.drain();
+      const detail = yield* service.get({ agentId: agent.id });
+      const expected = new Set(ids.map(({ eventId }) => eventId));
+      expect(new Set(detail.runs.flatMap((run) => run.eventIds))).toEqual(expected);
+      expect(new Set(detail.inbox.map((event) => event.id))).toEqual(expected);
     }),
   ),
 );
@@ -411,6 +480,8 @@ it.effect("cancels a model call and pauses later dispatch", () =>
     yield* Effect.gen(function* () {
       const service = yield* AlwaysOnService.AlwaysOnService;
       const created = yield* createAgent(service);
+      const updates = yield* Stream.toPull(service.subscribe().pipe(Stream.rechunk(1)));
+      const [initial] = yield* updates;
       yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
@@ -418,29 +489,40 @@ it.effect("cancels a model call and pauses later dispatch", () =>
         kind: "external",
         text: "Work forever.",
       });
+      const [queued] = yield* updates;
+      expect(queued.agents[0]?.pendingInboxCount).toBe(1);
+      expect(queued.revision).toBeGreaterThan(initial.revision);
       const fiber = yield* Effect.forkChild(service.drain());
       yield* Deferred.await(entered);
+      const next = yield* service.submitEvent({
+        agentId: created.agent.id,
+        source: "user",
+        sourceEventId: "paused",
+        kind: "user_reply",
+        text: "This waits.",
+      });
+      const [started] = yield* updates;
+      expect(started.agents[0]).toMatchObject({ phase: "running", pendingInboxCount: 0 });
+      expect(started.revision).toBeGreaterThan(queued.revision);
+      const [nextQueued] = yield* updates;
+      expect(nextQueued.agents[0]).toMatchObject({ phase: "running", pendingInboxCount: 1 });
+      expect(nextQueued.revision).toBeGreaterThan(started.revision);
       const running = yield* service.get({ agentId: created.agent.id });
       const runId = running.runs[0]?.id;
       assert(runId !== undefined);
+      const paused = yield* service.setEnabled({ agentId: created.agent.id, enabled: false });
+      expect(paused).toMatchObject({ enabled: false, phase: "running" });
       yield* service.cancel({ agentId: created.agent.id, runId });
       yield* Fiber.join(fiber);
       const cancelled = yield* service.get({ agentId: created.agent.id });
       expect(cancelled.runs[0]?.status).toBe("cancelled");
       expect(cancelled.runs[0]?.executedActions).toEqual([]);
 
-      yield* service.setEnabled({ agentId: created.agent.id, enabled: false });
-      yield* service.submitEvent({
-        agentId: created.agent.id,
-        source: "user",
-        sourceEventId: "paused",
-        kind: "external",
+      expect(cancelled.agent.phase).toBe("paused");
+      expect(cancelled.inbox.find((event) => event.id === next.eventId)).toMatchObject({
+        status: "pending",
         text: "This waits.",
       });
-      yield* service.drain();
-      const paused = yield* service.get({ agentId: created.agent.id });
-      expect(paused.agent.phase).toBe("paused");
-      expect(paused.inbox.some((event) => event.status === "pending")).toBe(true);
     }).pipe(
       Effect.provide(
         AlwaysOnService.layerManual.pipe(Layer.provide(Layer.mergeAll(schedulerMock, model))),

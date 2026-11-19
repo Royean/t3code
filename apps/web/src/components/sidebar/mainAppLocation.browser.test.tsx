@@ -11,6 +11,7 @@ import {
 import {
   startMainAppLocationTracking,
   useCloseAppModal,
+  useNavigateToChatWorkspace,
   useNavigateToMainApp,
 } from "./mainAppLocation";
 
@@ -31,6 +32,7 @@ const citation: AssistantCitation = {
 function ReturnControls() {
   const closeAppModal = useCloseAppModal();
   const navigateToMainApp = useNavigateToMainApp();
+  const navigateToChatWorkspace = useNavigateToChatWorkspace();
   return (
     <>
       <button type="button" onClick={() => void closeAppModal()}>
@@ -38,6 +40,12 @@ function ReturnControls() {
       </button>
       <button type="button" onClick={() => void navigateToMainApp()}>
         Back to app
+      </button>
+      <button type="button" onClick={() => void navigateToChatWorkspace("threads")}>
+        Threads
+      </button>
+      <button type="button" onClick={() => void navigateToChatWorkspace("always-on")}>
+        Always On
       </button>
     </>
   );
@@ -52,6 +60,25 @@ async function settled(router: AnyRouter, navigation: Promise<void>) {
 }
 
 describe("main app return location", () => {
+  it("remembers the open conversation independently in both chat workspaces", async () => {
+    const agentHref = "/always-on?environment=environment-one&agent=agent-one";
+    await using screen = await render(<ReturnControls />, { router: THREAD_PATH });
+    const router = screen.router!;
+    using _tracking = { [Symbol.dispose]: startMainAppLocationTracking(router) };
+
+    await userEvent.click(screen.getByRole("button", { name: "Always On" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe("/always-on"));
+    await settled(router, router.navigate({ href: agentHref }));
+    await settled(router, router.navigate({ href: "/settings/always-on" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close modal" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe(agentHref));
+
+    await userEvent.click(screen.getByRole("button", { name: "Threads" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe(THREAD_PATH));
+    await userEvent.click(screen.getByRole("button", { name: "Always On" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe(agentHref));
+  });
+
   it("closes Usage without leaving the current document when the app started with history", async () => {
     await using screen = await render(<ReturnControls />, { router: "/" });
     const router = screen.router!;

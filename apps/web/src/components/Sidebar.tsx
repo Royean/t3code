@@ -906,7 +906,13 @@ function readRouteThreadKey(router: AnyRouter): string | null {
   return ref === null ? null : scopedThreadKey(ref);
 }
 
-export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReveal }) {
+export default function Sidebar({
+  routeReveal,
+  workspaceNavigation,
+}: {
+  routeReveal: SidebarRouteReveal;
+  workspaceNavigation?: ReactNode;
+}) {
   const gt = useGT();
   const messages = useMessages();
   const {
@@ -2978,6 +2984,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   return (
     <SidebarFolderDrop>
       <SidebarChromeHeader isElectron={isElectron} />
+      {workspaceNavigation}
       <SidebarContent
         ref={sidebarContentRef}
         className="min-h-full"

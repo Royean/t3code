@@ -252,6 +252,7 @@ export const AlwaysOnInboxEntry = Schema.Struct({
   source: Schema.String,
   sourceEventId: Schema.String,
   kind: AlwaysOnEventKind,
+  text: Schema.optional(Schema.String),
   status: Schema.Literals(["pending", "consumed", "cancelled"]),
   sessionPolicy: Schema.Literals(["continue", "fresh"]),
   createdAt: IsoDateTime,
@@ -299,11 +300,13 @@ export type AlwaysOnApprovalEntry = typeof AlwaysOnApprovalEntry.Type;
 
 export const AlwaysOnDeliveryEntry = Schema.Struct({
   id: Identifier,
+  runId: Schema.optional(AlwaysOnRunId),
   sessionId: AlwaysOnSessionId,
   body: Schema.String,
   status: Schema.Literals(["pending", "delivered", "failed"]),
   attempts: Schema.Int,
   dedupeKey: Schema.String,
+  createdAt: Schema.optional(IsoDateTime),
 });
 export type AlwaysOnDeliveryEntry = typeof AlwaysOnDeliveryEntry.Type;
 

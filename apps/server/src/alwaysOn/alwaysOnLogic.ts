@@ -15,35 +15,35 @@ export function containsCredential(value: unknown): boolean {
 export interface BatchEvent {
   readonly kind: AlwaysOnEventKind;
   readonly relatedSessionId: string | null;
+  readonly text: string;
 }
+
+const MAX_PROMPT_CHARS = 8_000;
+const MAX_BATCH_EVENT_CHARS = 4_500;
+
+const eventLine = (event: { readonly kind: string; readonly text: string }) =>
+  `- ${event.kind}: ${event.text}`;
 
 /** One run consumes one session affinity. Later events wait for the next run. */
 export function selectInboxBatch<E extends BatchEvent>(events: readonly E[]): readonly E[] {
   const first = events[0];
   if (first === undefined) return [];
   const batch: E[] = [];
-  if (first.kind === "user_reply") {
-    for (const event of events) {
-      if (event.kind !== "user_reply") break;
-      batch.push(event);
-    }
-    return batch;
-  }
-  if (first.kind === "approval") {
-    for (const event of events) {
-      if (event.kind !== "approval" || event.relatedSessionId !== first.relatedSessionId) break;
-      batch.push(event);
-    }
-    return batch;
-  }
+  let chars = 0;
   for (const event of events) {
-    if (event.kind === "user_reply" || event.kind === "approval") break;
+    const sameSession =
+      first.kind === "user_reply"
+        ? event.kind === "user_reply"
+        : first.kind === "approval"
+          ? event.kind === "approval" && event.relatedSessionId === first.relatedSessionId
+          : event.kind !== "user_reply" && event.kind !== "approval";
+    if (!sameSession) break;
+    chars += eventLine(event).length + 1;
+    if (batch.length > 0 && chars > MAX_BATCH_EVENT_CHARS) break;
     batch.push(event);
   }
   return batch;
 }
-
-const MAX_PROMPT_CHARS = 8_000;
 
 /**
  * Lean context for one model call. The allowed-type sentence only steers the reply.
@@ -56,7 +56,7 @@ export function alwaysOnPrompt(input: {
   readonly recentResults: readonly { readonly title: string; readonly body: string }[];
   readonly events: readonly { readonly kind: string; readonly text: string }[];
 }): string {
-  const lines = [
+  const context = [
     "Decide the next always-on actions. Reply with JSON {summary, actions}.",
     "Allowed action types: remember_note, record_progress, remember_result, set_timer, deliver, silent, request_approval, record_uncertain.",
     "Do not invent tools. Shell and network calls are not actions.",
@@ -67,11 +67,9 @@ export function alwaysOnPrompt(input: {
     ...input.progress.map((item) => `- ${item.taskKey ?? item.title}: ${item.title}`),
     "Recent results:",
     ...input.recentResults.map((result) => `- ${result.title}: ${result.body}`),
-    "Events:",
-    ...input.events.map((event) => `- ${event.kind}: ${event.text}`),
-  ];
-  const text = lines.join("\n");
-  return text.length <= MAX_PROMPT_CHARS ? text : text.slice(0, MAX_PROMPT_CHARS);
+  ].join("\n");
+  const events = ["Events:", ...input.events.map(eventLine)].join("\n");
+  return `${context.slice(0, Math.max(0, MAX_PROMPT_CHARS - events.length - 1))}\n${events}`;
 }
 
 /** Collapse missed recurrences into the next future due time and one inbox event. */

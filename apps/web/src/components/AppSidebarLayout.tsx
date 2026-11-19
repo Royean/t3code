@@ -41,8 +41,9 @@ import {
 import { BackgroundThreadAnnouncer } from "./BackgroundThreadAnnouncer";
 import { HistorySwipeNavigation } from "./HistorySwipeNavigation";
 import ThreadSidebar from "./Sidebar";
+import { AlwaysOnSidebar, ChatWorkspaceNavigation } from "./alwaysOn/AlwaysOnSidebar";
 import { SidebarBrandWidthProbe } from "./sidebar/SidebarChrome";
-import { isAppModalPage } from "./sidebar/mainAppLocation";
+import { isAlwaysOnWorkspace, isAppModalPage } from "./sidebar/mainAppLocation";
 import type { SidebarRouteReveal } from "./sidebar/routeReveal";
 import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import {
@@ -234,7 +235,10 @@ function registerThreadUndoCommands(
   router: AnyRouter,
   readSidebarVisible: () => boolean,
 ): () => void {
-  const threadSidebarShown = () => !isAppModalPage(router.state.location.pathname);
+  const threadSidebarShown = () => {
+    const { pathname } = router.state.location;
+    return !isAppModalPage(pathname) && !isAlwaysOnWorkspace(pathname);
+  };
   const unregister = registerCommands(
     {},
     {
@@ -422,7 +426,6 @@ export function AppSidebarLayout({
   showSidebar?: boolean;
 }) {
   const gt = useGT();
-  const sidebarArea = workspaceAreaProps("sidebar", 0, gt("Threads"));
   const [sidebarRouteReveal] = useState<SidebarRouteReveal>(() => ({
     observedKey: null,
     pendingKey: null,
@@ -430,6 +433,9 @@ export function AppSidebarLayout({
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
   const pathname = useLocation({ select: (location) => location.pathname });
+  const alwaysOnOpen = isAlwaysOnWorkspace(pathname);
+  const sidebarLabel = alwaysOnOpen ? gt("Always On") : gt("Threads");
+  const sidebarArea = workspaceAreaProps("sidebar", 0, sidebarLabel);
   const panelAnimationsSuppressed = usePanelNavigationSuppression(pathname);
   const routePanelAnimationsActive = panelAnimationsActive && !panelAnimationsSuppressed;
   const isMacosDesktop = isElectron && isMacPlatform(navigator.platform);
@@ -479,7 +485,7 @@ export function AppSidebarLayout({
               data-app-sidebar=""
               {...sidebarArea}
               role="navigation"
-              aria-label={gt("Threads")}
+              aria-label={sidebarLabel}
               resizable={{
                 maxWidth: sidebarMaximumWidth,
                 minWidth: sidebarMinimumWidth,
@@ -491,7 +497,14 @@ export function AppSidebarLayout({
               }}
               style={windowControlsInsetStyle}
             >
-              <ThreadSidebar routeReveal={sidebarRouteReveal} />
+              {alwaysOnOpen ? (
+                <AlwaysOnSidebar />
+              ) : (
+                <ThreadSidebar
+                  routeReveal={sidebarRouteReveal}
+                  workspaceNavigation={<ChatWorkspaceNavigation selected="threads" />}
+                />
+              )}
               <SidebarRail onDoubleClick={resetSidebarWidth} />
             </Sidebar>
           </>

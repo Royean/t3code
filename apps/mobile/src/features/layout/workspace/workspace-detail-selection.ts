@@ -13,6 +13,7 @@ type RootParams = ReactNavigation.RootParamList;
 /** A page the workspace's detail column shows on its own: what a list row selects. */
 export type WorkspaceDetail =
   | { readonly name: "Thread"; readonly params: RootParams["Thread"] }
+  | { readonly name: "AlwaysOnConversation"; readonly params: RootParams["AlwaysOnConversation"] }
   | { readonly name: "PullRequest"; readonly params: RootParams["PullRequest"] }
   | { readonly name: "Issue"; readonly params: RootParams["Issue"] };
 
@@ -42,6 +43,7 @@ export function selectWorkspaceDetail(
 
 const IDENTITY = {
   Thread: ["environmentId", "threadId"],
+  AlwaysOnConversation: ["environmentId", "agentId"],
   PullRequest: ["environmentId", "projectId", "repository", "number", "host"],
   Issue: ["environmentId", "projectId", "tracker", "host", "scope", "issueKey"],
 } as const;

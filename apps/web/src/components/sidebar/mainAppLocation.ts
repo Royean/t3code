@@ -15,12 +15,20 @@ export function isSidebarUtilityPage(pathname: string) {
   );
 }
 
+export function isAlwaysOnWorkspace(pathname: string) {
+  return pathname === "/always-on" || pathname === "/always-on/";
+}
+
+export type ChatWorkspace = "threads" | "always-on";
+
 // Pages the root route always renders without the app shell, so they are never
 // a page to return to. Other paths seen before auth or on a prompt-link landing
 // are still recorded; they are real app URLs, so returning to one is harmless.
 const SHELL_LESS_PATHS = new Set(["/pair", "/connect", "/connect-agent", GUEST_PAGE_PATH]);
 
 let mainAppHref: string | null = null;
+let threadsWorkspaceHref: string | null = null;
+let alwaysOnWorkspaceHref: string | null = null;
 let appModalReturnHref: string | null = null;
 let appModalReturnHistoryIndex: number | null = null;
 let appModalReturnThreadTarget: ThreadRouteTarget | null = null;
@@ -29,6 +37,8 @@ let initialHistoryIndex = 0;
 /** Remembers where Settings, Usage, and the utility pages lead back to. */
 export function startMainAppLocationTracking(router: AnyRouter): () => void {
   initialHistoryIndex = router.state.location.state.__TSR_index;
+  threadsWorkspaceHref = null;
+  alwaysOnWorkspaceHref = null;
   const record = () => {
     const { pathname } = router.state.location;
     if (isAppModalPage(pathname) || SHELL_LESS_PATHS.has(pathname)) return;
@@ -40,10 +50,25 @@ export function startMainAppLocationTracking(router: AnyRouter): () => void {
     appModalReturnThreadTarget = resolveThreadRouteTarget(
       router.state.matches.at(-1)?.params ?? {},
     );
-    if (!isSidebarUtilityPage(pathname)) mainAppHref = href;
+    if (!isSidebarUtilityPage(pathname)) {
+      mainAppHref = href;
+      if (isAlwaysOnWorkspace(pathname)) alwaysOnWorkspaceHref = href;
+      else threadsWorkspaceHref = href;
+    }
   };
   record();
   return router.subscribe("onResolved", record);
+}
+
+export function useNavigateToChatWorkspace() {
+  const navigate = useNavigate();
+  return (workspace: ChatWorkspace) =>
+    navigate({
+      href:
+        workspace === "threads"
+          ? (threadsWorkspaceHref ?? "/")
+          : (alwaysOnWorkspaceHref ?? "/always-on"),
+    });
 }
 
 /** The thread Settings or Usage opened over, for views mounted while the modal is open. */

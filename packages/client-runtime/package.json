@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./always-on-conversation": {
+      "types": "./src/alwaysOnConversation.ts",
+      "default": "./src/alwaysOnConversation.ts"
+    },
     "./pull-request-diff-fold": {
       "types": "./src/pullRequestDiffFold.ts",
       "default": "./src/pullRequestDiffFold.ts"

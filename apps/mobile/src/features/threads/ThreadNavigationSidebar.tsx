@@ -92,6 +92,7 @@ type SidebarListItem =
     };
 
 interface ThreadNavigationSidebarProps {
+  readonly listTabs?: React.ReactNode;
   readonly width: number;
   readonly visible: boolean;
   readonly selectedThreadKey: string | null;
@@ -611,6 +612,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
     return (
       <>
         {header}
+        {props.listTabs}
         <View className="flex-1">
           <SwipeableScrollGateProvider enabled={swipeEnabled}>
             <GestureDetector gesture={sidebarScrollGesture}>
@@ -655,6 +657,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
   // Android: the bar floats below the list.
   return (
     <View testID="thread-navigation-sidebar" className="flex-1 bg-header">
+      {props.listTabs}
       <View
         className="flex-1"
         style={{

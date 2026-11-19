@@ -47,9 +47,11 @@ Other adaptations, marked as such:
 
 ## Use it
 
-Open **Settings → Always-on agents** on web or desktop to set up an agent. The same section on mobile lists agents by connected environment and lets you read recent runs and deliveries, and approve or reject pending requests. Self-hosted users first pair with the computer that runs the agent.
+Open **Settings → Always-on agents** to create an agent for a project with an existing text generator or Claude instance. Self-hosted users first pair with the computer that runs the agent.
 
-Create an agent with a project id, instructions, and either a text generator or a Claude instance and model that you have already configured. Queue a natural-language event as a new session or as a continuation of the user session. The run shows the model's summary or error and the actions the server actually executed. Pause stops new runs and leaves the inbox in place. Approve or reject a waiting card; the decision goes back through the model, and a rejected action is not executed by itself. Confirm an unknown run only after you have checked the external system yourself.
+Open **Always On** beside **Threads** and select an agent. Its conversation shows what triggered each run, the live status, and the result. Send a message to wake the agent. Messages wait in its queue while it is already running or paused.
+
+Use **Stop run** to stop the current run. Pause the agent to hold future runs while preserving the queue, and resume it to continue. Approve or reject a request in its card. Confirm an unknown outcome after checking what happened in the external system.
 
 The page needs `orchestration:read` to view state and `orchestration:operate` to create agents, queue events, approve, confirm, pause, or cancel. A reader cannot call the operate methods.
 

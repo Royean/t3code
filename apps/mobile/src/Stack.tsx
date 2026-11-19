@@ -118,10 +118,8 @@ import {
   SettingsScheduledTaskNewRouteScreen,
   SettingsScheduledTaskEditRouteScreen,
 } from "./features/settings/SettingsScheduledTasksRouteScreen";
-import {
-  SettingsAlwaysOnAgentRouteScreen,
-  SettingsAlwaysOnRouteScreen,
-} from "./features/settings/SettingsAlwaysOnRouteScreen";
+import { SettingsAlwaysOnRouteScreen } from "./features/settings/SettingsAlwaysOnRouteScreen";
+import { AlwaysOnConversationRouteScreen } from "./features/always-on/AlwaysOnConversationRouteScreen";
 import {
   ScheduledTaskModelPickerRouteScreen,
   ScheduledTaskBranchPickerRouteScreen,
@@ -194,7 +192,6 @@ const ROUTE_TITLES: Readonly<Record<string, string>> = {
   SettingsFollowUp: msg("Chat", { $context: "noun, settings page title" }),
   SettingsScheduledTasks: msg("Scheduled tasks"),
   SettingsAlwaysOn: msg("Always-on agents"),
-  SettingsAlwaysOnAgent: msg("Always-on agents"),
   SettingsScheduledTaskNew: msg("New scheduled task"),
   SettingsScheduledTaskEdit: msg("Edit scheduled task"),
   SettingsScheduledTaskBranch: msg("Base branch"),
@@ -378,10 +375,6 @@ const SETTINGS_SCREENS = {
   SettingsAlwaysOn: createNativeStackScreen({
     screen: SettingsAlwaysOnRouteScreen,
     linking: "settings/always-on",
-    options: settingsPage(),
-  }),
-  SettingsAlwaysOnAgent: createNativeStackScreen({
-    screen: SettingsAlwaysOnAgentRouteScreen,
     options: settingsPage(),
   }),
   SettingsScheduledTaskNew: createNativeStackScreen({
@@ -665,6 +658,10 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: ThreadRouteScreen,
       linking: { path: "threads/:environmentId?/:threadId?", alias: ["new/draft"] },
       options: pageRoute({ duoMinimize: "onScrollUp" }),
+    }),
+    AlwaysOnConversation: createNativeStackScreen({
+      screen: AlwaysOnConversationRouteScreen,
+      options: pageRoute({ duoMinimize: "never" }),
     }),
     NewTaskProject: createNativeStackScreen({
       screen: NewTaskRouteScreen,

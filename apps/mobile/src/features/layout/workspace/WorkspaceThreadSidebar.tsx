@@ -4,6 +4,7 @@ import type {
 } from "@t3tools/client-runtime/state/shell";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useNavigation, useNavigationState } from "@react-navigation/native";
+import type { ReactNode } from "react";
 
 import { scopedThreadKey } from "../../../lib/scopedEntities";
 import { uuidv4 } from "../../../lib/uuid";
@@ -13,6 +14,7 @@ import { openSettings } from "../../settings/settings-navigation";
 import { ThreadNavigationSidebar } from "../../threads/ThreadNavigationSidebar";
 import { useOpenThreadPullRequests } from "../../threads/use-open-thread-pull-requests";
 import { useSelectWorkspaceDetail } from "./useSelectWorkspaceDetail";
+import { AlwaysOnWorkspace } from "../../always-on/AlwaysOnWorkspace";
 
 type Route = { readonly name: string; readonly params?: object };
 
@@ -41,6 +43,10 @@ function selectedThreadKey(state: { readonly index: number; readonly routes: rea
 
 /** The thread list in the workspace's sidebar column. */
 export function WorkspaceThreadSidebar() {
+  return <AlwaysOnWorkspace sidebar renderThreads={(tabs) => <WorkspaceThreads tabs={tabs} />} />;
+}
+
+function WorkspaceThreads({ tabs }: { readonly tabs: ReactNode }) {
   const navigation = useNavigation();
   const { layout, setPrimarySidebarSearchQuery, revealPrimarySidebar, openWorkspaceTab } =
     useAdaptiveWorkspaceLayout();
@@ -53,6 +59,7 @@ export function WorkspaceThreadSidebar() {
   const { openPendingTask } = usePendingTaskListActions(selectThreadRoute);
   return (
     <ThreadNavigationSidebar
+      listTabs={tabs}
       width={layout.listPaneWidth ?? 0}
       visible={panes.primarySidebarVisible}
       onRequestVisibility={revealPrimarySidebar}
