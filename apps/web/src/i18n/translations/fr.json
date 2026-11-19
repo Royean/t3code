@@ -7287,7 +7287,6 @@
   "27b770d3402abfa2": "Avancé",
   "f2e86dbee8b3105b": "Agents toujours actifs",
   "1afed7ee137cb22d": "Un événement en langage naturel réveille un court appel au modèle. Le serveur n’accepte que des actions validées par le schéma. Les générateurs de texte n’envoient aucun outil. La génération de texte Claude est appelée avec une liste d’outils vide. Les autres environnements restent désactivés.",
-  "4a80c0a01b9931cc": "L’application mobile n’a pas encore cet écran. Le bureau utilise cette page.",
   "fa50dece59f25a04": "Connectez un environnement pour gérer les agents toujours actifs.",
   "0b08f57b7288e373": "Impossible de créer l’agent.",
   "e779f4f0a1bd6fc3": "Titre de l’agent",

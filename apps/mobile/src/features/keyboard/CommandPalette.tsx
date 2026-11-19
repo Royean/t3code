@@ -340,6 +340,13 @@ export function CommandPalette(props: {
         run: () => openSettings(navigation, "SettingsScheduledTasks"),
       },
       {
+        key: "alwaysOn",
+        kind: "action",
+        title: gt("Always-on agents"),
+        searchTerms: ["always on", "approvals"],
+        run: () => openSettings(navigation, "SettingsAlwaysOn"),
+      },
+      {
         key: "usage",
         kind: "action",
         title: gt("Usage", { $context: "command, opens usage settings" }),

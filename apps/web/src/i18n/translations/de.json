@@ -7285,7 +7285,6 @@
   "27b770d3402abfa2": "Erweitert",
   "f2e86dbee8b3105b": "Daueraktive Agenten",
   "1afed7ee137cb22d": "Ein natürlichsprachliches Ereignis weckt einen kurzen Modellaufruf. Der Server akzeptiert nur per Schema geprüfte Aktionen. Textgeneratoren senden keine Werkzeuge. Die Claude-Texterzeugung wird mit einer leeren Werkzeugliste aufgerufen. Andere Laufzeiten bleiben deaktiviert.",
-  "4a80c0a01b9931cc": "Die mobile App hat diesen Bildschirm noch nicht. Die Desktop-App verwendet diese Seite.",
   "fa50dece59f25a04": "Verbinden Sie eine Umgebung, um daueraktive Agenten zu verwalten.",
   "0b08f57b7288e373": "Der Agent konnte nicht erstellt werden.",
   "e779f4f0a1bd6fc3": "Agententitel",

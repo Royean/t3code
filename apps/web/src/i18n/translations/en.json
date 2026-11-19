@@ -7293,7 +7293,6 @@
   "27b770d3402abfa2": "Advanced",
   "f2e86dbee8b3105b": "Always-on agents",
   "1afed7ee137cb22d": "A natural-language event wakes one short model call. The server accepts only schema-checked actions. Text generators send no tools. Claude text generation is called with an empty tool list. Other runtimes stay disabled.",
-  "4a80c0a01b9931cc": "The mobile app does not include this screen yet. Desktop uses this page.",
   "fa50dece59f25a04": "Connect an environment to manage always-on agents.",
   "0b08f57b7288e373": "Could not create the agent.",
   "e779f4f0a1bd6fc3": "Agent title",

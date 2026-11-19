@@ -1268,7 +1268,7 @@ const make = Effect.fn("AlwaysOnService.make")(function* (wake: "eager" | "manua
     }>`
         SELECT approval_id, run_id, session_id, status, summary, created_at
         FROM always_on_approval WHERE agent_id = ${input.agentId}
-        ORDER BY created_at DESC LIMIT 20
+        ORDER BY (status = 'pending') DESC, created_at DESC, approval_id LIMIT 20
       `;
     const deliveries = yield* sql<{
       readonly outbox_id: string;

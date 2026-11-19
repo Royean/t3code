@@ -47,7 +47,7 @@ Other adaptations, marked as such:
 
 ## Use it
 
-Check out `feat/self-hosted-connect` plus this integration, not `main`. Open **Settings → Always-on agents** in the web app. The desktop app uses the same page. The mobile app does not have this screen yet; the websocket methods and schemas are in the shared contract. A self-hosted login reaches this page only after the client redeems that computer's pairing link. The account password does not grant these methods by itself.
+Open **Settings → Always-on agents** on web or desktop to set up an agent. The same section on mobile lists agents by connected environment and lets you read recent runs and deliveries, and approve or reject pending requests. Self-hosted users first pair with the computer that runs the agent.
 
 Create an agent with a project id, instructions, and either a text generator or a Claude instance and model that you have already configured. Queue a natural-language event as a new session or as a continuation of the user session. The run shows the model's summary or error and the actions the server actually executed. Pause stops new runs and leaves the inbox in place. Approve or reject a waiting card; the decision goes back through the model, and a rejected action is not executed by itself. Confirm an unknown run only after you have checked the external system yourself.
 

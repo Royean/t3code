@@ -7286,7 +7286,6 @@
   "27b770d3402abfa2": "Avançado",
   "f2e86dbee8b3105b": "Agentes sempre ativos",
   "1afed7ee137cb22d": "Um evento em linguagem natural acorda uma chamada curta ao modelo. O servidor só aceita ações validadas pelo esquema. Geradores de texto não enviam ferramentas. A geração de texto do Claude é chamada com uma lista de ferramentas vazia. Os outros runtimes ficam desativados.",
-  "4a80c0a01b9931cc": "O app móvel ainda não tem esta tela. O desktop usa esta página.",
   "fa50dece59f25a04": "Conecte um ambiente para gerenciar agentes sempre ativos.",
   "0b08f57b7288e373": "Não foi possível criar o agente.",
   "e779f4f0a1bd6fc3": "Título do agente",

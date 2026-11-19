@@ -303,6 +303,50 @@ it.effect("asks the model again after approval and can run other events meanwhil
   ),
 );
 
+it.effect("keeps pending approvals visible after the recent history fills up", () =>
+  harness((service, queue) =>
+    Effect.gen(function* () {
+      const { agent } = yield* createAgent(service);
+      const ask = (index: number) =>
+        Effect.gen(function* () {
+          const summary = `Approval ${index}`;
+          yield* Ref.set(queue, [
+            {
+              summary,
+              actions: [{ type: "request_approval", key: "ask", summary, onApprove: [] }],
+            },
+          ]);
+          yield* service.submitEvent({
+            agentId: agent.id,
+            source: "user",
+            sourceEventId: `ask-${index}`,
+            kind: "external",
+            text: summary,
+          });
+          yield* service.drain();
+          const detail = yield* service.get({ agentId: agent.id });
+          const approval = detail.approvals.find((entry) => entry.summary === summary);
+          assert(approval !== undefined);
+          return approval.id;
+        });
+
+      const oldest = yield* ask(0);
+      for (let index = 1; index <= 20; index++) {
+        yield* TestClock.adjust("1 second");
+        const approvalId = yield* ask(index);
+        yield* service.resolveApproval({ agentId: agent.id, approvalId, decision: "rejected" });
+        yield* service.drain();
+      }
+
+      const detail = yield* service.get({ agentId: agent.id });
+      expect(detail.agent.pendingApprovalCount).toBe(1);
+      expect(
+        detail.approvals.filter((entry) => entry.status === "pending").map((entry) => entry.id),
+      ).toEqual([oldest]);
+    }),
+  ),
+);
+
 it.effect("does not call the model again when a stored decision survives a restart", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();

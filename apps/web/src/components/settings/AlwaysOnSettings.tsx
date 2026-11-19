@@ -55,9 +55,6 @@ export function AlwaysOnSettings() {
             "A natural-language event wakes one short model call. The server accepts only schema-checked actions. Text generators send no tools. Claude text generation is called with an empty tool list. Other runtimes stay disabled.",
           )}
         </p>
-        <p className="text-muted-foreground text-sm">
-          {gt("The mobile app does not include this screen yet. Desktop uses this page.")}
-        </p>
         {environment === undefined || snapshot === null ? (
           <p className="text-sm">{gt("Connect an environment to manage always-on agents.")}</p>
         ) : (
@@ -68,7 +65,6 @@ export function AlwaysOnSettings() {
             }
             agents={snapshot.agents}
             providers={snapshot.providers}
-            revision={snapshot.revision}
           />
         )}
       </SettingsSection>
@@ -81,13 +77,11 @@ function AlwaysOnEnvironment({
   projectId,
   agents,
   providers,
-  revision,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId | undefined;
   readonly agents: readonly AlwaysOnAgentSummary[];
   readonly providers: readonly AlwaysOnProviderPolicy[];
-  readonly revision: number;
 }) {
   const gt = useGT();
   const canOperate = useAtomValue(
@@ -223,7 +217,6 @@ function AlwaysOnEnvironment({
         <AlwaysOnAgentDetail
           environmentId={environmentId}
           agentId={selected}
-          revision={revision}
           canOperate={canOperate}
         />
       ) : null}
@@ -234,17 +227,15 @@ function AlwaysOnEnvironment({
 function AlwaysOnAgentDetail({
   environmentId,
   agentId,
-  revision,
   canOperate,
 }: {
   readonly environmentId: EnvironmentId;
   readonly agentId: AlwaysOnAgentId;
-  readonly revision: number;
   readonly canOperate: boolean;
 }) {
   const gt = useGT();
   const detailQuery = useAtomValue(
-    serverEnvironment.alwaysOnDetail({ environmentId, input: { agentId, revision } }),
+    serverEnvironment.alwaysOnDetail({ environmentId, input: { agentId } }),
   );
   const detail = AsyncResult.getOrElse(detailQuery, () => null);
   const setEnabled = useAtomCommand(serverEnvironment.setAlwaysOnEnabled, "always-on enabled");

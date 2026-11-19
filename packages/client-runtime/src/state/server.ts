@@ -1438,6 +1438,17 @@ export function createServerEnvironmentAtoms<R, E>(
     scheduler: configScheduler,
     concurrency: configConcurrency,
   });
+  const alwaysOnLive = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+    label: "environment-data:server:always-on:live",
+    tag: WS_METHODS.alwaysOnSubscribe,
+  });
+  const alwaysOnRevision = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make(
+      (get) =>
+        AsyncResult.getOrElse(get(alwaysOnLive({ environmentId, input: {} })), () => null)
+          ?.revision,
+    ),
+  );
 
   return {
     configValueAtom,
@@ -1578,13 +1589,11 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:scheduled-tasks:live",
       tag: WS_METHODS.scheduledTasksSubscribe,
     }),
-    alwaysOnLive: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
-      label: "environment-data:server:always-on:live",
-      tag: WS_METHODS.alwaysOnSubscribe,
-    }),
+    alwaysOnLive,
     alwaysOnDetail: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:always-on:detail",
       tag: WS_METHODS.alwaysOnGet,
+      refreshTrigger: ({ environmentId }) => alwaysOnRevision(environmentId),
     }),
     // A cold transcript scan is measured in seconds, so keep the result around
     // long enough that switching windows or re-rendering does not rescan. With
