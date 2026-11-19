@@ -48,6 +48,26 @@ describe("RPC authorization scopes", () => {
     }
   });
 
+  it("lets readers inspect always-on state and requires operate to change it", () => {
+    for (const method of [
+      WS_METHODS.alwaysOnSubscribe,
+      WS_METHODS.alwaysOnGet,
+      WS_METHODS.alwaysOnReadMemory,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+    for (const method of [
+      WS_METHODS.alwaysOnCreate,
+      WS_METHODS.alwaysOnSetEnabled,
+      WS_METHODS.alwaysOnSubmitEvent,
+      WS_METHODS.alwaysOnResolveApproval,
+      WS_METHODS.alwaysOnConfirmUnknown,
+      WS_METHODS.alwaysOnCancel,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
   it("keeps triage, which seeds an agent that reads logs and the database, behind operate scope", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.serverPrepareTriage)).toBe(
       AuthOrchestrationOperateScope,

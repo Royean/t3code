@@ -32,6 +32,7 @@ export type SettingsPath =
   | "/settings/browser"
   | "/settings/devices"
   | "/settings/scheduled-tasks"
+  | "/settings/always-on"
   | "/settings/source-control"
   | "/settings/worktrees"
   | "/settings/connections"
@@ -107,6 +108,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/browser": msg("Browser"),
   "/settings/devices": msg("Devices"),
   "/settings/scheduled-tasks": msg("Scheduled tasks"),
+  "/settings/always-on": msg("Always-on agents"),
   "/settings/source-control": msg("Source control & issues"),
   "/settings/worktrees": msg("Worktrees"),
   "/settings/connections": msg("Environments"),
@@ -155,6 +157,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
       "/settings/browser",
       "/settings/devices",
       "/settings/scheduled-tasks",
+      "/settings/always-on",
     ],
   },
   {
@@ -1075,6 +1078,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/scheduled-tasks",
   },
   {
+    id: "always-on",
+    title: msg("Always-on agents"),
+    to: "/settings/always-on",
+    searchTerms: [msg("inbox timer memory approval outbox sleep wake")],
+  },
+  {
     id: "agent-browser-access",
     title: msg("Agent browser access"),
     to: "/settings/browser",
@@ -1480,6 +1489,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/access": "connections",
   "/settings/secrets": null,
   "/settings/scheduled-tasks": null,
+  "/settings/always-on": null,
   "/settings/maintenance": null,
   "/settings/labs": null,
   "/settings/about": null,

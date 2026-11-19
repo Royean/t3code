@@ -21,11 +21,13 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
 import { subscribeChatGptHandoff } from "./provider/CodexChatGptHandoff.ts";
 import {
   AcpRegistryOperationError,
+  AlwaysOnError,
   CommandId,
   authScopeResponse,
   AuthAccessStreamError,
@@ -124,6 +126,7 @@ import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManag
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
+import * as AlwaysOn from "./alwaysOn/AlwaysOnService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
@@ -285,6 +288,11 @@ import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import { requestUrl } from "./requestUrl.ts";
+
+const alwaysOnStorageError = (error: AlwaysOnError | SqlError.SqlError): AlwaysOnError =>
+  SqlError.isSqlError(error)
+    ? new AlwaysOnError({ message: "Always-on storage failed.", reason: "unavailable" })
+    : error;
 
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
 const isProviderUploadFeedbackError = Schema.is(ProviderUploadFeedbackError);
@@ -1480,6 +1488,7 @@ export const layerWsRpc = (
       const commandOutputHub = yield* CommandOutputHub.CommandOutputHub;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const alwaysOn = yield* AlwaysOn.AlwaysOnService;
       const secretRequests = yield* SecretRequests.SecretRequests;
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
@@ -2359,6 +2368,24 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.getWebhookDelivery(input)),
           ),
+        [WS_METHODS.alwaysOnSubscribe]: (_input) =>
+          alwaysOn.subscribe().pipe(Stream.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnCreate]: (input) =>
+          alwaysOn.create(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnSetEnabled]: (input) =>
+          alwaysOn.setEnabled(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnSubmitEvent]: (input) =>
+          alwaysOn.submitEvent(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnGet]: (input) =>
+          alwaysOn.get(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnReadMemory]: (input) =>
+          alwaysOn.readMemory(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnResolveApproval]: (input) =>
+          alwaysOn.resolveApproval(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnConfirmUnknown]: (input) =>
+          alwaysOn.confirmUnknown(input).pipe(Effect.mapError(alwaysOnStorageError)),
+        [WS_METHODS.alwaysOnCancel]: (input) =>
+          alwaysOn.cancel(input).pipe(Effect.mapError(alwaysOnStorageError)),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) =>
           loadServerConfig({

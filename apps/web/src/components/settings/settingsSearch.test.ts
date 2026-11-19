@@ -88,6 +88,13 @@ describe("searchSettings", () => {
     });
   });
 
+  it("finds the Always-on agents page", () => {
+    expect(searchSettings("always-on")[0]).toMatchObject({
+      id: "always-on",
+      to: "/settings/always-on",
+    });
+  });
+
   it("matches normalized title substrings", () => {
     expect(searchSettings("  WORD   WRAP  ", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
     expect(searchSettings("glass").map((item) => item.id)).toEqual(["setting-glass-opacity"]);
