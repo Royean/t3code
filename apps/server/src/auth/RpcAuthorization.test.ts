@@ -12,6 +12,7 @@ import {
   IssueTrackerKind,
   SecretProviderId,
   ThreadId,
+  AlwaysOnAgentId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthSourceControlWriteScope,
@@ -165,6 +166,78 @@ describe("RPC scope middleware", () => {
     }),
   );
 });
+
+it.effect("refuses always-on changes without operate scope before the handler runs", () =>
+  Effect.gen(function* () {
+    const tested = [WS_METHODS.alwaysOnSubscribe, WS_METHODS.alwaysOnCreate] as const;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof tested)[number]> =>
+          !(tested as ReadonlyArray<string>).includes(tag),
+      ),
+    );
+    let handled = 0;
+    const snapshot = { revision: 0, agents: [], providers: [] };
+    const handlers = Layer.mergeAll(
+      group.toLayerHandler(WS_METHODS.alwaysOnSubscribe, () =>
+        Stream.fromEffect(
+          Effect.sync(() => {
+            handled += 1;
+            return snapshot;
+          }),
+        ),
+      ),
+      group.toLayerHandler(WS_METHODS.alwaysOnCreate, () =>
+        Effect.sync(() => {
+          handled += 1;
+          return {
+            agent: {
+              id: AlwaysOnAgentId.make("agent-1"),
+              projectId: ProjectId.make("project-1"),
+              title: "Desk",
+              enabled: true,
+              phase: "sleeping" as const,
+              userSessionId: null,
+              pendingInboxCount: 0,
+              pendingApprovalCount: 0,
+              pendingOutboxCount: 0,
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            },
+          };
+        }),
+      ),
+    );
+    const input = {
+      projectId: ProjectId.make("project-1"),
+      title: "Desk",
+      instructions: "Stay quiet.",
+      providerKind: "textGenerator" as const,
+      instanceId: "generator",
+      model: "fixture",
+    };
+    const anonymous = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([]))),
+    );
+    expect(
+      yield* Stream.runDrain(anonymous[WS_METHODS.alwaysOnSubscribe]({}).pipe(Stream.drain)).pipe(
+        Effect.flip,
+      ),
+    ).toMatchObject({ requiredPermission: AuthOrchestrationReadScope });
+    expect(yield* anonymous[WS_METHODS.alwaysOnCreate](input).pipe(Effect.flip)).toMatchObject({
+      requiredPermission: AuthOrchestrationOperateScope,
+    });
+    expect(handled).toBe(0);
+
+    const reader = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope]))),
+    );
+    yield* Stream.runDrain(reader[WS_METHODS.alwaysOnSubscribe]({}).pipe(Stream.drain));
+    expect(yield* reader[WS_METHODS.alwaysOnCreate](input).pipe(Effect.flip)).toMatchObject({
+      requiredPermission: AuthOrchestrationOperateScope,
+    });
+    expect(handled).toBe(1);
+  }).pipe(Effect.scoped),
+);
 
 it.effect("allows issue reads but requires a source-control grant before commenting", () =>
   Effect.gen(function* () {

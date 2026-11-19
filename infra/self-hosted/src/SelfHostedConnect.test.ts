@@ -144,6 +144,10 @@ it.effect(
         label: "Office computer",
         scopes: AuthStandardClientScopes,
       });
+      expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/.well-known/t3/environment",
+        "/api/auth/pairing-token",
+      ]);
     }).pipe(
       Effect.provide(
         SelfHostedConnect.layer(config(), {

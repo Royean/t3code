@@ -445,3 +445,25 @@ it.effect("fires a timer into the inbox and lets the model answer it", () =>
     );
   }),
 );
+
+it.effect("does not show an agent created in another environment database", () =>
+  Effect.gen(function* () {
+    const queue = yield* Ref.make<readonly unknown[]>([]);
+    const prompts = yield* Ref.make<readonly string[]>([]);
+    const office = provide(queue, prompts).pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
+    const home = provide(queue, prompts).pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
+    const agentId = yield* Effect.gen(function* () {
+      const service = yield* AlwaysOnService.AlwaysOnService;
+      return (yield* createAgent(service, "Office")).agent.id;
+    }).pipe(Effect.provide(office));
+
+    const other = yield* Effect.gen(function* () {
+      const service = yield* AlwaysOnService.AlwaysOnService;
+      const missing = yield* service.get({ agentId }).pipe(Effect.exit);
+      const created = yield* createAgent(service, "Home");
+      return { missing, createdId: created.agent.id };
+    }).pipe(Effect.provide(home));
+    expect(other.missing._tag).toBe("Failure");
+    expect(other.createdId).not.toBe(agentId);
+  }),
+);

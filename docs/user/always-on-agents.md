@@ -20,11 +20,11 @@ The article's dreaming pass and risk classifiers are not part of this build.
 
 T3 already persists threads, runs a five-second `Scheduler`, and stores projections in SQLite. Scheduled tasks can wake a thread on an interval, a clock time, or a webhook. Provider sessions go idle and thread settlement can detach them. Permission modes are enforced by each provider's own runtime; T3 does not sit in front of every tool call.
 
-The fork branch `feat/event-orchestration` is a separate GitHub role pipeline. This always-on work does not depend on it and does not change it.
+This copy is built on `feat/self-hosted-connect` (`e264e79bf0` at the time of the integration). That branch already contains the event-orchestration role pipeline and the optional self-hosted account directory. Always-on does not replace either of them. Official T3 Connect is unchanged.
 
 ## What this build adapts
 
-Always-on state lives in its own SQLite tables on the existing T3 server. There is no Temporal service and no Anthropic-only SDK.
+Always-on state lives in its own SQLite tables on the environment's T3 server, applied as fork migration 2 after the event-orchestration fork migration. It does not take an upstream migration number. There is no Temporal service and no Anthropic-only SDK. The self-hosted account directory only lists computers and issues a one-time environment pairing link. It does not store always-on memory, provider credentials, or runs, and it has no method that calls them.
 
 A queued event is natural language. The worker sends the instructions, a memory index, and the event to one model completion. The reply is untrusted. The server decodes at most four actions: a note, progress, a sent result, a timer, a delivery into this agent's session, silence, an approval request, or a record that an external effect was not performed. A shell action or any other shape fails the run and executes nothing. Each call is one completion and 20 seconds.
 
@@ -47,7 +47,7 @@ Other adaptations, marked as such:
 
 ## Use it
 
-Open **Settings → Always-on agents** in the web app. The desktop app uses the same page. The mobile app does not have this screen yet; the websocket methods and schemas are in the shared contract.
+Check out `feat/self-hosted-connect` plus this integration, not `main`. Open **Settings → Always-on agents** in the web app. The desktop app uses the same page. The mobile app does not have this screen yet; the websocket methods and schemas are in the shared contract. A self-hosted login reaches this page only after the client redeems that computer's pairing link. The account password does not grant these methods by itself.
 
 Create an agent with a project id, instructions, and either a text generator or a Claude instance and model that you have already configured. Queue a natural-language event as a new session or as a continuation of the user session. The run shows the model's summary or error and the actions the server actually executed. Pause stops new runs and leaves the inbox in place. Approve or reject a waiting card; the decision goes back through the model, and a rejected action is not executed by itself. Confirm an unknown run only after you have checked the external system yourself.
 
@@ -58,7 +58,7 @@ The page needs `orchestration:read` to view state and `orchestration:operate` to
 From the repository root, with the dev server stopped and without pointing at `~/.t3`:
 
 ```sh
-vp test run apps/server/src/alwaysOn/AlwaysOnService.test.ts apps/server/src/alwaysOn/AlwaysOnModel.test.ts apps/server/src/textGeneration/ClaudeTextGeneration.test.ts apps/server/src/auth/RpcAuthorization.test.ts apps/web/src/components/settings/settingsSearch.test.ts
+vp test run apps/server/src/alwaysOn/AlwaysOnService.test.ts apps/server/src/alwaysOn/AlwaysOnModel.test.ts apps/server/src/textGeneration/ClaudeTextGeneration.test.ts apps/server/src/auth/RpcAuthorization.test.ts apps/server/src/persistence/Migrations.test.ts apps/server/src/eventOrchestration/http.test.ts infra/self-hosted/src/SelfHostedConnect.test.ts apps/web/src/components/settings/settingsSearch.test.ts
 ```
 
 The service tests use an in-memory database and a fake completion. They check that the completion is called with memory, and they do not send a paid request. `AlwaysOnModel.test.ts` calls `TextGenerators.complete` through a fixture and does not open a network connection. The Claude text-generation test runs a fake `claude` binary and checks that the transcription completion always-on uses receives `--tools` with an empty list. A real run still needs a text generator or Claude account configured on your machine.
