@@ -26,9 +26,16 @@ The fork branch `feat/event-orchestration` is a separate GitHub role pipeline. T
 
 Always-on state lives in its own SQLite tables on the existing T3 server. There is no Temporal service and no Anthropic-only SDK.
 
-The worker is fail-closed. No installed provider runtime was verified to intercept each tool before it runs, so an always-on run never starts Claude, Codex, or another provider process. The run applies only an allowlist: save a note or progress pointer, set a timer, deliver a message into this agent's session feed, stay quiet, or ask for approval. Shell commands are not an action. Credential-shaped text is rejected and is not written to the inbox, memory, logs, or prompts.
+A queued event is natural language. The worker sends the instructions, a memory index, and the event to one model completion. The reply is untrusted. The server decodes at most four actions: a note, progress, a sent result, a timer, a delivery into this agent's session, silence, an approval request, or a record that an external effect was not performed. A shell action or any other shape fails the run and executes nothing. Each call is one completion and 20 seconds.
 
-That is narrower than the article. The secret proxy is not implemented. Unattended tool use is not available. A future executor can sit behind the same inbox only after a runtime can prove a per-tool boundary.
+Only two runtimes are enabled, and both are empty of tools in code rather than by a prompt:
+
+- Text generators send a chat message with no `tools` field (`textGeneratorDrivers.ts`).
+- Claude text generation, when it is not investigating a checkout, passes `--tools` with an empty list, disables hooks, and sets `--permission-mode dontAsk`. Always-on uses that completion.
+
+Codex stays disabled because `codex exec -s read-only` still has tools. Antigravity stays disabled because rejecting tool callbacks is not a native sandbox. Other agent runtimes stay disabled until they have an empty tool list in code.
+
+A pattern match rejects some credential-shaped strings before they are stored. That is not a guarantee that a secret never reaches a prompt, a log, or a model. Do not put secrets in instructions or events. The article's secret proxy is not implemented. Tests use a fake completion and do not call a paid model. You configure the text generator or Claude account locally before a real run.
 
 Other adaptations, marked as such:
 
@@ -42,7 +49,7 @@ Other adaptations, marked as such:
 
 Open **Settings → Always-on agents** in the web app. The desktop app uses the same page. The mobile app does not have this screen yet; the websocket methods and schemas are in the shared contract.
 
-Create an agent with a project id and the instructions that should load on every run. Queue an event as a new session or as a continuation of the user session. Pause stops new runs and leaves the inbox in place. Resume continues. Approve or reject a waiting card; reject does not perform the approved action. Confirm an unknown run only after you have checked the external system yourself.
+Create an agent with a project id, instructions, and either a text generator or a Claude instance and model that you have already configured. Queue a natural-language event as a new session or as a continuation of the user session. The run shows the model's summary or error and the actions the server actually executed. Pause stops new runs and leaves the inbox in place. Approve or reject a waiting card; the decision goes back through the model, and a rejected action is not executed by itself. Confirm an unknown run only after you have checked the external system yourself.
 
 The page needs `orchestration:read` to view state and `orchestration:operate` to create agents, queue events, approve, confirm, pause, or cancel. A reader cannot call the operate methods.
 
@@ -51,7 +58,7 @@ The page needs `orchestration:read` to view state and `orchestration:operate` to
 From the repository root, with the dev server stopped and without pointing at `~/.t3`:
 
 ```sh
-vp test run apps/server/src/alwaysOn/AlwaysOnService.test.ts apps/server/src/auth/RpcAuthorization.test.ts apps/web/src/components/settings/settingsSearch.test.ts
+vp test run apps/server/src/alwaysOn/AlwaysOnService.test.ts apps/server/src/alwaysOn/AlwaysOnModel.test.ts apps/server/src/textGeneration/ClaudeTextGeneration.test.ts apps/server/src/auth/RpcAuthorization.test.ts apps/web/src/components/settings/settingsSearch.test.ts
 ```
 
-The service tests use an in-memory database and fixtures. They do not call a model or a provider.
+The service tests use an in-memory database and a fake completion. They check that the completion is called with memory, and they do not send a paid request. `AlwaysOnModel.test.ts` calls `TextGenerators.complete` through a fixture and does not open a network connection. The Claude text-generation test runs a fake `claude` binary and checks that the transcription completion always-on uses receives `--tools` with an empty list. A real run still needs a text generator or Claude account configured on your machine.

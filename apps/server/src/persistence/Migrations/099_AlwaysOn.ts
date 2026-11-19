@@ -13,6 +13,9 @@ export default Effect.gen(function* () {
       user_session_id TEXT,
       lease_expires_at TEXT,
       lease_run_id TEXT,
+      provider_kind TEXT NOT NULL,
+      model_instance_id TEXT NOT NULL,
+      model TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
@@ -35,6 +38,7 @@ export default Effect.gen(function* () {
       kind TEXT NOT NULL,
       session_policy TEXT NOT NULL,
       related_session_id TEXT,
+      body_text TEXT NOT NULL,
       actions_json TEXT NOT NULL,
       status TEXT NOT NULL,
       run_id TEXT,
@@ -58,6 +62,10 @@ export default Effect.gen(function* () {
       context_json TEXT NOT NULL,
       event_ids_json TEXT NOT NULL,
       last_progress_at TEXT,
+      model_summary TEXT,
+      model_error TEXT,
+      decision_json TEXT,
+      executed_actions_json TEXT NOT NULL DEFAULT '[]',
       started_at TEXT NOT NULL,
       finished_at TEXT
     )

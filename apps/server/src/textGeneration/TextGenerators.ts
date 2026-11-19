@@ -35,6 +35,12 @@ export class TextGenerators extends Context.Service<
     readonly runner: (
       id: ProviderInstanceId,
     ) => Effect.Effect<TextGenerationOperations.Runner | undefined>;
+    /** One chat completion. The request body has no tools field. */
+    readonly complete: (input: {
+      readonly id: ProviderInstanceId;
+      readonly model: string;
+      readonly prompt: string;
+    }) => Effect.Effect<string, TextGenerationError>;
     readonly listModels: (
       input: ListTextGeneratorModelsInput,
     ) => Effect.Effect<ListTextGeneratorModelsResult, TextGeneratorError>;
@@ -186,7 +192,42 @@ export const make = Effect.gen(function* () {
     Effect.mapError((error) => new TextGeneratorError({ detail: error.detail })),
   );
 
-  return TextGenerators.of({ runner, listModels });
+  const complete = Effect.fn("TextGenerators.complete")(function* (input: {
+    readonly id: ProviderInstanceId;
+    readonly model: string;
+    readonly prompt: string;
+  }) {
+    const config = yield* readConfig(input.id).pipe(Effect.orElseSucceed(() => undefined));
+    const operation = "generateTranscriptionPostProcessing";
+    if (config === undefined) {
+      return yield* new TextGenerationError({
+        operation,
+        detail: "That text generator does not exist.",
+      });
+    }
+    const label = generatorLabel(config);
+    if (!config.enabled) {
+      return yield* new TextGenerationError({
+        operation,
+        detail: `${label} is off. Turn it on in Settings → Providers.`,
+      });
+    }
+    const driver = TEXT_GENERATOR_DRIVERS[config.kind];
+    return yield* connect(config).pipe(
+      Effect.flatMap((connection) => driver.generate(connection, input.model, input.prompt)),
+      Effect.provideService(HttpClient.HttpClient, http),
+      Effect.mapError(
+        (error) =>
+          new TextGenerationError({
+            operation,
+            detail: error.detail,
+            cause: error,
+          }),
+      ),
+    );
+  });
+
+  return TextGenerators.of({ runner, complete, listModels });
 });
 
 export const layer = Layer.effect(TextGenerators, make).pipe(

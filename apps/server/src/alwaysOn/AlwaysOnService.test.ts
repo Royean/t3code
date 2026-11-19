@@ -7,15 +7,11 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 import { assert, expect, it } from "@effect/vitest";
-import {
-  AlwaysOnAgentId,
-  AlwaysOnMemoryId,
-  ProjectId,
-  type AlwaysOnAction,
-} from "@t3tools/contracts";
+import { ProjectId, type AlwaysOnModelDecision } from "@t3tools/contracts";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as AlwaysOnModel from "./AlwaysOnModel.ts";
 import * as AlwaysOnService from "./AlwaysOnService.ts";
 import { containsCredential, selectInboxBatch } from "./alwaysOnLogic.ts";
 
@@ -29,100 +25,134 @@ const schedulerMock = Layer.succeed(
   }),
 );
 
-const manual = AlwaysOnService.layerManual.pipe(Layer.provide(schedulerMock));
+const quiet = {
+  summary: "Quiet.",
+  actions: [{ type: "silent", key: "quiet" }],
+} satisfies AlwaysOnModelDecision;
 
-const withService = <A, E, R>(effect: Effect.Effect<A, E, R | AlwaysOnService.AlwaysOnService>) =>
-  effect.pipe(Effect.provide(manual.pipe(Layer.provideMerge(SqlitePersistence.layerMemory))));
+const scripted = (queue: Ref.Ref<readonly unknown[]>, prompts: Ref.Ref<readonly string[]>) =>
+  Layer.succeed(
+    AlwaysOnModel.AlwaysOnModel,
+    AlwaysOnModel.AlwaysOnModel.of({
+      decide: (input) =>
+        Effect.gen(function* () {
+          yield* Ref.update(prompts, (current) => [...current, input.prompt]);
+          const next = yield* Ref.modify(
+            queue,
+            (current) => [current[0], current.slice(1)] as const,
+          );
+          if (next === undefined) return quiet;
+          if (next === "hang") return yield* Effect.sleep("1 minute").pipe(Effect.as(quiet));
+          if (next === "config-error") {
+            return yield* new AlwaysOnModel.AlwaysOnModelError({
+              detail: "That text generator does not exist.",
+            });
+          }
+          return next;
+        }),
+    }),
+  );
 
-it("rejects credential-shaped text and keeps fresh events out of a user session", () => {
-  expect(containsCredential({ actions: [{ body: SECRET }] })).toBe(true);
-  expect(containsCredential({ actions: [{ body: "Check the inbox" }] })).toBe(false);
+const provide = (
+  queue: Ref.Ref<readonly unknown[]>,
+  prompts: Ref.Ref<readonly string[]>,
+  extra?: Layer.Layer<never>,
+) =>
+  AlwaysOnService.layerManual.pipe(
+    Layer.provide(
+      Layer.mergeAll(schedulerMock, scripted(queue, prompts), ...(extra ? [extra] : [])),
+    ),
+  );
+
+const harness = <A, E, R>(
+  effect: (
+    service: AlwaysOnService.AlwaysOnService["Service"],
+    queue: Ref.Ref<readonly unknown[]>,
+    prompts: Ref.Ref<readonly string[]>,
+  ) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const queue = yield* Ref.make<readonly unknown[]>([]);
+    const prompts = yield* Ref.make<readonly string[]>([]);
+    return yield* Effect.gen(function* () {
+      const service = yield* AlwaysOnService.AlwaysOnService;
+      return yield* effect(service, queue, prompts);
+    }).pipe(Effect.provide(provide(queue, prompts)));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory));
+
+const createAgent = (service: AlwaysOnService.AlwaysOnService["Service"], title = "Desk") =>
+  service.create({
+    projectId,
+    title,
+    instructions: "Stay quiet unless asked.",
+    providerKind: "textGenerator",
+    instanceId: "fixture-generator",
+    model: "fixture-model",
+  });
+
+it("rejects credential-shaped text and separates session batches", () => {
+  expect(containsCredential({ text: SECRET })).toBe(true);
+  expect(containsCredential({ text: "Check the inbox" })).toBe(false);
   expect(
     selectInboxBatch([
       { kind: "user_reply", relatedSessionId: "session-1" },
-      { kind: "user_reply", relatedSessionId: "session-1" },
-      { kind: "timer", relatedSessionId: null },
-    ]).map((event) => event.kind),
-  ).toEqual(["user_reply", "user_reply"]);
-  expect(
-    selectInboxBatch([
       { kind: "external", relatedSessionId: null },
-      { kind: "timer", relatedSessionId: null },
-      { kind: "approval", relatedSessionId: "session-2" },
     ]).map((event) => event.kind),
-  ).toEqual(["external", "timer"]);
+  ).toEqual(["user_reply"]);
 });
 
-it.effect("acks an event, runs it, stores memory and a delivery, then sleeps", () =>
-  withService(
+it.effect("calls the model with memory, then runs only the decoded actions", () =>
+  harness((service, queue, prompts) =>
     Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Stay quiet unless asked.",
-      });
+      const created = yield* createAgent(service);
+      yield* Ref.set(queue, [
+        {
+          summary: "Noted the request.",
+          actions: [
+            {
+              type: "remember_note",
+              key: "note-1",
+              title: "Role",
+              pointer: "directory:people/role",
+            },
+            { type: "deliver", key: "deliver-1", dedupeKey: "reply-1", body: "Noted." },
+          ],
+        },
+      ]);
       const submitted = yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
         sourceEventId: "msg-1",
         kind: "user_reply",
-        actions: [
-          { type: "remember_note", key: "note-1", title: "Role", pointer: "directory:people/role" },
-          {
-            type: "record_progress",
-            key: "progress-1",
-            title: "Inbox",
-            taskKey: "inbox",
-            done: "Seen msg-1",
-          },
-          { type: "deliver", key: "deliver-1", dedupeKey: "reply-1", body: "Noted." },
-        ],
+        text: "Remember my role and tell me you did.",
       });
       const duplicate = yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
         sourceEventId: "msg-1",
         kind: "user_reply",
-        actions: [],
+        text: "Remember my role and tell me you did.",
       });
       expect(duplicate).toEqual({ eventId: submitted.eventId, duplicate: true });
-      expect(created.agent.phase).toBe("sleeping");
-
       yield* service.drain();
       const detail = yield* service.get({ agentId: created.agent.id });
       expect(detail.agent.phase).toBe("sleeping");
-      expect(detail.inbox.map((event) => event.status)).toEqual(["consumed"]);
-      expect(detail.runs.map((run) => [run.status, run.outcome])).toEqual([
-        ["completed", "deliver"],
+      expect(detail.runs[0]?.modelSummary).toBe("Noted the request.");
+      expect(detail.runs[0]?.executedActions.map((action) => action.type)).toEqual([
+        "remember_note",
+        "deliver",
       ]);
-      expect(detail.runs[0]?.loadedContext.instructions).toBe("Stay quiet unless asked.");
-      expect(detail.runs[0]?.loadedContext.noteIndex).toEqual([]);
-      expect(detail.deliveries).toEqual([
-        expect.objectContaining({
-          body: "Noted.",
-          status: "delivered",
-          attempts: 1,
-          dedupeKey: "reply-1",
-        }),
-      ]);
-      const note = detail.memoryIndex.find((entry) => entry.kind === "note");
-      expect(note?.pointer).toBe("directory:people/role");
-      expect(note?.hasBody).toBe(false);
-      const progress = detail.memoryIndex.find((entry) => entry.kind === "task_progress");
-      assert(progress !== undefined);
-      const record = yield* service.readMemory({
-        agentId: created.agent.id,
-        memoryId: progress.id,
-      });
-      expect(record.body).toBe("Seen msg-1");
+      expect(detail.deliveries[0]?.body).toBe("Noted.");
+      expect((yield* Ref.get(prompts))[0]).toContain("Stay quiet unless asked.");
+      expect((yield* Ref.get(prompts))[0]).toContain("Remember my role");
 
+      yield* Ref.set(queue, [quiet]);
       yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
         sourceEventId: "msg-2",
         kind: "user_reply",
-        actions: [{ type: "silent", key: "quiet-2" }],
+        text: "Anything else?",
       });
       yield* service.drain();
       const continued = yield* service.get({ agentId: created.agent.id });
@@ -133,312 +163,216 @@ it.effect("acks an event, runs it, stores memory and a delivery, then sleeps", (
       expect(continued.runs[1]?.loadedContext.noteIndex.map((entry) => entry.title)).toEqual([
         "Role",
       ]);
-      expect(JSON.stringify(continued.runs[1]?.loadedContext.noteIndex)).not.toContain(
-        "Seen msg-1",
-      );
+      expect((yield* Ref.get(prompts))[1]).toContain("Role");
     }),
   ),
 );
 
-it.effect("defers events that arrive during a run and does not treat a heartbeat as progress", () =>
-  Effect.gen(function* () {
-    const entered = yield* Deferred.make<void>();
-    const release = yield* Deferred.make<void>();
-    const gate = Layer.succeed(AlwaysOnService.AlwaysOnRunGate, {
-      afterClaim: Effect.gen(function* () {
-        yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(release);
-      }),
-      afterUncertain: Effect.void,
-    });
-    yield* Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Stay quiet.",
-      });
+it.effect("rejects a structured shell action from the model and executes nothing", () =>
+  harness((service, queue, prompts) =>
+    Effect.gen(function* () {
+      const created = yield* createAgent(service);
+      yield* Ref.set(queue, [
+        { summary: "I will use a shell.", actions: [{ type: "shell", command: "rm -rf /" }] },
+      ]);
       yield* service.submitEvent({
         agentId: created.agent.id,
-        source: "github",
-        sourceEventId: "evt-1",
+        source: "user",
+        sourceEventId: "bad",
         kind: "external",
-        actions: [{ type: "remember_note", key: "during", title: "First", body: "one" }],
+        text: "Delete the disk.",
       });
-      const fiber = yield* Effect.forkChild(service.drain());
-      yield* Deferred.await(entered);
-      yield* service.submitEvent({
-        agentId: created.agent.id,
-        source: "github",
-        sourceEventId: "evt-2",
-        kind: "external",
-        actions: [{ type: "silent", key: "later" }],
-      });
-      const mid = yield* service.get({ agentId: created.agent.id });
-      expect(mid.agent.phase).toBe("running");
-      expect(mid.runs.map((run) => run.eventIds)).toEqual([[expect.any(String)]]);
-      expect(mid.runs[0]?.lastProgressAt).toBeNull();
-      expect(mid.inbox.filter((event) => event.status === "pending")).toHaveLength(1);
-      yield* Deferred.succeed(release, undefined);
-      yield* Fiber.join(fiber);
-      const done = yield* service.get({ agentId: created.agent.id });
-      expect(done.runs).toHaveLength(2);
-      expect(done.runs[0]?.eventIds).not.toEqual(done.runs[1]?.eventIds);
-      expect(done.runs[0]?.sessionId).not.toBe(done.runs[1]?.sessionId);
-      expect(done.agent.phase).toBe("sleeping");
-    }).pipe(
-      Effect.provide(
-        AlwaysOnService.layerManual.pipe(Layer.provide(Layer.mergeAll(schedulerMock, gate))),
-      ),
-    );
-  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
-);
-
-it.effect("fires a due timer into the inbox on the scheduler and runs it afterward", () =>
-  Effect.gen(function* () {
-    const service = yield* AlwaysOnService.AlwaysOnService;
-    const created = yield* service.create({
-      projectId,
-      title: "Desk",
-      instructions: "Check in.",
-    });
-    const dueAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { seconds: 1 }));
-    yield* service.submitEvent({
-      agentId: created.agent.id,
-      source: "agent",
-      sourceEventId: "arm-timer",
-      kind: "system",
-      actions: [{ type: "set_timer", key: "daily", timerKind: "deadline", dueAt }],
-    });
-    yield* service.drain();
-    const armed = yield* service.get({ agentId: created.agent.id });
-    expect(armed.timers).toEqual([expect.objectContaining({ kind: "deadline", status: "armed" })]);
-    expect(armed.inbox.some((event) => event.kind === "timer")).toBe(false);
-
-    yield* TestClock.adjust(Duration.seconds(5));
-    const fired = yield* service.get({ agentId: created.agent.id });
-    expect(fired.inbox.some((event) => event.kind === "timer" && event.status === "consumed")).toBe(
-      true,
-    );
-    expect(fired.timers[0]?.status).toBe("fired");
-    expect(fired.runs.at(-1)?.outcome).toBe("silent");
-  }).pipe(
-    Effect.provide(
-      AlwaysOnService.layerManual.pipe(
-        Layer.provide(Scheduler.layer),
-        Layer.provideMerge(SqlitePersistence.layerMemory),
-      ),
-    ),
+      yield* service.drain();
+      const detail = yield* service.get({ agentId: created.agent.id });
+      expect(detail.runs[0]?.status).toBe("failed");
+      expect(detail.runs[0]?.modelError).toBe(
+        "The model returned an action this server will not run.",
+      );
+      expect(detail.runs[0]?.executedActions).toEqual([]);
+      expect(detail.memoryIndex.map((entry) => entry.kind)).toEqual(["instruction"]);
+      expect(yield* Ref.get(prompts)).toHaveLength(1);
+    }),
   ),
 );
 
-it.effect("releases the worker while an approval waits, then resumes or skips the action", () =>
-  withService(
+it.effect("reports a missing text generator and executes nothing", () =>
+  harness((service, queue) =>
     Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Ask first.",
+      const created = yield* createAgent(service);
+      yield* Ref.set(queue, ["config-error"]);
+      yield* service.submitEvent({
+        agentId: created.agent.id,
+        source: "user",
+        sourceEventId: "missing",
+        kind: "external",
+        text: "Wake up.",
       });
-      const approved = yield* agentWithApproval(service, created.agent.id, "approval-a", "ship-a");
+      yield* service.drain();
+      const detail = yield* service.get({ agentId: created.agent.id });
+      expect(detail.runs[0]?.status).toBe("failed");
+      expect(detail.runs[0]?.modelError).toBe("That text generator does not exist.");
+      expect(detail.runs[0]?.executedActions).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("times out a model call without executing actions", () =>
+  harness((service, queue) =>
+    Effect.gen(function* () {
+      const created = yield* createAgent(service);
+      yield* Ref.set(queue, ["hang"]);
+      yield* service.submitEvent({
+        agentId: created.agent.id,
+        source: "user",
+        sourceEventId: "slow",
+        kind: "external",
+        text: "Take your time.",
+      });
+      const fiber = yield* Effect.forkChild(service.drain());
+      yield* TestClock.adjust(Duration.seconds(21));
+      yield* Fiber.join(fiber);
+      const detail = yield* service.get({ agentId: created.agent.id });
+      expect(detail.runs[0]?.status).toBe("failed");
+      expect(detail.runs[0]?.modelError).toBe("The model timed out.");
+      expect(detail.runs[0]?.executedActions).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("asks the model again after approval and can run other events meanwhile", () =>
+  harness((service, queue) =>
+    Effect.gen(function* () {
+      const created = yield* createAgent(service);
+      yield* Ref.set(queue, [
+        {
+          summary: "Need approval.",
+          actions: [
+            {
+              type: "request_approval",
+              key: "ask",
+              summary: "Send the update?",
+              onApprove: [],
+            },
+          ],
+        },
+        {
+          summary: "Did other work.",
+          actions: [{ type: "remember_note", key: "other", title: "Other work", body: "done" }],
+        },
+        {
+          summary: "Approved send.",
+          actions: [{ type: "deliver", key: "send", dedupeKey: "ship", body: "Ship it." }],
+        },
+      ]);
+      yield* service.submitEvent({
+        agentId: created.agent.id,
+        source: "user",
+        sourceEventId: "ask",
+        kind: "user_reply",
+        text: "Send the update if I approve.",
+      });
       yield* service.drain();
       const waiting = yield* service.get({ agentId: created.agent.id });
       expect(waiting.agent.phase).toBe("sleeping");
       expect(waiting.runs[0]?.status).toBe("awaiting_approval");
-      expect(waiting.approvals[0]?.status).toBe("pending");
+      const approvalId = waiting.approvals[0]?.id;
+      assert(approvalId !== undefined);
 
       yield* service.submitEvent({
         agentId: created.agent.id,
         source: "github",
-        sourceEventId: "while-waiting",
+        sourceEventId: "meanwhile",
         kind: "external",
-        actions: [{ type: "remember_note", key: "meanwhile", title: "Other work", body: "done" }],
+        text: "A different event arrived.",
       });
       yield* service.drain();
       const parallel = yield* service.get({ agentId: created.agent.id });
-      expect(parallel.runs.map((run) => run.status)).toEqual(["awaiting_approval", "completed"]);
       expect(parallel.memoryIndex.some((entry) => entry.title === "Other work")).toBe(true);
       expect(parallel.deliveries).toEqual([]);
 
       yield* service.resolveApproval({
         agentId: created.agent.id,
-        approvalId: approved,
+        approvalId,
         decision: "approved",
       });
       yield* service.drain();
       const resumed = yield* service.get({ agentId: created.agent.id });
       expect(resumed.deliveries.map((delivery) => delivery.body)).toEqual(["Ship it."]);
-      expect(resumed.approvals[0]?.status).toBe("approved");
-
-      const rejected = yield* service.create({
-        projectId,
-        title: "Other desk",
-        instructions: "Ask first.",
-      });
-      const rejectedApproval = yield* agentWithApproval(
-        service,
-        rejected.agent.id,
-        "approval-b",
-        "ship-b",
-      );
-      yield* service.drain();
-      yield* service.resolveApproval({
-        agentId: rejected.agent.id,
-        approvalId: rejectedApproval,
-        decision: "rejected",
-      });
-      yield* service.drain();
-      const declined = yield* service.get({ agentId: rejected.agent.id });
-      expect(declined.deliveries).toEqual([]);
-      expect(declined.approvals[0]?.status).toBe("rejected");
+      expect(resumed.runs.filter((run) => run.modelSummary === "Approved send.")).toHaveLength(1);
     }),
   ),
 );
 
-it.effect("retries a delivery once and deduplicates a repeated send", () =>
-  Effect.gen(function* () {
-    const attempts = yield* Ref.make(0);
-    const delivery = Layer.succeed(AlwaysOnService.AlwaysOnDeliveryAttempt, () =>
-      Effect.gen(function* () {
-        const attempt = yield* Ref.updateAndGet(attempts, (current) => current + 1);
-        if (attempt === 1) return yield* new AlwaysOnService.AlwaysOnDeliveryFailed();
-      }),
-    );
-    yield* Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Be quiet.",
-      });
-      yield* service.submitEvent({
-        agentId: created.agent.id,
-        source: "user",
-        sourceEventId: "send",
-        kind: "user_reply",
-        actions: [{ type: "deliver", key: "send", dedupeKey: "once", body: "Hello" }],
-      });
-      yield* service.drain();
-      const failed = yield* service.get({ agentId: created.agent.id });
-      expect(failed.deliveries[0]).toMatchObject({ status: "pending", attempts: 1 });
-      yield* service.drain();
-      const stillWaiting = yield* service.get({ agentId: created.agent.id });
-      expect(stillWaiting.deliveries[0]?.status).toBe("pending");
-      yield* TestClock.adjust(Duration.seconds(1));
-      yield* service.drain();
-      const delivered = yield* service.get({ agentId: created.agent.id });
-      expect(delivered.deliveries[0]).toMatchObject({ status: "delivered", attempts: 2 });
-
-      yield* service.submitEvent({
-        agentId: created.agent.id,
-        source: "user",
-        sourceEventId: "send-again",
-        kind: "user_reply",
-        actions: [{ type: "deliver", key: "send-again", dedupeKey: "once", body: "Hello again" }],
-      });
-      yield* service.drain();
-      const deduped = yield* service.get({ agentId: created.agent.id });
-      expect(deduped.deliveries.filter((delivery) => delivery.status === "delivered")).toHaveLength(
-        1,
-      );
-      expect(deduped.deliveries[0]?.body).toBe("Hello");
-    }).pipe(
-      Effect.provide(
-        AlwaysOnService.layerManual.pipe(Layer.provide(Layer.mergeAll(schedulerMock, delivery))),
-      ),
-    );
-  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
-);
-
-it.effect("requeues a crashed run and withholds an uncertain effect instead of replaying it", () =>
-  Effect.gen(function* () {
-    const safeEntered = yield* Deferred.make<void>();
-    const safeRelease = yield* Deferred.make<void>();
-    const uncertainEntered = yield* Deferred.make<void>();
-    const uncertainRelease = yield* Deferred.make<void>();
-    const safeId = yield* crashDuring(
-      {
-        afterClaim: Effect.gen(function* () {
-          yield* Deferred.succeed(safeEntered, undefined);
-          yield* Deferred.await(safeRelease);
-        }),
-        afterUncertain: Effect.void,
-      },
-      safeEntered,
-      [{ type: "remember_note", key: "note", title: "Kept", body: "body" }],
-      "safe-event",
-    );
-    const unknownId = yield* crashDuring(
-      {
-        afterClaim: Effect.void,
-        afterUncertain: Effect.gen(function* () {
-          yield* Deferred.succeed(uncertainEntered, undefined);
-          yield* Deferred.await(uncertainRelease);
-        }),
-      },
-      uncertainEntered,
-      [{ type: "record_uncertain", key: "external", summary: "An unverified external call" }],
-      "unknown-event",
-    );
-
-    return yield* Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      yield* service.drain();
-      const retried = yield* service.get({ agentId: safeId });
-      expect(retried.runs.map((run) => run.status)).toEqual(["interrupted", "completed"]);
-      expect(retried.inbox.every((event) => event.status === "consumed")).toBe(true);
-      expect(retried.memoryIndex.filter((entry) => entry.kind === "note")).toHaveLength(1);
-
-      const unknown = yield* service.get({ agentId: unknownId });
-      expect(unknown.agent.phase).toBe("needs_confirmation");
-      expect(unknown.runs.map((run) => run.status)).toEqual(["unknown"]);
-      expect(unknown.inbox[0]?.status).toBe("consumed");
-      expect(unknown.memoryIndex.map((entry) => entry.kind)).toEqual(["instruction"]);
-      yield* service.drain();
-      const stillUnknown = yield* service.get({ agentId: unknownId });
-      expect(stillUnknown.runs).toHaveLength(1);
-      const confirmed = yield* service.confirmUnknown({ agentId: unknownId });
-      expect(confirmed.phase).toBe("sleeping");
-      yield* service.submitEvent({
-        agentId: unknownId,
-        source: "user",
-        sourceEventId: "after-confirm",
-        kind: "system",
-        actions: [{ type: "deliver", key: "after", dedupeKey: "after", body: "Still here" }],
-      });
-      yield* service.drain();
-      const continued = yield* service.get({ agentId: unknownId });
-      expect(continued.deliveries.map((delivery) => delivery.body)).toEqual(["Still here"]);
-      expect(continued.runs.map((run) => run.outcome)).toEqual(["silent", "deliver"]);
-    }).pipe(Effect.provide(manual));
-  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
-);
-
-it.effect("cancels a running run and pauses dispatch without dropping the inbox", () =>
+it.effect("does not call the model again when a stored decision survives a restart", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
-    const release = yield* Deferred.make<void>();
+    const queue = yield* Ref.make<readonly unknown[]>([
+      {
+        summary: "Deliver once.",
+        actions: [{ type: "deliver", key: "once", dedupeKey: "once", body: "Hello" }],
+      },
+    ]);
+    const prompts = yield* Ref.make<readonly string[]>([]);
     const gate = Layer.succeed(AlwaysOnService.AlwaysOnRunGate, {
-      afterClaim: Effect.gen(function* () {
+      afterClaim: Effect.void,
+      afterDecision: Effect.gen(function* () {
         yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(release);
+        return yield* Effect.never;
       }),
       afterUncertain: Effect.void,
     });
+    const agentId = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* AlwaysOnService.AlwaysOnService;
+        const created = yield* createAgent(service, "restart");
+        yield* service.submitEvent({
+          agentId: created.agent.id,
+          source: "user",
+          sourceEventId: "once",
+          kind: "external",
+          text: "Say hello.",
+        });
+        const fiber = yield* Effect.forkChild(service.drain());
+        yield* Deferred.await(entered);
+        yield* Fiber.interrupt(fiber);
+        return created.agent.id;
+      }).pipe(Effect.provide(provide(queue, prompts, gate))),
+    );
+
     yield* Effect.gen(function* () {
       const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Stay quiet.",
-      });
+      yield* service.drain();
+      const detail = yield* service.get({ agentId });
+      expect(detail.deliveries.map((delivery) => delivery.body)).toEqual(["Hello"]);
+      expect(yield* Ref.get(prompts)).toHaveLength(1);
+    }).pipe(Effect.provide(provide(queue, prompts)));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("cancels a model call and pauses later dispatch", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const prompts = yield* Ref.make<readonly string[]>([]);
+    const model = Layer.succeed(
+      AlwaysOnModel.AlwaysOnModel,
+      AlwaysOnModel.AlwaysOnModel.of({
+        decide: (input) =>
+          Effect.gen(function* () {
+            yield* Ref.update(prompts, (current) => [...current, input.prompt]);
+            yield* Deferred.succeed(entered, undefined);
+            return yield* Effect.sleep("1 minute").pipe(Effect.as(quiet));
+          }),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* AlwaysOnService.AlwaysOnService;
+      const created = yield* createAgent(service);
       yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
-        sourceEventId: "cancel-me",
-        kind: "system",
-        actions: [{ type: "remember_note", key: "nope", title: "Should not land", body: "no" }],
+        sourceEventId: "cancel",
+        kind: "external",
+        text: "Work forever.",
       });
       const fiber = yield* Effect.forkChild(service.drain());
       yield* Deferred.await(entered);
@@ -446,157 +380,68 @@ it.effect("cancels a running run and pauses dispatch without dropping the inbox"
       const runId = running.runs[0]?.id;
       assert(runId !== undefined);
       yield* service.cancel({ agentId: created.agent.id, runId });
-      yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(fiber);
       const cancelled = yield* service.get({ agentId: created.agent.id });
       expect(cancelled.runs[0]?.status).toBe("cancelled");
-      expect(cancelled.memoryIndex.some((entry) => entry.title === "Should not land")).toBe(false);
+      expect(cancelled.runs[0]?.executedActions).toEqual([]);
 
       yield* service.setEnabled({ agentId: created.agent.id, enabled: false });
       yield* service.submitEvent({
         agentId: created.agent.id,
         source: "user",
-        sourceEventId: "while-paused",
+        sourceEventId: "paused",
         kind: "external",
-        actions: [{ type: "silent", key: "paused" }],
+        text: "This waits.",
       });
       yield* service.drain();
       const paused = yield* service.get({ agentId: created.agent.id });
       expect(paused.agent.phase).toBe("paused");
       expect(paused.inbox.some((event) => event.status === "pending")).toBe(true);
-      yield* service.setEnabled({ agentId: created.agent.id, enabled: true });
-      yield* service.drain();
-      const resumed = yield* service.get({ agentId: created.agent.id });
-      expect(resumed.agent.phase).toBe("sleeping");
-      expect(resumed.inbox.every((event) => event.status !== "pending")).toBe(true);
     }).pipe(
       Effect.provide(
-        AlwaysOnService.layerManual.pipe(Layer.provide(Layer.mergeAll(schedulerMock, gate))),
+        AlwaysOnService.layerManual.pipe(Layer.provide(Layer.mergeAll(schedulerMock, model))),
       ),
     );
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
-it.effect("refuses credential text and another agent's memory", () =>
-  withService(
-    Effect.gen(function* () {
+it.effect("fires a timer into the inbox and lets the model answer it", () =>
+  Effect.gen(function* () {
+    const queue = yield* Ref.make<readonly unknown[]>([]);
+    const prompts = yield* Ref.make<readonly string[]>([]);
+    yield* Effect.gen(function* () {
       const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: "Desk",
-        instructions: "Stay quiet.",
-      });
-      const failure = yield* service
-        .submitEvent({
-          agentId: created.agent.id,
-          source: "user",
-          sourceEventId: "secret",
-          kind: "user_reply",
-          actions: [{ type: "remember_note", key: "secret", title: "Nope", body: SECRET }],
-        })
-        .pipe(Effect.flip);
-      expect(failure.reason).toBe("rejected");
-      expect(failure.message).not.toContain(SECRET);
-      const clean = yield* service.get({ agentId: created.agent.id });
-      expect(clean.inbox).toEqual([]);
-      expect(JSON.stringify(clean)).not.toContain(SECRET);
-
+      const created = yield* createAgent(service);
+      const dueAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { seconds: 1 }));
+      yield* Ref.set(queue, [
+        {
+          summary: "Armed.",
+          actions: [{ type: "set_timer", key: "daily", timerKind: "deadline", dueAt }],
+        },
+        quiet,
+      ]);
       yield* service.submitEvent({
         agentId: created.agent.id,
-        source: "user",
-        sourceEventId: "note",
-        kind: "user_reply",
-        actions: [{ type: "remember_note", key: "owned", title: "Mine", body: "private note" }],
+        source: "agent",
+        sourceEventId: "arm",
+        kind: "system",
+        text: "Check back in a second.",
       });
       yield* service.drain();
-      const detail = yield* service.get({ agentId: created.agent.id });
-      const memoryId = detail.memoryIndex.find((entry) => entry.kind === "note")?.id;
-      assert(memoryId !== undefined);
-      const other = yield* service.create({
-        projectId,
-        title: "Other",
-        instructions: "Stay quiet.",
-      });
-      const denied = yield* service
-        .readMemory({ agentId: other.agent.id, memoryId })
-        .pipe(Effect.flip);
-      expect(denied.reason).toBe("denied");
-      expect(denied.message).not.toContain("private note");
-      const missing = yield* service
-        .readMemory({
-          agentId: created.agent.id,
-          memoryId: AlwaysOnMemoryId.make("always-on-memory:missing"),
-        })
-        .pipe(Effect.flip);
-      expect(missing.reason).toBe("not_found");
-      expect(AlwaysOnAgentId.make(created.agent.id)).toBe(created.agent.id);
-    }),
-  ),
-);
-
-const agentWithApproval = (
-  service: AlwaysOnService.AlwaysOnService["Service"],
-  agentId: AlwaysOnAgentId,
-  sourceEventId: string,
-  dedupeKey: string,
-) =>
-  Effect.gen(function* () {
-    yield* service.submitEvent({
-      agentId,
-      source: "user",
-      sourceEventId,
-      kind: "user_reply",
-      actions: [
-        {
-          type: "request_approval",
-          key: `${sourceEventId}-ask`,
-          summary: "Send the update?",
-          onApprove: [{ type: "deliver", key: `${dedupeKey}-send`, dedupeKey, body: "Ship it." }],
-        },
-      ],
-    });
-    yield* service.drain();
-    const detail = yield* service.get({ agentId });
-    const approvalId = detail.approvals[0]?.id;
-    assert(approvalId !== undefined);
-    return approvalId;
-  });
-
-const crashDuring = (
-  gate: {
-    readonly afterClaim: Effect.Effect<void>;
-    readonly afterUncertain: Effect.Effect<void>;
-  },
-  entered: Deferred.Deferred<void>,
-  actions: readonly AlwaysOnAction[],
-  sourceEventId: string,
-) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const service = yield* AlwaysOnService.AlwaysOnService;
-      const created = yield* service.create({
-        projectId,
-        title: sourceEventId,
-        instructions: "Stay quiet.",
-      });
-      yield* service.submitEvent({
-        agentId: created.agent.id,
-        source: "fixture",
-        sourceEventId,
-        kind: "external",
-        actions: [...actions],
-      });
-      const fiber = yield* Effect.forkChild(service.drain());
-      yield* Deferred.await(entered);
-      yield* Fiber.interrupt(fiber);
-      return created.agent.id;
+      yield* TestClock.adjust(Duration.seconds(5));
+      const fired = yield* service.get({ agentId: created.agent.id });
+      expect(
+        fired.inbox.some((event) => event.kind === "timer" && event.status === "consumed"),
+      ).toBe(true);
+      expect(fired.timers[0]?.status).toBe("fired");
+      expect((yield* Ref.get(prompts)).some((prompt) => prompt.includes("Timer due."))).toBe(true);
     }).pipe(
       Effect.provide(
         AlwaysOnService.layerManual.pipe(
-          Layer.provide(
-            Layer.mergeAll(schedulerMock, Layer.succeed(AlwaysOnService.AlwaysOnRunGate, gate)),
-          ),
+          Layer.provide(Layer.mergeAll(Scheduler.layer, scripted(queue, prompts))),
+          Layer.provideMerge(SqlitePersistence.layerMemory),
         ),
       ),
-    ),
-  );
+    );
+  }),
+);
