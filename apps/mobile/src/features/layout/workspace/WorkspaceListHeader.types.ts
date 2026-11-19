@@ -1,9 +1,11 @@
+import type { ReactNode } from "react";
 import type { AppBarMenuItem } from "../../../components/ui/AppBar.types";
 
 /** The header of the workspace thread list, on Home and in the sidebar column. */
 export interface WorkspaceListHeaderProps {
   /** Spoken for the brand title, such as "T3 Code, Threads". */
   readonly accessibilityLabel: string;
+  readonly androidTitleContent?: ReactNode;
   /** The connection status beside the brand opens environment settings. */
   readonly onOpenEnvironments: () => void;
   readonly search: {

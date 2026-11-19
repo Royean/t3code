@@ -62,10 +62,12 @@ export function WorkspaceListHeader(props: WorkspaceListHeaderProps) {
     <AppBar
       title="T3 Code"
       titleContent={
-        <WorkspaceBrandTitle
-          accessibilityLabel={props.accessibilityLabel}
-          onOpenEnvironments={props.onOpenEnvironments}
-        />
+        props.androidTitleContent ?? (
+          <WorkspaceBrandTitle
+            accessibilityLabel={props.accessibilityLabel}
+            onOpenEnvironments={props.onOpenEnvironments}
+          />
+        )
       }
       search={{
         value: search.value,

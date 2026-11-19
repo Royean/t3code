@@ -84,31 +84,35 @@ export function AlwaysOnWorkspace({
     },
   );
   const alwaysOnLabel = gt("Always On");
-  const tabs = (
-    <View className="items-start bg-header px-4 py-2">
-      <SegmentedControl
-        variant="card"
-        size="compact"
-        role="tab"
-        className="w-full max-w-64"
-        selected={selected}
-        onSelect={selectTab}
-        options={[
-          { value: "threads", label: gt("Threads") },
-          {
-            value: "alwaysOn",
-            label:
-              attention > 0
-                ? gt("{tab} · {count}", { tab: alwaysOnLabel, count: attention })
-                : alwaysOnLabel,
-            accessibilityLabel:
-              attention > 0
-                ? gt("Always On, {count} need attention", { count: attention })
-                : alwaysOnLabel,
-          },
-        ]}
-      />
-    </View>
+  const tabsInHeader = Platform.OS === "android" && !sidebar && !layout.usesSplitView;
+  const switcher = (
+    <SegmentedControl
+      variant="card"
+      size="compact"
+      role="tab"
+      className="w-full max-w-64"
+      selected={selected}
+      onSelect={selectTab}
+      options={[
+        { value: "threads", label: gt("Threads") },
+        {
+          value: "alwaysOn",
+          label:
+            attention > 0
+              ? gt("{tab} · {count}", { tab: alwaysOnLabel, count: attention })
+              : alwaysOnLabel,
+          accessibilityLabel:
+            attention > 0
+              ? gt("Always On, {count} need attention", { count: attention })
+              : alwaysOnLabel,
+        },
+      ]}
+    />
+  );
+  const tabs = tabsInHeader ? (
+    switcher
+  ) : (
+    <View className="items-start bg-header px-4 py-2">{switcher}</View>
   );
 
   return (
@@ -121,9 +125,13 @@ export function AlwaysOnWorkspace({
         ) : (
           <>
             {!sidebar && Platform.OS === "android" ? (
-              <AppBar embedded title={alwaysOnLabel} />
+              <AppBar
+                embedded
+                title={alwaysOnLabel}
+                titleContent={tabsInHeader ? tabs : undefined}
+              />
             ) : null}
-            {tabs}
+            {tabsInHeader ? null : tabs}
             <AlwaysOnAgentList environments={environments} />
           </>
         )

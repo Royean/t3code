@@ -70,6 +70,7 @@ function ThreadHomeRouteScreen({ tabs }: { readonly tabs?: ReactNode }) {
   const m = useMessages();
   const nativePrimaryColumn = use(NativePrimaryColumnContext);
   const { layout, setPrimarySidebarSearchQuery, startNewTask } = useAdaptiveWorkspaceLayout();
+  const tabsInHeader = Platform.OS === "android" && !layout.usesSplitView;
   const { primarySidebarSearchQuery } = useWorkspacePaneState();
   const selectDetail = useSelectWorkspaceDetail();
   const projects = useProjects();
@@ -188,6 +189,7 @@ function ThreadHomeRouteScreen({ tabs }: { readonly tabs?: ReactNode }) {
       <>
         <WorkspaceListHeader
           accessibilityLabel={gt("T3 Code, Threads")}
+          androidTitleContent={tabsInHeader ? tabs : undefined}
           onOpenEnvironments={() => openSettings(navigation, "SettingsEnvironments")}
           search={{
             value: searchQuery,
@@ -210,7 +212,7 @@ function ThreadHomeRouteScreen({ tabs }: { readonly tabs?: ReactNode }) {
             ),
           }}
         />
-        {tabs}
+        {tabsInHeader ? null : tabs}
         <HomeScreen
           catalogState={catalogState}
           environments={environments}
