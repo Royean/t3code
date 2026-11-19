@@ -393,6 +393,23 @@ import {
   TextGeneratorError,
 } from "./settings.ts";
 import {
+  AlwaysOnAgentInput,
+  AlwaysOnAgentSummary,
+  AlwaysOnCancelInput,
+  AlwaysOnCreateInput,
+  AlwaysOnCreateResult,
+  AlwaysOnDetail,
+  AlwaysOnError,
+  AlwaysOnGetInput,
+  AlwaysOnMemoryRecord,
+  AlwaysOnReadMemoryInput,
+  AlwaysOnResolveApprovalInput,
+  AlwaysOnSetEnabledInput,
+  AlwaysOnSnapshot,
+  AlwaysOnSubmitEventInput,
+  AlwaysOnSubmitEventResult,
+} from "./alwaysOn.ts";
+import {
   ScheduledTaskDeleteInput,
   ScheduledTaskDeleteResult,
   ScheduledTaskError,
@@ -586,6 +603,16 @@ export const WS_METHODS = {
   guestShareCreate: "guestShare.create",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
+
+  alwaysOnSubscribe: "alwaysOn.subscribe",
+  alwaysOnCreate: "alwaysOn.create",
+  alwaysOnSetEnabled: "alwaysOn.setEnabled",
+  alwaysOnSubmitEvent: "alwaysOn.submitEvent",
+  alwaysOnGet: "alwaysOn.get",
+  alwaysOnReadMemory: "alwaysOn.readMemory",
+  alwaysOnResolveApproval: "alwaysOn.resolveApproval",
+  alwaysOnConfirmUnknown: "alwaysOn.confirmUnknown",
+  alwaysOnCancel: "alwaysOn.cancel",
 
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -2217,6 +2244,61 @@ const WsScheduledTasksListWebhookDeliveriesRpc = Rpc.make(
   },
 );
 
+const WsAlwaysOnSubscribeRpc = Rpc.make(WS_METHODS.alwaysOnSubscribe, {
+  payload: Schema.Struct({}),
+  success: AlwaysOnSnapshot,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+const WsAlwaysOnCreateRpc = Rpc.make(WS_METHODS.alwaysOnCreate, {
+  payload: AlwaysOnCreateInput,
+  success: AlwaysOnCreateResult,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnSetEnabledRpc = Rpc.make(WS_METHODS.alwaysOnSetEnabled, {
+  payload: AlwaysOnSetEnabledInput,
+  success: AlwaysOnAgentSummary,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnSubmitEventRpc = Rpc.make(WS_METHODS.alwaysOnSubmitEvent, {
+  payload: AlwaysOnSubmitEventInput,
+  success: AlwaysOnSubmitEventResult,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnGetRpc = Rpc.make(WS_METHODS.alwaysOnGet, {
+  payload: AlwaysOnGetInput,
+  success: AlwaysOnDetail,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnReadMemoryRpc = Rpc.make(WS_METHODS.alwaysOnReadMemory, {
+  payload: AlwaysOnReadMemoryInput,
+  success: AlwaysOnMemoryRecord,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnResolveApprovalRpc = Rpc.make(WS_METHODS.alwaysOnResolveApproval, {
+  payload: AlwaysOnResolveApprovalInput,
+  success: AlwaysOnSubmitEventResult,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnConfirmUnknownRpc = Rpc.make(WS_METHODS.alwaysOnConfirmUnknown, {
+  payload: AlwaysOnAgentInput,
+  success: AlwaysOnAgentSummary,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
+const WsAlwaysOnCancelRpc = Rpc.make(WS_METHODS.alwaysOnCancel, {
+  payload: AlwaysOnCancelInput,
+  success: AlwaysOnAgentSummary,
+  error: Schema.Union([AlwaysOnError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksGetWebhookDeliveryRpc = Rpc.make(
   WS_METHODS.scheduledTasksGetWebhookDelivery,
   {
@@ -2329,6 +2411,15 @@ export const WsRpcGroup = RpcGroup.make(
   WsSecretsAnswerRequestRpc,
   WsScheduledTasksListWebhookDeliveriesRpc,
   WsScheduledTasksGetWebhookDeliveryRpc,
+  WsAlwaysOnSubscribeRpc,
+  WsAlwaysOnCreateRpc,
+  WsAlwaysOnSetEnabledRpc,
+  WsAlwaysOnSubmitEventRpc,
+  WsAlwaysOnGetRpc,
+  WsAlwaysOnReadMemoryRpc,
+  WsAlwaysOnResolveApprovalRpc,
+  WsAlwaysOnConfirmUnknownRpc,
+  WsAlwaysOnCancelRpc,
   WsServerReportClientActivityRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,

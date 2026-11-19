@@ -57,6 +57,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as AlwaysOnService from "../alwaysOn/AlwaysOnService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -407,6 +408,7 @@ export const layerProduction = Layer.mergeAll(
   layerThreadLaunchProvided,
   layerScheduledTaskProvided,
   layerEventOrchestrationProvided,
+  AlwaysOnService.layer,
   layerScratchThreadPromotionProvided,
   layerSecretRequestsProvided,
   GuestShareService.layer.pipe(
