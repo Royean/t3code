@@ -43,6 +43,37 @@ export function selectInboxBatch<E extends BatchEvent>(events: readonly E[]): re
   return batch;
 }
 
+const MAX_PROMPT_CHARS = 8_000;
+
+/**
+ * Lean context for one model call. The allowed-type sentence only steers the reply.
+ * The service rejects every other shape; this text is not the enforcement.
+ */
+export function alwaysOnPrompt(input: {
+  readonly instructions: string;
+  readonly notes: readonly { readonly title: string; readonly pointer: string | null }[];
+  readonly progress: readonly { readonly title: string; readonly taskKey: string | null }[];
+  readonly recentResults: readonly { readonly title: string; readonly body: string }[];
+  readonly events: readonly { readonly kind: string; readonly text: string }[];
+}): string {
+  const lines = [
+    "Decide the next always-on actions. Reply with JSON {summary, actions}.",
+    "Allowed action types: remember_note, record_progress, remember_result, set_timer, deliver, silent, request_approval, record_uncertain.",
+    "Do not invent tools. Shell and network calls are not actions.",
+    `Instructions: ${input.instructions}`,
+    "Notes:",
+    ...input.notes.map((note) => `- ${note.title}${note.pointer ? ` (${note.pointer})` : ""}`),
+    "Progress:",
+    ...input.progress.map((item) => `- ${item.taskKey ?? item.title}: ${item.title}`),
+    "Recent results:",
+    ...input.recentResults.map((result) => `- ${result.title}: ${result.body}`),
+    "Events:",
+    ...input.events.map((event) => `- ${event.kind}: ${event.text}`),
+  ];
+  const text = lines.join("\n");
+  return text.length <= MAX_PROMPT_CHARS ? text : text.slice(0, MAX_PROMPT_CHARS);
+}
+
 /** Collapse missed recurrences into the next future due time and one inbox event. */
 export function nextRecurringDue(dueAtMs: number, everyMs: number, nowMs: number): number {
   const step = Math.max(1, everyMs);

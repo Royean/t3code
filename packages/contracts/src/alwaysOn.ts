@@ -107,7 +107,7 @@ const AlwaysOnSilentAction = Schema.Struct({
   key: ActionKey,
 });
 
-/** Actions the restricted executor can apply without a provider process. */
+/** Actions the server may apply after a model decision passes the schema. */
 export const AlwaysOnEffectAction = Schema.Union([
   AlwaysOnNoteAction,
   AlwaysOnProgressAction,
@@ -197,9 +197,53 @@ export const AlwaysOnAgentSummary = Schema.Struct({
 });
 export type AlwaysOnAgentSummary = typeof AlwaysOnAgentSummary.Type;
 
+export const AlwaysOnProviderKind = Schema.Literals(["textGenerator", "claudeAgent"]);
+export type AlwaysOnProviderKind = typeof AlwaysOnProviderKind.Type;
+
+export const AlwaysOnProviderPolicy = Schema.Struct({
+  id: Schema.String,
+  supported: Schema.Boolean,
+  detail: Schema.String,
+});
+export type AlwaysOnProviderPolicy = typeof AlwaysOnProviderPolicy.Type;
+
+/** Known drivers. Anything else is unsupported until its tool list is empty in code. */
+export const ALWAYS_ON_PROVIDER_POLICY: readonly AlwaysOnProviderPolicy[] = [
+  {
+    id: "textGenerator",
+    supported: true,
+    detail:
+      "OpenAI-compatible and Anthropic text generators send only a chat message. The HTTP body has no tools field.",
+  },
+  {
+    id: "claudeAgent",
+    supported: true,
+    detail:
+      "Claude text generation passes --tools with an empty list, disables hooks, and refuses permission prompts.",
+  },
+  {
+    id: "codex",
+    supported: false,
+    detail:
+      "Codex exec uses a read-only sandbox but still has tools. It is not an empty tool list.",
+  },
+  {
+    id: "antigravity",
+    supported: false,
+    detail:
+      "Antigravity rejects tool callbacks, and that rejection is not a native sandbox. It stays disabled.",
+  },
+  {
+    id: "other",
+    supported: false,
+    detail: "This runtime has no verified empty tool list, so always-on will not start it.",
+  },
+];
+
 export const AlwaysOnSnapshot = Schema.Struct({
   revision: Schema.Number,
   agents: Schema.Array(AlwaysOnAgentSummary),
+  providers: Schema.Array(AlwaysOnProviderPolicy),
 });
 export type AlwaysOnSnapshot = typeof AlwaysOnSnapshot.Type;
 
@@ -214,6 +258,18 @@ export const AlwaysOnInboxEntry = Schema.Struct({
 });
 export type AlwaysOnInboxEntry = typeof AlwaysOnInboxEntry.Type;
 
+export const AlwaysOnExecutedAction = Schema.Struct({
+  type: Schema.String,
+  key: Schema.String,
+});
+export type AlwaysOnExecutedAction = typeof AlwaysOnExecutedAction.Type;
+
+export const AlwaysOnModelDecision = Schema.Struct({
+  summary: Summary,
+  actions: Schema.Array(AlwaysOnAction).check(Schema.isMaxLength(4)),
+});
+export type AlwaysOnModelDecision = typeof AlwaysOnModelDecision.Type;
+
 export const AlwaysOnRunEntry = Schema.Struct({
   id: AlwaysOnRunId,
   sessionId: AlwaysOnSessionId,
@@ -225,6 +281,9 @@ export const AlwaysOnRunEntry = Schema.Struct({
   lastProgressAt: Schema.NullOr(IsoDateTime),
   eventIds: Schema.Array(AlwaysOnEventId),
   loadedContext: AlwaysOnLoadedContext,
+  modelSummary: Schema.NullOr(Schema.String),
+  modelError: Schema.NullOr(Schema.String),
+  executedActions: Schema.Array(AlwaysOnExecutedAction),
 });
 export type AlwaysOnRunEntry = typeof AlwaysOnRunEntry.Type;
 
@@ -284,6 +343,9 @@ export const AlwaysOnCreateInput = Schema.Struct({
   projectId: ProjectId,
   title: Identifier,
   instructions: Instructions,
+  providerKind: AlwaysOnProviderKind,
+  instanceId: Identifier,
+  model: Identifier,
 });
 export type AlwaysOnCreateInput = typeof AlwaysOnCreateInput.Type;
 
@@ -306,7 +368,7 @@ export const AlwaysOnSubmitEventInput = Schema.Struct({
   source: Identifier,
   sourceEventId: Identifier,
   kind: AlwaysOnSubmitKind,
-  actions: Schema.Array(AlwaysOnAction).check(Schema.isMaxLength(8)),
+  text: Summary,
 });
 export type AlwaysOnSubmitEventInput = typeof AlwaysOnSubmitEventInput.Type;
 

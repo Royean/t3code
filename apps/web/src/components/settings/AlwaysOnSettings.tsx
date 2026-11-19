@@ -4,9 +4,9 @@ import {
   AlwaysOnMemoryId,
   AlwaysOnRunId,
   ProjectId,
-  type AlwaysOnAction,
   type AlwaysOnAgentSummary,
   type AlwaysOnDetail,
+  type AlwaysOnProviderPolicy,
   type EnvironmentId,
 } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -52,7 +52,7 @@ export function AlwaysOnSettings() {
       <SettingsSection title={gt("Always-on agents")} icon={<InfinityIcon />}>
         <p className="text-muted-foreground text-sm">
           {gt(
-            "An always-on agent sleeps until an inbox event wakes a short run. This build does not start Claude, Codex, or any other provider: no runtime here can intercept each tool before it runs. External effects stay withheld for approval, and credentials are rejected instead of stored.",
+            "A natural-language event wakes one short model call. The server accepts only schema-checked actions. Text generators send no tools. Claude text generation is called with an empty tool list. Other runtimes stay disabled.",
           )}
         </p>
         <p className="text-muted-foreground text-sm">
@@ -67,6 +67,7 @@ export function AlwaysOnSettings() {
               scope.members.find((member) => member.environmentId === environment.environmentId)?.id
             }
             agents={snapshot.agents}
+            providers={snapshot.providers}
             revision={snapshot.revision}
           />
         )}
@@ -79,11 +80,13 @@ function AlwaysOnEnvironment({
   environmentId,
   projectId,
   agents,
+  providers,
   revision,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId | undefined;
   readonly agents: readonly AlwaysOnAgentSummary[];
+  readonly providers: readonly AlwaysOnProviderPolicy[];
   readonly revision: number;
 }) {
   const gt = useGT();
@@ -94,6 +97,11 @@ function AlwaysOnEnvironment({
   const [title, setTitle] = useState("");
   const [instructions, setInstructions] = useState("");
   const [project, setProject] = useState(projectId ?? "");
+  const [providerKind, setProviderKind] = useState<"textGenerator" | "claudeAgent">(
+    "textGenerator",
+  );
+  const [instanceId, setInstanceId] = useState("");
+  const [model, setModel] = useState("");
   const [selected, setSelected] = useState<AlwaysOnAgentId | null>(agents[0]?.id ?? null);
   const [error, setError] = useState<string | null>(null);
 
@@ -110,6 +118,9 @@ function AlwaysOnEnvironment({
               projectId: ProjectId.make(project.trim()),
               title: title.trim(),
               instructions: instructions.trim(),
+              providerKind,
+              instanceId: instanceId.trim(),
+              model: model.trim(),
             },
           }).then((result) => {
             if (result._tag === "Failure") {
@@ -141,13 +152,51 @@ function AlwaysOnEnvironment({
           placeholder={gt("Instructions loaded at the start of every run")}
           onChange={(event) => setInstructions(event.target.value)}
         />
+        <label className="text-sm">
+          {gt("Model runtime")}
+          <select
+            className="border-input ms-2 rounded-md border bg-transparent px-2 py-1"
+            value={providerKind}
+            onChange={(event) =>
+              setProviderKind(
+                event.target.value === "claudeAgent" ? "claudeAgent" : "textGenerator",
+              )
+            }
+          >
+            <option value="textGenerator">{gt("Text generator, no tools")}</option>
+            <option value="claudeAgent">{gt("Claude, empty tool list")}</option>
+          </select>
+        </label>
+        <Input
+          aria-label={gt("Provider instance id")}
+          value={instanceId}
+          placeholder={gt("Provider instance id")}
+          onChange={(event) => setInstanceId(event.target.value)}
+        />
+        <Input
+          aria-label={gt("Model")}
+          value={model}
+          placeholder={gt("Model")}
+          onChange={(event) => setModel(event.target.value)}
+        />
+        <ul className="text-muted-foreground text-sm">
+          {providers
+            .filter((provider) => !provider.supported)
+            .map((provider) => (
+              <li key={provider.id}>
+                {provider.id}: {provider.detail}
+              </li>
+            ))}
+        </ul>
         <Button
           type="submit"
           disabled={
             !canOperate ||
             title.trim() === "" ||
             instructions.trim() === "" ||
-            project.trim() === ""
+            project.trim() === "" ||
+            instanceId.trim() === "" ||
+            model.trim() === ""
           }
         >
           {gt("Create agent")}
@@ -205,56 +254,13 @@ function AlwaysOnAgentDetail({
   const cancel = useAtomCommand(serverEnvironment.cancelAlwaysOnRun, "always-on cancel");
   const readMemory = useAtomCommand(serverEnvironment.readAlwaysOnMemory, "always-on memory");
   const [memory, setMemory] = useState<string | null>(null);
-  const [action, setAction] = useState<"silent" | "note" | "deliver" | "approval" | "timer">(
-    "silent",
-  );
   const [text, setText] = useState("");
   const [kind, setKind] = useState<"user_reply" | "external">("external");
 
   if (detail === null) return <p className="text-sm">{gt("Loading agent")}</p>;
 
   const send = () => {
-    if (!canOperate) return;
-    const actions: AlwaysOnAction[] = [];
-    if (action === "note") {
-      actions.push({
-        type: "remember_note",
-        key: SecureRandom.uuidV4Unsafe(),
-        title: text,
-        pointer: text,
-      });
-    } else if (action === "deliver") {
-      actions.push({
-        type: "deliver",
-        key: SecureRandom.uuidV4Unsafe(),
-        dedupeKey: SecureRandom.uuidV4Unsafe(),
-        body: text,
-      });
-    } else if (action === "approval") {
-      actions.push({
-        type: "request_approval",
-        key: SecureRandom.uuidV4Unsafe(),
-        summary: text,
-        onApprove: [
-          {
-            type: "deliver",
-            key: SecureRandom.uuidV4Unsafe(),
-            dedupeKey: SecureRandom.uuidV4Unsafe(),
-            body: text,
-          },
-        ],
-      });
-    } else if (action === "timer") {
-      const dueAt = new Date(Date.now() + 60_000).toISOString();
-      actions.push({
-        type: "set_timer",
-        key: SecureRandom.uuidV4Unsafe(),
-        timerKind: "deadline",
-        dueAt,
-      });
-    } else {
-      actions.push({ type: "silent", key: SecureRandom.uuidV4Unsafe() });
-    }
+    if (!canOperate || text.trim() === "") return;
     void submit({
       environmentId,
       input: {
@@ -262,9 +268,10 @@ function AlwaysOnAgentDetail({
         source: "settings",
         sourceEventId: `ui:${SecureRandom.uuidV4Unsafe()}`,
         kind,
-        actions,
+        text: text.trim(),
       },
     });
+    setText("");
   };
 
   return (
@@ -308,31 +315,15 @@ function AlwaysOnAgentDetail({
             <option value="user_reply">{gt("Continue user session")}</option>
           </select>
         </label>
-        <label className="text-sm">
-          {gt("Restricted action")}
-          <select
-            className="border-input ms-2 rounded-md border bg-transparent px-2 py-1"
-            value={action}
-            onChange={(event) => setAction(event.target.value as typeof action)}
-          >
-            <option value="silent">{gt("Stay quiet")}</option>
-            <option value="note">{gt("Save a note")}</option>
-            <option value="deliver">{gt("Deliver to this session")}</option>
-            <option value="approval">{gt("Ask for approval")}</option>
-            <option value="timer">{gt("Set a one-minute timer")}</option>
-          </select>
-        </label>
       </div>
-      <Input
-        aria-label={gt("Action text")}
+      <textarea
+        aria-label={gt("Event")}
+        className="border-input bg-background min-h-20 w-full rounded-md border px-3 py-2 text-sm"
         value={text}
+        placeholder={gt("Tell the agent what happened")}
         onChange={(event) => setText(event.target.value)}
       />
-      <Button
-        type="button"
-        disabled={!canOperate || (action !== "silent" && action !== "timer" && text.trim() === "")}
-        onClick={send}
-      >
+      <Button type="button" disabled={!canOperate || text.trim() === ""} onClick={send}>
         {gt("Queue event")}
       </Button>
       <RecordList
@@ -342,7 +333,8 @@ function AlwaysOnAgentDetail({
       <RecordList
         title={gt("Runs")}
         rows={detail.runs.map(
-          (run) => `${run.status} ${run.outcome ?? ""} session ${run.sessionId}`,
+          (run) =>
+            `${run.status} ${run.modelSummary ?? run.modelError ?? ""} ${run.executedActions.map((action) => action.type).join(", ")}`,
         )}
       />
       {detail.runs
