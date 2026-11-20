@@ -56,6 +56,7 @@ describe("runMigrations", () => {
         assert.deepStrictEqual(forkHistory, [
           { migration_id: 1, name: "EventOrchestration" },
           { migration_id: 2, name: "AlwaysOn" },
+          { migration_id: 3, name: "AlwaysOnEventRouting" },
         ]);
         const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
         assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
@@ -94,8 +95,9 @@ describe("runMigrations", () => {
         SELECT 1, '{"kept":true}' WHERE NOT EXISTS (
           SELECT 1 FROM event_orchestration_registry WHERE id = 1
         )`;
-      yield* sql`DELETE FROM t3_fork_migrations WHERE migration_id = 2`;
+      yield* sql`DELETE FROM t3_fork_migrations WHERE migration_id >= 2`;
       for (const name of [
+        "always_on_event_route",
         "always_on_delivery",
         "always_on_outbox",
         "always_on_approval",
@@ -119,6 +121,7 @@ describe("runMigrations", () => {
         [
           { migration_id: 1, name: "EventOrchestration" },
           { migration_id: 2, name: "AlwaysOn" },
+          { migration_id: 3, name: "AlwaysOnEventRouting" },
         ],
       );
       assert.deepStrictEqual(

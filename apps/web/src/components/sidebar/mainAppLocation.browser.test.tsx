@@ -77,6 +77,13 @@ describe("main app return location", () => {
     await vi.waitFor(() => expect(router.state.location.href).toBe(THREAD_PATH));
     await userEvent.click(screen.getByRole("button", { name: "Always On" }));
     await vi.waitFor(() => expect(router.state.location.href).toBe(agentHref));
+
+    const eventHref = "/environment-one/always-on-event-example";
+    await settled(router, router.navigate({ href: eventHref }));
+    await userEvent.click(screen.getByRole("button", { name: "Threads" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe(THREAD_PATH));
+    await userEvent.click(screen.getByRole("button", { name: "Always On" }));
+    await vi.waitFor(() => expect(router.state.location.href).toBe(eventHref));
   });
 
   it("closes Usage without leaving the current document when the app started with history", async () => {

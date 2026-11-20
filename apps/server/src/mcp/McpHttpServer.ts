@@ -58,6 +58,7 @@ import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
 import * as EnvironmentHandlers from "./toolkits/environment/handlers.ts";
 import { ThemeToolkit } from "./toolkits/theme/tools.ts";
 import * as ThemeHandlers from "./toolkits/theme/handlers.ts";
+import * as AlwaysOnPeer from "./toolkits/alwaysOnPeer.ts";
 import { EventOrchestrationToolkit } from "./toolkits/eventOrchestration/tools.ts";
 import * as EventOrchestrationHandlers from "./toolkits/eventOrchestration/handlers.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
@@ -1324,6 +1325,11 @@ export const layerEventOrchestrationToolkit = toolkitRegistration(
   EventOrchestrationHandlers.layer,
 ).pipe(Layer.provide(managedEventVisibility.layer));
 
+export const layerAlwaysOnPeer = toolkitRegistration(
+  AlwaysOnPeer.AlwaysOnPeerToolkit,
+  AlwaysOnPeer.layer,
+);
+
 export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
 
 export const layerAttachmentToolkit = toolkitRegistration(
@@ -1419,7 +1425,9 @@ const layerToolExposure = Layer.effect(
           caller?.thread !== undefined && events?.ownsThread(caller.thread.threadId) === true;
         return server.tools
           .filter(
-            ({ tool }) => managed || !Object.hasOwn(EventOrchestrationToolkit.tools, tool.name),
+            ({ tool }) =>
+              !Object.hasOwn(AlwaysOnPeer.AlwaysOnPeerToolkit.tools, tool.name) &&
+              (managed || !Object.hasOwn(EventOrchestrationToolkit.tools, tool.name)),
           )
           .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" }));
       },
@@ -1456,4 +1464,6 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch));
+export const layer = layerMcpTransport(
+  Layer.mergeAll(layerTools, layerToolSearch, layerAlwaysOnPeer),
+);

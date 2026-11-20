@@ -118,7 +118,10 @@ import {
   SettingsScheduledTaskNewRouteScreen,
   SettingsScheduledTaskEditRouteScreen,
 } from "./features/settings/SettingsScheduledTasksRouteScreen";
-import { SettingsAlwaysOnRouteScreen } from "./features/settings/SettingsAlwaysOnRouteScreen";
+import {
+  AlwaysOnModelPickerRouteScreen,
+  SettingsAlwaysOnRouteScreen,
+} from "./features/settings/SettingsAlwaysOnRouteScreen";
 import { AlwaysOnConversationRouteScreen } from "./features/always-on/AlwaysOnConversationRouteScreen";
 import {
   ScheduledTaskModelPickerRouteScreen,
@@ -191,7 +194,7 @@ const ROUTE_TITLES: Readonly<Record<string, string>> = {
   SettingsVoice: msg("Voice"),
   SettingsFollowUp: msg("Chat", { $context: "noun, settings page title" }),
   SettingsScheduledTasks: msg("Scheduled tasks"),
-  SettingsAlwaysOn: msg("Always-on agents"),
+  SettingsAlwaysOn: msg("Always On"),
   SettingsScheduledTaskNew: msg("New scheduled task"),
   SettingsScheduledTaskEdit: msg("Edit scheduled task"),
   SettingsScheduledTaskBranch: msg("Base branch"),
@@ -376,6 +379,10 @@ const SETTINGS_SCREENS = {
     screen: SettingsAlwaysOnRouteScreen,
     linking: "settings/always-on",
     options: settingsPage(),
+  }),
+  SettingsAlwaysOnModel: createNativeStackScreen({
+    screen: AlwaysOnModelPickerRouteScreen,
+    options: THREAD_SETTINGS_ROUTE,
   }),
   SettingsScheduledTaskNew: createNativeStackScreen({
     screen: SettingsScheduledTaskNewRouteScreen,

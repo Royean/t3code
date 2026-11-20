@@ -1,4 +1,5 @@
 import {
+  type AlwaysOnRoutingPreferences,
   type CustomModelSetting,
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   ModelCapabilities,
@@ -7,12 +8,75 @@ import {
   ProviderInstanceId,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
+  type ServerProvider,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { copySorted } from "./Array.ts";
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
+
+export const REASONING_EFFORT_OPTION_IDS: ReadonlyArray<string> = [
+  "reasoningEffort",
+  "effort",
+  "reasoning",
+  "variant",
+  "reasoning_effort",
+  "thinking_level",
+];
+
+const REASONING_DESCRIPTOR_IDS: ReadonlySet<string> = new Set([
+  ...REASONING_EFFORT_OPTION_IDS,
+  "thinking",
+]);
+
+/** The model's reasoning control: a known effort id, or a select its agent marked as reasoning. */
+export function isReasoningControl(descriptor: ProviderOptionDescriptor): boolean {
+  return (
+    (descriptor.type === "select" && descriptor.role === "reasoning") ||
+    REASONING_DESCRIPTOR_IDS.has(descriptor.id)
+  );
+}
+
+export function isReasoningSelect(
+  descriptor: ProviderOptionDescriptor,
+): descriptor is Extract<ProviderOptionDescriptor, { type: "select" }> {
+  return descriptor.type === "select" && isReasoningControl(descriptor);
+}
+
+export function resolveAlwaysOnSettingsModelSelection(
+  preferences: AlwaysOnRoutingPreferences | null,
+  providers: readonly Pick<ServerProvider, "instanceId" | "models">[],
+  projectModel?: ModelSelection | null,
+): ModelSelection | null {
+  if (preferences === null) return null;
+  if (preferences.modelSelection !== undefined) return preferences.modelSelection;
+  const { harness, model, effort } = preferences;
+  if (harness === undefined && model === undefined && effort === undefined) return null;
+  const instanceId = harness ?? projectModel?.instanceId;
+  if (instanceId === undefined) return null;
+  const models = providers.find((provider) => provider.instanceId === instanceId)?.models ?? [];
+  const configuredModel =
+    (harness === instanceId ? model : undefined) ??
+    (projectModel?.instanceId === instanceId ? projectModel.model : undefined);
+  const modelEntry =
+    configuredModel === undefined
+      ? (models.find((entry) => entry.isDefault && !entry.isLegacy) ??
+        models.find((entry) => !entry.isLegacy))
+      : models.find(
+          (entry) => entry.slug === configuredModel || entry.aliases?.includes(configuredModel),
+        );
+  const slug = modelEntry?.slug ?? configuredModel;
+  if (slug === undefined || (effort !== undefined && modelEntry === undefined)) return null;
+  const reasoning = modelEntry?.capabilities?.optionDescriptors?.find(isReasoningSelect);
+  return {
+    instanceId,
+    model: slug,
+    ...(effort !== undefined && reasoning?.options.some((choice) => choice.id === effort)
+      ? { options: [{ id: reasoning.id, value: effort }] }
+      : {}),
+  };
+}
 
 export function modelSelectionCommandType(
   currentInstanceId: ProviderInstanceId,

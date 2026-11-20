@@ -1,6 +1,14 @@
 import * as Schema from "effect/Schema";
 
-import { IsoDateTime, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  EnvironmentId,
+  IsoDateTime,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+import { ModelSelection } from "./modelSelection.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 const Identifier = TrimmedNonEmptyString.check(Schema.isMaxLength(160));
 const Summary = TrimmedNonEmptyString.check(Schema.isMaxLength(2_000));
@@ -380,6 +388,60 @@ export const AlwaysOnSubmitEventResult = Schema.Struct({
   duplicate: Schema.Boolean,
 });
 export type AlwaysOnSubmitEventResult = typeof AlwaysOnSubmitEventResult.Type;
+
+const alwaysOnEventTarget = {
+  modelSelection: Schema.optionalKey(ModelSelection),
+  // Older clients and saved routes used independent fields.
+  harness: Schema.optionalKey(ProviderInstanceId),
+  model: Schema.optionalKey(Identifier),
+  effort: Schema.optionalKey(Identifier),
+};
+
+export const AlwaysOnRoutingPreferences = Schema.Struct({
+  environmentId: Schema.optionalKey(EnvironmentId),
+  projectId: Schema.optionalKey(ProjectId),
+  ...alwaysOnEventTarget,
+});
+export type AlwaysOnRoutingPreferences = typeof AlwaysOnRoutingPreferences.Type;
+
+export const AlwaysOnEventSubmission = Schema.Struct({
+  environmentId: Schema.optionalKey(EnvironmentId),
+  ...alwaysOnEventTarget,
+  source: Identifier,
+  sourceEventId: Identifier,
+  title: Schema.optionalKey(Identifier),
+  text: Summary,
+});
+export type AlwaysOnEventSubmission = typeof AlwaysOnEventSubmission.Type;
+
+export const AlwaysOnPeerEvent = Schema.Struct({
+  ...AlwaysOnEventSubmission.fields,
+  environmentId: EnvironmentId,
+  originEnvironmentId: EnvironmentId,
+  deliveryId: Identifier,
+});
+export type AlwaysOnPeerEvent = typeof AlwaysOnPeerEvent.Type;
+
+export const ALWAYS_ON_PEER_EVENT_TOOL = "t3_always_on_receive_event";
+
+export const AlwaysOnEventReceipt = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  duplicate: Schema.Boolean,
+});
+export type AlwaysOnEventReceipt = typeof AlwaysOnEventReceipt.Type;
+
+export class AlwaysOnRoutingError extends Schema.TaggedError<AlwaysOnRoutingError>()(
+  "AlwaysOnRoutingError",
+  {
+    reason: Schema.Literals(["configuration", "unavailable", "conflict", "forbidden"]),
+    message: Schema.String,
+  },
+) {}
+
+export const ALWAYS_ON_EVENT_THREAD_PREFIX = "always-on-event-";
+export const isAlwaysOnEventThread = (threadId: string) =>
+  threadId.startsWith(ALWAYS_ON_EVENT_THREAD_PREFIX);
 
 export const AlwaysOnGetInput = Schema.Struct({
   agentId: AlwaysOnAgentId,

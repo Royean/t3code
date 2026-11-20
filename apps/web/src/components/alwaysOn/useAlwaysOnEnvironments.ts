@@ -3,17 +3,25 @@ import { alwaysOnAttentionCount } from "@t3tools/client-runtime/always-on-conver
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  isAlwaysOnEventThread,
   type AlwaysOnAgentSummary,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { Atom } from "effect/reactivity";
 
 import { environmentAtomList, environmentIdsKey } from "../../state/environmentAtomList";
+import { useQuietThreadShells } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
 import { serverEnvironment } from "../../state/server";
 import { environmentSession, sessionHasScope } from "../../state/session";
 
 const EMPTY_AGENTS: readonly AlwaysOnAgentSummary[] = [];
+
+function useAlwaysOnEventThreads() {
+  return useQuietThreadShells()
+    .filter((thread) => thread.archivedAt === null && isAlwaysOnEventThread(thread.id))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
 
 const environmentQueries = environmentAtomList("web-always-on-environments", (environmentId) =>
   Atom.make((get) => {
@@ -45,6 +53,7 @@ const environmentQueries = environmentAtomList("web-always-on-environments", (en
 
 export function useAlwaysOnEnvironments() {
   const { environments, isReady } = useEnvironments();
+  const eventThreads = useAlwaysOnEventThreads();
   const connected = environments.filter(({ connection }) => connection.phase === "connected");
   const queries = useAtomValue(
     environmentQueries(environmentIdsKey(connected.map(({ environmentId }) => environmentId))),
@@ -66,14 +75,19 @@ export function useAlwaysOnEnvironments() {
             : ("disconnected" as const)),
       agents: query?.status === "ready" ? query.agents : EMPTY_AGENTS,
       canOperate: query?.status === "ready" && query.canOperate,
+      eventThreads: eventThreads.filter((thread) => thread.environmentId === environmentId),
     };
   });
 
   const attention = entries.reduce(
     (sum, entry) =>
-      entry.canOperate
-        ? entry.agents.reduce((total, agent) => total + alwaysOnAttentionCount(agent), sum)
-        : sum,
+      sum +
+      (entry.canOperate
+        ? entry.agents.reduce((total, agent) => total + alwaysOnAttentionCount(agent), 0)
+        : 0) +
+      entry.eventThreads.filter(
+        (thread) => thread.hasPendingApprovals || thread.hasPendingUserInput,
+      ).length,
     0,
   );
   return { entries, attention, isReady };

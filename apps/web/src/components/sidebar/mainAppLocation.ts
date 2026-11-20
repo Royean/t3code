@@ -1,3 +1,4 @@
+import { isAlwaysOnEventThread } from "@t3tools/contracts";
 import { useNavigate, useRouter, type AnyRouter } from "@tanstack/react-router";
 
 import { GUEST_PAGE_PATH } from "../../guestPage";
@@ -16,7 +17,10 @@ export function isSidebarUtilityPage(pathname: string) {
 }
 
 export function isAlwaysOnWorkspace(pathname: string) {
-  return pathname === "/always-on" || pathname === "/always-on/";
+  const path = pathname.replace(/\/$/, "");
+  if (path === "/always-on") return true;
+  const [, environmentId, threadId, ...rest] = path.split("/");
+  return !!environmentId && !!threadId && rest.length === 0 && isAlwaysOnEventThread(threadId);
 }
 
 export type ChatWorkspace = "threads" | "always-on";

@@ -1,33 +1,131 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtom, useAtomValue } from "@effect/atom-react";
+import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { offersLinkedEnvironments } from "@t3tools/client-runtime/link-request";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/models";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { AlwaysOnCreateInput, AuthOrchestrationReadScope } from "@t3tools/contracts";
-import type { AlwaysOnProviderKind } from "@t3tools/contracts";
-import * as Schema from "effect/Schema";
+import {
+  AuthAccessReadScope,
+  AuthSettingsWriteScope,
+  EnvironmentId,
+  ProjectId,
+  type AlwaysOnRoutingPreferences,
+  type ModelSelection,
+  type ServerProvider,
+} from "@t3tools/contracts";
+import { modelSelectionsEqual, resolveAlwaysOnSettingsModelSelection } from "@t3tools/shared/model";
+import { Atom } from "effect/reactivity";
 import { useGT } from "gt-react-native";
-import { useRef, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
-import { FormField, FormSection } from "../../components/ui/FormSection";
+import { FormSection } from "../../components/ui/FormSection";
 import { Menu } from "../../components/ui/Menu";
 import { ScreenScrollView } from "../../components/ui/ScreenScrollView";
 import { SymbolView } from "../../components/ui/AppSymbol";
-import { useProjects } from "../../state/entities";
+import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
+import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
+import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
+import { peerLinkEnvironment } from "../../state/peerLinks";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
-import { useEnvironmentScope, useEnvironmentScopeDenied } from "../../state/session";
+import { useEnvironmentsWithScope, useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { ThreadSettingsPickerScreen } from "../threads/ThreadSettingsSheet";
 import { useSettingsEnvironmentMenu } from "./components/SettingsEnvironmentFilterHeader";
 import { SettingsScreen } from "./components/SettingsScreen";
-import { SettingsSection } from "./components/SettingsSection";
 import { useSettingsEnvironmentFilter, type SettingsTarget } from "./settings-environment-filter";
 import { settingsTargetsForProject } from "./settings-environment-filter.logic";
 
-const isCreateInput = Schema.is(AlwaysOnCreateInput);
+type RoutingDraft = {
+  readonly environmentId?: EnvironmentId | null;
+  readonly projectId?: ProjectId | null;
+  readonly modelSelection?: ModelSelection | null;
+};
+
+// Each settings page and its native model picker share drafts by environment.
+const routingDraftsAtom = Atom.family((_editorId: string) =>
+  Atom.make<ReadonlyMap<EnvironmentId, RoutingDraft>>(new Map()),
+);
+
+function changeRoutingDraft(
+  drafts: ReadonlyMap<EnvironmentId, RoutingDraft>,
+  environmentId: EnvironmentId,
+  patch: RoutingDraft,
+) {
+  return new Map(drafts).set(environmentId, { ...drafts.get(environmentId), ...patch });
+}
+
+function routingDefaults(
+  environment: SettingsTarget,
+  projects: readonly EnvironmentProject[],
+  providers: readonly ServerProvider[],
+): AlwaysOnRoutingPreferences | null {
+  const saved = environment.serverConfig.settings.alwaysOnRouting;
+  if (!saved) return null;
+  const { environmentId, projectId, harness, model, effort } = saved;
+  const selection = resolveAlwaysOnSettingsModelSelection(
+    saved,
+    providers,
+    projects.find((project) => project.id === projectId)?.defaultModelSelection,
+  );
+  return {
+    ...(environmentId && environmentId !== environment.environmentId ? { environmentId } : {}),
+    ...(projectId ? { projectId } : {}),
+    ...(selection
+      ? { modelSelection: selection }
+      : {
+          ...(harness === undefined ? {} : { harness }),
+          ...(model === undefined ? {} : { model }),
+          ...(effort === undefined ? {} : { effort }),
+        }),
+  };
+}
+
+function applyRoutingDraft(
+  initial: AlwaysOnRoutingPreferences | null,
+  draft: RoutingDraft | undefined,
+): AlwaysOnRoutingPreferences | null {
+  if (!draft) return initial;
+  const environmentId =
+    draft.environmentId === undefined ? initial?.environmentId : draft.environmentId;
+  const projectId = draft.projectId === undefined ? initial?.projectId : draft.projectId;
+  const selection =
+    draft.modelSelection === undefined ? initial?.modelSelection : draft.modelSelection;
+  const current = {
+    ...(environmentId ? { environmentId } : {}),
+    ...(projectId ? { projectId } : {}),
+    ...(selection ? { modelSelection: selection } : {}),
+    // Keep older fields until the user changes the model or the catalog can resolve it.
+    ...(draft.modelSelection === undefined && !initial?.modelSelection
+      ? {
+          ...(initial?.harness === undefined ? {} : { harness: initial.harness }),
+          ...(initial?.model === undefined ? {} : { model: initial.model }),
+          ...(initial?.effort === undefined ? {} : { effort: initial.effort }),
+        }
+      : {}),
+  };
+  return Object.keys(current).length === 0 ? null : current;
+}
+
+function sameRoutingPreferences(
+  left: AlwaysOnRoutingPreferences | null,
+  right: AlwaysOnRoutingPreferences | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  const lhsModel = left.modelSelection;
+  const rhsModel = right.modelSelection;
+  return (
+    left.environmentId === right.environmentId &&
+    left.projectId === right.projectId &&
+    left.harness === right.harness &&
+    left.model === right.model &&
+    left.effort === right.effort &&
+    (lhsModel && rhsModel ? modelSelectionsEqual(lhsModel, rhsModel) : lhsModel === rhsModel)
+  );
+}
 
 export function SettingsAlwaysOnRouteScreen() {
   const gt = useGT();
@@ -41,9 +139,108 @@ export function SettingsAlwaysOnRouteScreen() {
       ? null
       : projectGroups.find((group) => group.key === selectedProjectKey);
   const targets = settingsTargetsForProject(selectedTargets, selectedGroup);
+  const providersByEnvironment = useAtomValue(
+    useMemo(
+      () =>
+        Atom.make(
+          (get) =>
+            new Map(
+              targets.map(({ environmentId }) => [
+                environmentId,
+                get(serverEnvironment.providersValueAtom(environmentId)),
+              ]),
+            ),
+        ),
+      [targets],
+    ),
+  );
+  const editorId = useId();
+  const [drafts, setDrafts] = useAtom(routingDraftsAtom(editorId));
+  const canWrite = useEnvironmentsWithScope(targets, AuthSettingsWriteScope);
+  const update = useAtomCommand(serverEnvironment.updateSettings);
+  const [saving, setSaving] = useState(false);
+  const [errors, setErrors] = useState<ReadonlyMap<EnvironmentId, string>>(new Map());
+  const rows = targets.map((environment) => {
+    const environmentProjects = projects.filter(
+      (project) => project.environmentId === environment.environmentId,
+    );
+    const providers = providersByEnvironment.get(environment.environmentId) ?? [];
+    const initial = routingDefaults(environment, environmentProjects, providers);
+    return {
+      environment,
+      projects: environmentProjects.filter((project) => !project.archivedAt),
+      providers,
+      initial,
+      current: applyRoutingDraft(initial, drafts.get(environment.environmentId)),
+    };
+  });
+  const changes = rows.flatMap(({ environment, initial, current }) =>
+    canWrite.has(environment.environmentId) && !sameRoutingPreferences(initial, current)
+      ? [{ environmentId: environment.environmentId, preferences: current }]
+      : [],
+  );
+  const persist = async (
+    writes: readonly {
+      environmentId: EnvironmentId;
+      preferences: AlwaysOnRoutingPreferences | null;
+    }[],
+  ) => {
+    if (saving || writes.length === 0) return;
+    setSaving(true);
+    const results = await Promise.all(
+      writes.map(async ({ environmentId, preferences }) => {
+        const result = await update({
+          environmentId,
+          input: { patch: { alwaysOnRouting: preferences } },
+        });
+        if (result._tag === "Failure") {
+          const cause = squashAtomCommandFailure(result);
+          return {
+            environmentId,
+            error: cause instanceof Error ? cause.message : gt("Could not save settings"),
+          };
+        }
+        const saved = result.value.alwaysOnRouting ?? null;
+        return {
+          environmentId,
+          error: sameRoutingPreferences(preferences, saved) ? null : gt("Could not save settings"),
+        };
+      }),
+    ).finally(() => setSaving(false));
+    setErrors((previous) => {
+      const next = new Map(previous);
+      for (const { environmentId, error } of results) {
+        if (error === null) next.delete(environmentId);
+        else next.set(environmentId, error);
+      }
+      return next;
+    });
+    setDrafts((previous) => {
+      const next = new Map(previous);
+      for (const { environmentId, error } of results) {
+        if (error === null && previous.get(environmentId) === drafts.get(environmentId)) {
+          next.delete(environmentId);
+        }
+      }
+      return next;
+    });
+  };
 
   return (
-    <SettingsScreen title={gt("Always-on agents")} menus={[environmentMenu]}>
+    <SettingsScreen
+      title={gt("Always On")}
+      menus={[environmentMenu]}
+      confirm={
+        canWrite.size > 0 || saving
+          ? {
+              label: gt("Save"),
+              disabled: saving || changes.length === 0,
+              loading: saving,
+              onPress: () => void persist(changes),
+            }
+          : undefined
+      }
+    >
       <ScreenScrollView
         className="flex-1"
         contentInsetAdjustmentBehavior="automatic"
@@ -54,25 +251,34 @@ export function SettingsAlwaysOnRouteScreen() {
         {targets.length === 0 ? (
           <Text className="px-2 text-foreground-muted">
             {availableTargets.length === 0
-              ? gt("Connect an environment to see always-on agents.")
+              ? gt("Connect an environment to use Always On.")
               : gt("No environments match these filters. Change the filter above.")}
           </Text>
         ) : (
-          targets.map((environment) => (
-            <EnvironmentAgents
+          rows.map(({ environment, projects, providers, initial, current }) => (
+            <RoutingDefaults
               key={environment.environmentId}
+              editorId={editorId}
               environment={environment}
-              scopedToProject={selectedGroup !== null}
-              projects={projects.filter(
-                (project) =>
-                  project.environmentId === environment.environmentId &&
-                  (selectedGroup === null ||
-                    selectedGroup?.members.some(
-                      (member) =>
-                        member.project.environmentId === project.environmentId &&
-                        member.project.id === project.id,
-                    )),
-              )}
+              projects={projects}
+              providers={providers}
+              preferences={current}
+              canWrite={canWrite.has(environment.environmentId)}
+              saving={saving}
+              error={errors.get(environment.environmentId)}
+              onChange={(patch) =>
+                setDrafts((previous) =>
+                  changeRoutingDraft(previous, environment.environmentId, patch),
+                )
+              }
+              onClear={
+                initial === null
+                  ? undefined
+                  : () =>
+                      void persist([
+                        { environmentId: environment.environmentId, preferences: null },
+                      ])
+              }
             />
           ))
         )}
@@ -81,98 +287,248 @@ export function SettingsAlwaysOnRouteScreen() {
   );
 }
 
-function EnvironmentAgents({
+const ROUTING_DEFAULT_CHOICE = "__always-on-default__";
+
+function routingChoice(choices: readonly Choice[], id: string | null) {
+  return (
+    choices.find((choice) => choice.id === (id ?? ROUTING_DEFAULT_CHOICE)) ??
+    (id === null ? undefined : { id, title: id })
+  );
+}
+
+function RoutingDefaults({
+  editorId,
   environment,
   projects,
-  scopedToProject,
+  providers,
+  preferences,
+  canWrite,
+  saving,
+  error,
+  onChange,
+  onClear,
 }: {
+  readonly editorId: string;
   readonly environment: SettingsTarget;
   readonly projects: readonly EnvironmentProject[];
-  readonly scopedToProject: boolean;
+  readonly providers: readonly ServerProvider[];
+  readonly preferences: AlwaysOnRoutingPreferences | null;
+  readonly canWrite: boolean;
+  readonly saving: boolean;
+  readonly error: string | undefined;
+  readonly onChange: (patch: RoutingDraft) => void;
+  readonly onClear: (() => void) | undefined;
 }) {
   const gt = useGT();
-  const { environmentId } = environment;
-  const canRead = useEnvironmentScope(environmentId, AuthOrchestrationReadScope);
-  const readDenied = useEnvironmentScopeDenied(environmentId, AuthOrchestrationReadScope);
-  const canCreate = useAtomValue(
-    serverEnvironment.createAlwaysOnAgent.permissionAtom(environmentId),
+  const navigation = useNavigation();
+  const { environmentId, serverConfig } = environment;
+  const canReadLinks = useEnvironmentScope(environmentId, AuthAccessReadScope);
+  const links = useEnvironmentQuery(
+    canReadLinks && offersLinkedEnvironments(serverConfig)
+      ? peerLinkEnvironment.list({ environmentId, input: {} })
+      : null,
   );
-  const query = useEnvironmentQuery(
-    canRead ? serverEnvironment.alwaysOnLive({ environmentId, input: {} }) : null,
-  );
-  const projectIds = new Set(projects.map((project) => project.id));
-  const agents = query.data?.agents.filter(
-    (agent) => !scopedToProject || projectIds.has(agent.projectId),
-  );
-  const openProjects = projects.filter((project) => !project.archivedAt);
-  const [creating, setCreating] = useState(false);
-  const [created, setCreated] = useState<string | null>(null);
+  const chosenDestination = preferences?.environmentId ?? null;
+  const project = preferences?.projectId ?? null;
+  const modelSelection = preferences?.modelSelection ?? null;
+  const pendingLegacyModel =
+    modelSelection === null &&
+    (preferences?.harness !== undefined ||
+      preferences?.model !== undefined ||
+      preferences?.effort !== undefined);
+  const label = modelSelection
+    ? (providers
+        .find((provider) => provider.instanceId === modelSelection.instanceId)
+        ?.models.find((model) => model.slug === modelSelection.model)?.name ?? modelSelection.model)
+    : ((pendingLegacyModel ? (preferences?.model ?? preferences?.harness) : undefined) ??
+      gt("Automatic"));
+
+  const peerChoices = (links.data?.links ?? [])
+    .filter((peer) => peer.status !== "expired" && peer.access !== "read-only")
+    .map((peer) => ({ id: peer.environmentId, title: peer.label }));
+  const environments = [
+    { id: ROUTING_DEFAULT_CHOICE, title: gt("This environment") },
+    ...peerChoices,
+  ];
+  const projectChoices = [
+    { id: ROUTING_DEFAULT_CHOICE, title: gt("None") },
+    ...projects.map((project) => ({ id: project.id, title: project.title })),
+  ];
+  const unavailableDestination =
+    chosenDestination !== null &&
+    !links.isPending &&
+    (!peerChoices.some((peer) => peer.id === chosenDestination) ||
+      links.data?.links.some(
+        (peer) => peer.environmentId === chosenDestination && peer.status === "unreachable",
+      ));
+  const disabled = !canWrite || saving;
 
   return (
-    <>
-      <SettingsSection title={environment.label}>
-        {readDenied ? (
-          <Text className="px-4 py-3 text-foreground-muted">
-            {gt("This connection cannot view always-on agents.")}
-          </Text>
-        ) : query.error !== null ? (
-          <View className="gap-2 px-4 py-3">
-            <Text accessibilityRole="alert" className="text-foreground-muted">
-              {query.error}
-            </Text>
-            <Button label={gt("Retry")} onPress={query.refresh} size="compact" />
-          </View>
-        ) : agents === undefined ? (
-          <AppActivityIndicator className="self-start px-4 py-3" />
-        ) : (
-          <>
-            <View className="gap-2 px-4 py-3">
-              {agents.length === 0 ? (
-                <Text className="text-foreground-muted">{gt("No always-on agents yet.")}</Text>
-              ) : (
-                agents.map((agent) => <Text key={agent.id}>{agent.title}</Text>)
-              )}
-            </View>
-            <View className="gap-2 border-t border-border-subtle px-4 py-3">
-              {created === null ? null : (
-                <Text accessibilityLiveRegion="polite">
-                  {gt("Created {title}. Find it in Chats under Always On.", { title: created })}
-                </Text>
-              )}
-              {!canCreate ? (
-                <Text className="text-foreground-muted">
-                  {gt("This connection has read-only access.")}
-                </Text>
-              ) : openProjects.length === 0 ? (
-                <Text className="text-foreground-muted">
-                  {gt("Select an active project to create an always-on agent.")}
-                </Text>
-              ) : !creating ? (
-                <Button
-                  label={gt("Create agent")}
-                  size="compact"
-                  onPress={() => {
-                    setCreated(null);
-                    setCreating(true);
-                  }}
-                />
-              ) : null}
-            </View>
-          </>
+    <FormSection title={gt("{environment} · Event routing", { environment: environment.label })}>
+      <ChooseField
+        label={gt("Default environment")}
+        choices={environments}
+        value={routingChoice(environments, chosenDestination)}
+        disabled={disabled}
+        onChange={(id) =>
+          onChange({ environmentId: id === ROUTING_DEFAULT_CHOICE ? null : EnvironmentId.make(id) })
+        }
+      />
+      {unavailableDestination ? (
+        <Text className="text-foreground-muted">
+          {gt("The selected linked environment is unavailable.")}
+        </Text>
+      ) : null}
+      <Text className="text-foreground-muted">
+        {gt("The following defaults apply when an event runs on this environment.")}
+      </Text>
+      <ChooseField
+        label={gt("Project")}
+        choices={projectChoices}
+        value={routingChoice(projectChoices, project)}
+        disabled={disabled}
+        onChange={(id) =>
+          onChange({ projectId: id === ROUTING_DEFAULT_CHOICE ? null : ProjectId.make(id) })
+        }
+      />
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={gt("{label}, {value}", { label: gt("Model"), value: label })}
+        disabled={disabled}
+        className="min-h-10 flex-row items-center justify-between gap-3 active:opacity-70"
+        onPress={() =>
+          navigation.navigate("SettingsAlwaysOnModel", {
+            editorId,
+            environmentId,
+            projectId: project,
+            selection: modelSelection,
+          })
+        }
+      >
+        <Text>{gt("Model")}</Text>
+        <Text numberOfLines={1} className="flex-1 text-right text-foreground-muted">
+          {label}
+        </Text>
+        {disabled ? null : (
+          <SymbolView
+            name="chevron.right"
+            size={14}
+            tintColorClassName="accent-chevron"
+            type="monochrome"
+          />
         )}
-      </SettingsSection>
-      {creating && query.error === null && canCreate && canRead && openProjects.length > 0 ? (
-        <CreateAgentForm
-          environment={environment}
-          projects={openProjects}
-          onCancel={() => setCreating(false)}
-          onCreated={(title) => {
-            setCreating(false);
-            setCreated(title);
-          }}
+      </Pressable>
+      {(modelSelection !== null || pendingLegacyModel) && !disabled ? (
+        <Button
+          label={gt("Use project default")}
+          tone="text"
+          onPress={() => onChange({ modelSelection: null })}
         />
       ) : null}
-    </>
+      {error === undefined ? null : (
+        <Text accessibilityRole="alert" className="text-danger">
+          {error}
+        </Text>
+      )}
+      {canWrite ? (
+        onClear ? (
+          <Button
+            label={gt("Clear defaults")}
+            tone="secondary"
+            disabled={saving}
+            onPress={onClear}
+          />
+        ) : null
+      ) : (
+        <Text className="text-foreground-muted">{gt("This connection has read-only access.")}</Text>
+      )}
+    </FormSection>
+  );
+}
+
+type AlwaysOnModelPickerParams = {
+  readonly editorId: string;
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId | null;
+  readonly selection: ModelSelection | null;
+};
+
+export function AlwaysOnModelPickerRouteScreen({
+  route,
+}: StaticScreenProps<AlwaysOnModelPickerParams>) {
+  const gt = useGT();
+  const navigation = useNavigation();
+  const { editorId, environmentId, projectId, selection } = route.params;
+  const canWrite = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+  const config = useEnvironmentServerConfig(environmentId);
+  const [drafts, setDrafts] = useAtom(routingDraftsAtom(editorId));
+  const modelDraft = drafts.get(environmentId)?.modelSelection;
+  const selectedModel = modelDraft === undefined ? selection : modelDraft;
+  const providers = (config?.providers ?? []).filter(
+    (provider) =>
+      provider.availability !== "unavailable" &&
+      provider.supportedRuntimeModes?.includes("approval-required") !== false,
+  );
+  const models = buildModelOptions(
+    config ? { ...config, providers } : null,
+    selectedModel,
+    undefined,
+    projectId,
+  );
+  const selectedOption = models.find(
+    (option) =>
+      option.providerKey === selectedModel?.instanceId &&
+      option.selection.model === selectedModel.model,
+  );
+  const optionDescriptors = resolveProviderOptionDescriptors({
+    capabilities: selectedOption?.capabilities,
+    selections: selectedModel?.options,
+  });
+  const providerGroups = groupByProvider(
+    models.filter((option) =>
+      providers.some((provider) => provider.instanceId === option.providerKey),
+    ),
+  );
+
+  if (!canWrite) {
+    return (
+      <SettingsScreen title={gt("Model")}>
+        <Text className="p-5 text-foreground-muted">
+          {gt("This connection has read-only access.")}
+        </Text>
+      </SettingsScreen>
+    );
+  }
+
+  return (
+    <ThreadSettingsPickerScreen
+      environmentId={environmentId}
+      projectId={projectId}
+      cwd={null}
+      providerGroups={providerGroups}
+      selectedModel={selectedModel}
+      modelOnly
+      prompt=""
+      onPromptChange={() => undefined}
+      onSelectModel={(option) =>
+        setDrafts((previous) =>
+          changeRoutingDraft(previous, environmentId, { modelSelection: option.selection }),
+        )
+      }
+      optionDescriptors={optionDescriptors}
+      onUpdateOptionSelections={(options) =>
+        setDrafts((previous) => {
+          const current = previous.get(environmentId)?.modelSelection;
+          const model = current === undefined ? selection : current;
+          return model
+            ? changeRoutingDraft(previous, environmentId, { modelSelection: { ...model, options } })
+            : previous;
+        })
+      }
+      runtimeMode="approval-required"
+      onUpdateRuntimeMode={() => undefined}
+      onClose={() => navigation.goBack()}
+    />
   );
 }
 
@@ -192,7 +548,7 @@ function ChooseField<Value extends string>({
   readonly disabled: boolean;
 }) {
   const gt = useGT();
-  if (choices.length === 0 || (choices.length === 1 && value !== undefined) || disabled) {
+  if (choices.length === 0 || (choices.length === 1 && choices[0]?.id === value?.id) || disabled) {
     return (
       <View className="min-h-10 flex-row items-center justify-between gap-3">
         <Text>{label}</Text>
@@ -230,205 +586,5 @@ function ChooseField<Value extends string>({
         />
       </Pressable>
     </Menu>
-  );
-}
-
-function CreateAgentForm({
-  environment,
-  projects,
-  onCreated,
-  onCancel,
-}: {
-  readonly environment: SettingsTarget;
-  readonly projects: readonly EnvironmentProject[];
-  readonly onCreated: (title: string) => void;
-  readonly onCancel: () => void;
-}) {
-  const gt = useGT();
-  const { environmentId, serverConfig } = environment;
-  const providers = useAtomValue(serverEnvironment.providersValueAtom(environmentId));
-  const canCreate = useAtomValue(
-    serverEnvironment.createAlwaysOnAgent.permissionAtom(environmentId),
-  );
-  const create = useAtomCommand(serverEnvironment.createAlwaysOnAgent);
-  const [projectId, setProjectId] = useState<EnvironmentProject["id"] | null>(null);
-  const [providerKind, setProviderKind] = useState<AlwaysOnProviderKind | null>(null);
-  const [instanceId, setInstanceId] = useState<string | null>(null);
-  const [modelId, setModelId] = useState<string | null>(null);
-  const [title, setTitle] = useState("");
-  const [instructions, setInstructions] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const inFlight = useRef(false);
-
-  const projectChoices = projects.map((project) => ({ id: project.id, title: project.title }));
-  const project =
-    projectId === null
-      ? projectChoices[0]
-      : projectChoices.find((choice) => choice.id === projectId);
-  const textGenerators = Object.entries(serverConfig.settings.textGenerators)
-    .filter(([, generator]) => generator.enabled)
-    .map(([id, generator]) => ({ id, title: generator.label ?? id }));
-  const claudeInstances = (providers ?? []).filter(
-    (provider) => provider.driver === "claudeAgent" && provider.enabled && provider.installed,
-  );
-  const runtimes: Choice<AlwaysOnProviderKind>[] = [];
-  if (textGenerators.length > 0) {
-    runtimes.push({ id: "textGenerator", title: gt("Text generator") });
-  }
-  if (claudeInstances.length > 0) {
-    runtimes.push({ id: "claudeAgent", title: gt("Claude") });
-  }
-  const runtime =
-    providerKind === null ? runtimes[0] : runtimes.find((choice) => choice.id === providerKind);
-  const textGenerator = runtime?.id === "textGenerator";
-  const instances: Choice[] = textGenerator
-    ? textGenerators
-    : claudeInstances.map((provider) => ({
-        id: provider.instanceId,
-        title: provider.displayName ?? provider.instanceId,
-      }));
-  const instance =
-    instanceId === null ? instances[0] : instances.find((choice) => choice.id === instanceId);
-  const modelSelection =
-    (project
-      ? serverConfig.settings.projectSettingsOverrides[project.id]?.textGenerationModelSelection
-      : undefined) ?? serverConfig.settings.textGenerationModelSelection;
-  const defaultModel = modelSelection.instanceId === instance?.id ? modelSelection.model : "";
-  const models =
-    claudeInstances
-      .find((provider) => provider.instanceId === instance?.id)
-      ?.models.filter((model) => model.supportsTextGeneration !== false)
-      .map((model) => ({ id: model.slug, title: model.name })) ?? [];
-  const model =
-    models.find((choice) => choice.id === (modelId ?? defaultModel)) ??
-    (modelId === null ? models[0] : undefined);
-  const modelText = modelId ?? defaultModel;
-  const input = {
-    projectId: project?.id,
-    title: title.trim(),
-    instructions: instructions.trim(),
-    providerKind: runtime?.id,
-    instanceId: instance?.id,
-    model: textGenerator || models.length === 0 ? modelText.trim() : model?.id,
-  };
-  const valid = isCreateInput(input);
-
-  const submit = async () => {
-    if (!canCreate || !valid || inFlight.current) return;
-    inFlight.current = true;
-    setSaving(true);
-    setError(null);
-    const result = await create({ environmentId, input });
-    inFlight.current = false;
-    setSaving(false);
-    if (result._tag === "Failure") {
-      const cause = squashAtomCommandFailure(result);
-      setError(cause instanceof Error ? cause.message : gt("Could not create the agent."));
-    } else {
-      onCreated(result.value.agent.title);
-    }
-  };
-
-  return (
-    <FormSection title={gt("New agent")}>
-      {runtimes.length === 0 ? (
-        <Text className="text-foreground-muted">
-          {gt("Configure a text generator or Claude on this environment to create an agent.")}
-        </Text>
-      ) : (
-        <>
-          <ChooseField
-            label={gt("Project")}
-            choices={projectChoices}
-            value={project}
-            disabled={saving}
-            onChange={(id) => {
-              setProjectId(id);
-              setModelId(null);
-            }}
-          />
-          <FormField
-            label={gt("Agent title")}
-            placeholder={gt("Agent title")}
-            accessibilityLabel={gt("Agent title")}
-            value={title}
-            onChangeText={setTitle}
-            editable={!saving}
-            maxLength={160}
-          />
-          <FormField
-            label={gt("Instructions")}
-            placeholder={gt("Instructions loaded at the start of every run")}
-            accessibilityLabel={gt("Instructions")}
-            value={instructions}
-            onChangeText={setInstructions}
-            editable={!saving}
-            multiline
-            numberOfLines={4}
-            maxLength={8_000}
-          />
-          <ChooseField
-            label={gt("Model runtime")}
-            choices={runtimes}
-            value={runtime}
-            disabled={saving}
-            onChange={(kind) => {
-              setProviderKind(kind);
-              setInstanceId(null);
-              setModelId(null);
-            }}
-          />
-          <ChooseField
-            label={gt("Provider instance")}
-            choices={instances}
-            value={instance}
-            disabled={saving}
-            onChange={(id) => {
-              setInstanceId(id);
-              setModelId(null);
-            }}
-          />
-          {!textGenerator && models.length > 0 ? (
-            <ChooseField
-              label={gt("Model")}
-              choices={models}
-              value={model}
-              disabled={saving}
-              onChange={setModelId}
-            />
-          ) : (
-            <FormField
-              label={gt("Model ID")}
-              placeholder={gt("Model ID")}
-              accessibilityLabel={gt("Model ID")}
-              value={modelText}
-              onChangeText={setModelId}
-              autoCapitalize="none"
-              autoCorrect={false}
-              editable={!saving}
-              maxLength={160}
-            />
-          )}
-          {error === null ? null : (
-            <Text accessibilityRole="alert" className="text-danger">
-              {error}
-            </Text>
-          )}
-        </>
-      )}
-      <View className="flex-row flex-wrap gap-2">
-        {runtimes.length === 0 ? null : (
-          <Button
-            label={gt("Create agent")}
-            tone="primary"
-            disabled={!canCreate || !valid}
-            loading={saving}
-            onPress={() => void submit()}
-          />
-        )}
-        <Button label={gt("Cancel")} tone="text" disabled={saving} onPress={onCancel} />
-      </View>
-    </FormSection>
   );
 }

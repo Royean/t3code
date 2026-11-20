@@ -12,7 +12,6 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
 import { pickableProjectGroups } from "@t3tools/client-runtime/state/project-grouping";
 
 import { useProjects } from "../../state/entities";
-import { steadyNavigationThreadShellsAtom } from "../../state/threads";
 import { useLaunchingThreads, usePendingNewTasks } from "../../state/use-pending-new-tasks";
 import { useWorkspaceState } from "../../state/workspace";
 import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
@@ -44,7 +43,10 @@ import { WorkspaceListHeader } from "../layout/workspace/WorkspaceListHeader";
 import { buildHomeListFilterMenuItems, homeListFilterEnvironments } from "./home-list-filter-menu";
 import { AppText as Text } from "../../components/ui/AppText";
 import { AlwaysOnWorkspace } from "../always-on/AlwaysOnWorkspace";
-import { chatsWorkspaceTabAtom } from "../always-on/always-on-workspace-state";
+import {
+  chatsWorkspaceTabAtom,
+  ordinaryChatsThreadShellsAtom,
+} from "../always-on/always-on-workspace-state";
 
 export function HomeRouteScreen() {
   const gt = useGT();
@@ -55,7 +57,7 @@ export function HomeRouteScreen() {
     return selected === "alwaysOn" ? (
       <View className="flex-1 items-center justify-center bg-screen px-6">
         <Text className="text-center text-foreground-muted">
-          {gt("Choose an always-on agent.")}
+          {gt("Choose a run in Always On.")}
         </Text>
       </View>
     ) : (
@@ -77,7 +79,7 @@ function ThreadHomeRouteScreen({ tabs }: { readonly tabs?: ReactNode }) {
   // Stop rebuilding the streaming thread list while Thread covers Home.
   const visible = useHomeRouteVisible();
   const threads = useLaunchingThreads(
-    useAtomValueWhileVisible(steadyNavigationThreadShellsAtom, visible),
+    useAtomValueWhileVisible(ordinaryChatsThreadShellsAtom, visible),
   );
   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
   const { savedConnectionsById } = useSavedRemoteConnections();

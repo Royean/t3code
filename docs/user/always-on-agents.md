@@ -1,5 +1,31 @@
 # Always-on agents
 
+## Route a new event
+
+Open **Settings → Always On** on the environment that receives events. Choose a default destination there. On each environment that will run events, set the default project and use the standard **Model** picker to choose a model and its options. The destination can be the receiving environment or another environment linked with permission to start work.
+
+Submit events to `POST /api/always-on/events` on the receiving T3 environment using a session with `orchestration:operate`.
+
+```json
+{
+  "source": "build-monitor",
+  "sourceEventId": "build-1281",
+  "title": "Investigate failed build",
+  "text": "The integration test failed. Find the cause and report back.",
+  "modelSelection": {
+    "instanceId": "codex",
+    "model": "gpt-5.4",
+    "options": [{ "id": "reasoningEffort", "value": "high" }]
+  }
+}
+```
+
+The optional `environmentId` selects a destination. An explicit `modelSelection` takes precedence over the destination's default. Use an instance, model, and options available on the destination. A retry with the same source and event ID keeps the first destination and thread.
+
+The response contains `environmentId` and `threadId`. Open the run under **Chats → Always On** to see the native Codex or Claude conversation, respond, stop it, or handle approvals. New events start with approval-required permissions.
+
+## Existing always-on agents
+
 An always-on agent is an experience: it looks continuous, but it spends most of its time asleep. A short run wakes for an inbox event, saves what must carry forward, and goes back to sleep.
 
 The shape comes from William Hu's article [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents) (13 November 2026). This page separates that article, the T3 behavior that already existed, and the restricted build in this fork.
@@ -47,7 +73,7 @@ Other adaptations, marked as such:
 
 ## Use it
 
-Open **Settings → Always-on agents** to create an agent for a project with an existing text generator or Claude instance. Self-hosted users first pair with the computer that runs the agent.
+Existing agent conversations can still be opened from **Always On** after pairing with their environment.
 
 Open **Always On** beside **Threads** and select an agent. Its conversation shows what triggered each run, the live status, and the result. Send a message to wake the agent. Messages wait in its queue while it is already running or paused.
 

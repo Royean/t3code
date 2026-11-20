@@ -21,7 +21,7 @@ import type {
   ServerSettings,
   ThreadId,
 } from "@t3tools/contracts";
-import type { LegendListRenderItemProps } from "@legendapp/list/react-native";
+import type { LegendListRef, LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { RegistryContext, useAtomMount, useAtomValue } from "@effect/atom-react";
 import { AnimatedLegendList } from "@legendapp/list/reanimated";
 import {
@@ -285,6 +285,7 @@ type ThreadSettingsSessionProps = {
   readonly restoreSelection?: (selection: ModelSelection) => ModelSelection;
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
   readonly onUpdateOptionSelections: (selections: ReadonlyArray<ProviderOptionSelection>) => void;
+  readonly modelOnly?: boolean;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
 };
@@ -307,6 +308,7 @@ type ThreadSettingsSessionValue = {
   readonly pendingHiddenKeys: ReadonlySet<string>;
   readonly manageHidden: boolean;
   readonly setManageHidden: (value: boolean) => void;
+  readonly modelOnly: boolean;
   readonly runtimeMode: RuntimeMode;
   readonly runtimeModeChoices: ReadonlyArray<RuntimeModeChoice>;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
@@ -576,7 +578,9 @@ function ThreadSettingsSessionProvider(
       return;
     }
     if (pendingModel) {
-      rememberModelOptions(pendingModel.selection.instanceId, pendingModel.selection.model, next);
+      if (!props.modelOnly) {
+        rememberModelOptions(pendingModel.selection.instanceId, pendingModel.selection.model, next);
+      }
       setPendingModel({
         ...pendingModel,
         selection: { ...pendingModel.selection, options: next },
@@ -628,6 +632,7 @@ function ThreadSettingsSessionProvider(
     setManageHidden,
     toggleHidden,
     pendingHiddenKeys,
+    modelOnly: props.modelOnly === true,
     runtimeMode: compatibleRuntimeMode,
     runtimeModeChoices,
     onUpdateRuntimeMode: props.onUpdateRuntimeMode,
@@ -725,15 +730,20 @@ type ThreadSettingsCatalogItem =
   | {
       readonly kind: "options";
       readonly key: "options";
+    }
+  | {
+      readonly kind: "catalog-controls";
+      readonly key: "catalog-controls";
     };
 
 function ThreadSettingsModelListRow(props: {
   readonly option: ModelOption;
   readonly isFirst: boolean;
   readonly isLast: boolean;
+  readonly onSelect: (option: ModelOption) => void;
 }) {
   const session = useThreadSettingsSession();
-  const onPress = () => session.pressModel(props.option);
+  const onPress = () => props.onSelect(props.option);
 
   return (
     <ModelRow
@@ -883,8 +893,12 @@ function ThreadSettingsOptionsItem(props: {
         ?.providers.find((provider) => provider.instanceId === session.providerInstanceId) ?? null)
     : null;
 
+  if (session.modelOnly && session.displayedDescriptors.length === 0) return null;
+
   return (
-    <View style={{ paddingBottom: insets.bottom + props.bottomInset + 12 }}>
+    <View
+      style={{ paddingBottom: session.modelOnly ? 12 : insets.bottom + props.bottomInset + 12 }}
+    >
       <ChatGptSharingStatus provider={selectedProvider} />
       <Text className="px-5 pb-2 pt-2 text-sm font-t3-medium text-foreground-muted">
         <T>Options</T>
@@ -936,21 +950,33 @@ function ThreadSettingsOptionsItem(props: {
             </Animated.View>
           );
         })}
-        <Animated.View layout={THREAD_SETTINGS_OPTIONS_LAYOUT_TRANSITION}>
-          <DisclosureRow
-            isLast
-            label={gt("Runtime", { $context: "agent permission mode setting" })}
-            value={(() => {
-              const label = session.runtimeModeChoices.find(
-                (choice) => choice.mode === session.runtimeMode,
-              )?.label;
-              return label === undefined ? undefined : m(label);
-            })()}
-            onPress={() => props.onOpenSubmenu({ kind: "runtime" })}
-          />
-        </Animated.View>
+        {session.modelOnly ? null : (
+          <Animated.View layout={THREAD_SETTINGS_OPTIONS_LAYOUT_TRANSITION}>
+            <DisclosureRow
+              isLast
+              label={gt("Runtime", { $context: "agent permission mode setting" })}
+              value={(() => {
+                const label = session.runtimeModeChoices.find(
+                  (choice) => choice.mode === session.runtimeMode,
+                )?.label;
+                return label === undefined ? undefined : m(label);
+              })()}
+              onPress={() => props.onOpenSubmenu({ kind: "runtime" })}
+            />
+          </Animated.View>
+        )}
       </Animated.View>
 
+      {session.modelOnly ? null : <ThreadSettingsCatalogControls />}
+    </View>
+  );
+}
+
+function ThreadSettingsCatalogControls() {
+  const gt = useGT();
+  const session = useThreadSettingsSession();
+  return (
+    <>
       <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">
         {gt("Catalog", { $context: "section heading for the model catalog" })}
       </Text>
@@ -962,7 +988,7 @@ function ThreadSettingsOptionsItem(props: {
           isLast
         />
       </View>
-    </View>
+    </>
   );
 }
 
@@ -1016,6 +1042,8 @@ function ThreadSettingsMainContent(props: {
       });
   };
   const [listLoaded, setListLoaded] = useState(false);
+  const list = useRef<LegendListRef>(null);
+  const insets = useSafeAreaInsets();
   // Android can drop the first frame of a reduced-motion fade, leaving rows invisible.
   const reducedMotion = useReducedMotion();
   const reduceMotionEnabled = useReduceMotionEnabled();
@@ -1023,10 +1051,22 @@ function ThreadSettingsMainContent(props: {
   const catalogItems = buildThreadSettingsCatalogItems(session, m, locale);
   const hasActiveCatalogFilter =
     session.providerFilter !== null || session.searchQuery.trim().length > 0;
-  const listItems = [
-    ...(catalogItems.length === 0 ? ([{ kind: "empty", key: "empty" }] as const) : catalogItems),
-    { kind: "options", key: "options" },
-  ] satisfies ReadonlyArray<ThreadSettingsCatalogItem>;
+  const modelItems: ReadonlyArray<ThreadSettingsCatalogItem> =
+    catalogItems.length === 0 ? [{ kind: "empty", key: "empty" }] : catalogItems;
+  const optionsItem = { kind: "options", key: "options" } as const;
+  const listItems: ReadonlyArray<ThreadSettingsCatalogItem> = session.modelOnly
+    ? [
+        ...(session.displayedDescriptors.length > 0 ? [optionsItem] : []),
+        ...modelItems,
+        { kind: "catalog-controls", key: "catalog-controls" },
+      ]
+    : [...modelItems, optionsItem];
+  const selectModel = (option: ModelOption) => {
+    session.pressModel(option);
+    if (session.modelOnly && option.capabilities?.optionDescriptors?.length) {
+      void list.current?.scrollToOffset({ offset: 0, animated: true });
+    }
+  };
   const renderCatalogItem = (itemProps: LegendListRenderItemProps<ThreadSettingsCatalogItem>) => {
     const item = itemProps.item;
     let content: ReactNode;
@@ -1039,6 +1079,7 @@ function ThreadSettingsMainContent(props: {
           isFirst={item.isFirst}
           isLast={item.isLast}
           option={item.option}
+          onSelect={selectModel}
         />
       );
     } else if (item.kind === "notice") {
@@ -1054,6 +1095,12 @@ function ThreadSettingsMainContent(props: {
                 ? gt("No matching models")
                 : gt("No available models")}
           </Text>
+        </View>
+      );
+    } else if (item.kind === "catalog-controls") {
+      content = (
+        <View style={{ paddingBottom: insets.bottom + props.bottomInset + 12 }}>
+          <ThreadSettingsCatalogControls />
         </View>
       );
     } else {
@@ -1080,6 +1127,7 @@ function ThreadSettingsMainContent(props: {
   return (
     // oxlint-disable-next-line t3code/require-registered-list-scroll -- Sheet content; sheets sit outside workspace columns and keep their own header handling.
     <AnimatedLegendList
+      ref={list}
       alwaysBounceVertical
       automaticallyAdjustsScrollIndicatorInsets
       className="flex-1 bg-sheet"
@@ -1267,9 +1315,9 @@ function ThreadSettingsModelsScreen() {
   return (
     <>
       <AppBar
-        title={gt("Thread settings")}
+        title={session.modelOnly ? gt("Model") : gt("Thread settings")}
         onClose={presentation.onClose}
-        closeAccessibilityLabel={gt("Cancel thread settings")}
+        closeAccessibilityLabel={session.modelOnly ? gt("Cancel") : gt("Cancel thread settings")}
         search={search}
         menus={[
           {
@@ -1353,6 +1401,7 @@ function ThreadSettingsChoiceScreen() {
 function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation) {
   const screenOptions = useSheetStackOptions();
   const gt = useGT();
+  const { modelOnly } = useThreadSettingsSession();
   const presentation = {
     onClose: props.onClose,
   };
@@ -1366,7 +1415,10 @@ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation) 
         <ThreadSettingsPickerStack.Screen
           name="ThreadSettingsModels"
           component={ThreadSettingsModelsScreen}
-          options={{ headerBackVisible: false, title: gt("Thread settings") }}
+          options={{
+            headerBackVisible: false,
+            title: modelOnly ? gt("Model") : gt("Thread settings"),
+          }}
         />
         <ThreadSettingsPickerStack.Screen
           name="ThreadSettingsChoice"

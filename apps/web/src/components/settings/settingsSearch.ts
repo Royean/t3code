@@ -108,7 +108,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/browser": msg("Browser"),
   "/settings/devices": msg("Devices"),
   "/settings/scheduled-tasks": msg("Scheduled tasks"),
-  "/settings/always-on": msg("Always-on agents"),
+  "/settings/always-on": msg("Always On"),
   "/settings/source-control": msg("Source control & issues"),
   "/settings/worktrees": msg("Worktrees"),
   "/settings/connections": msg("Environments"),
@@ -1079,9 +1079,14 @@ export const SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "always-on",
-    title: msg("Always-on agents"),
+    title: msg("Always On"),
     to: "/settings/always-on",
-    searchTerms: [msg("inbox timer memory approval outbox sleep wake")],
+  },
+  {
+    id: "always-on-routing",
+    title: msg("Event routing"),
+    to: "/settings/always-on",
+    searchTerms: [msg("default destination environment project model reasoning effort")],
   },
   {
     id: "agent-browser-access",

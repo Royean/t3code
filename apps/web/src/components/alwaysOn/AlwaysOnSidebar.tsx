@@ -1,6 +1,7 @@
 import { alwaysOnAttentionCount } from "@t3tools/client-runtime/always-on-conversation";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import type { AlwaysOnAgentSummary } from "@t3tools/contracts";
-import { Link, useSearch } from "@tanstack/react-router";
+import { Link, useParams, useSearch } from "@tanstack/react-router";
 import { useGT } from "gt-react";
 
 import { isElectron } from "../../env";
@@ -71,6 +72,7 @@ export function AlwaysOnSidebar() {
   const agent = useSearch({ strict: false, select: (search) => search.agent });
   const environment = useSearch({ strict: false, select: (search) => search.environment });
   const { attention, entries, isReady } = useAlwaysOnEnvironments();
+  const params = useParams({ strict: false });
   const { isMobile, setOpenMobile } = useSidebar();
 
   const emptyState = isReady
@@ -92,6 +94,38 @@ export function AlwaysOnSidebar() {
             <h2 className="truncate px-2 pb-1 text-xs font-medium text-muted-foreground">
               {entry.label}
             </h2>
+            {entry.eventThreads.length > 0 ? (
+              <SidebarMenu>
+                {entry.eventThreads.map((thread) => {
+                  const selected =
+                    params.environmentId === thread.environmentId && params.threadId === thread.id;
+                  return (
+                    <SidebarMenuItem key={thread.id}>
+                      <SidebarMenuButton
+                        isActive={selected}
+                        aria-current={selected ? "page" : undefined}
+                        render={
+                          <Link
+                            to="/$environmentId/$threadId"
+                            params={{ environmentId: thread.environmentId, threadId: thread.id }}
+                            onClick={() => {
+                              if (isMobile) setOpenMobile(false);
+                            }}
+                          />
+                        }
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate">{thread.title}</p>
+                          <p className="text-muted-foreground truncate text-xs">
+                            <EventRunStatus thread={thread} />
+                          </p>
+                        </div>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            ) : null}
             {entry.status === "ready" && entry.agents.length > 0 ? (
               <SidebarMenu>
                 {entry.agents.map((item) => {
@@ -128,17 +162,42 @@ export function AlwaysOnSidebar() {
                   );
                 })}
               </SidebarMenu>
-            ) : (
+            ) : entry.eventThreads.length === 0 ? (
               <p className="px-2 text-sm text-muted-foreground">
                 <EnvironmentMessage status={entry.status} />
               </p>
-            )}
+            ) : null}
           </SidebarGroup>
         ))}
       </SidebarContent>
       <SidebarChromeFooter />
     </>
   );
+}
+
+function EventRunStatus({ thread }: { readonly thread: EnvironmentThreadShell }) {
+  const gt = useGT();
+  if (thread.hasPendingApprovals) return gt("Awaiting approval");
+  if (thread.hasPendingUserInput) return gt("Waiting for input");
+  switch (thread.latestRun?.status) {
+    case "preparing":
+    case "starting":
+    case "running":
+      return gt("Running");
+    case "waiting":
+      return gt("Waiting");
+    case "completed":
+      return gt("Completed");
+    case "failed":
+      return gt("Failed");
+    case "cancelled":
+    case "interrupted":
+    case "rolled_back":
+      return gt("Stopped");
+    case "queued":
+    case undefined:
+      return gt("Queued");
+  }
 }
 
 function AgentPhase({ agent }: { readonly agent: AlwaysOnAgentSummary }) {

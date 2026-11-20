@@ -41,6 +41,7 @@ import {
   AuthWebSocketTicketResult,
   ServerAuthSessionMethod,
 } from "./auth.ts";
+import { AlwaysOnEventReceipt, AlwaysOnEventSubmission } from "./alwaysOn.ts";
 import {
   ExecutionEnvironmentDescriptor,
   ORCHESTRATION_PROTOCOL_HEADER,
@@ -1072,6 +1073,27 @@ class EnvironmentWebhooksHttpApi extends HttpApiGroup.make("webhooks")
   .add(HttpApiEndpoint.patch("webhookPatch", WEBHOOK_PATH, webhookEndpoint))
   .add(HttpApiEndpoint.get("webhookGet", WEBHOOK_PATH, webhookEndpoint)) {}
 
+export class EnvironmentAlwaysOnUnavailableError extends Schema.TaggedError<EnvironmentAlwaysOnUnavailableError>()(
+  "EnvironmentAlwaysOnUnavailableError",
+  { message: Schema.String },
+  { httpApiStatus: 503 },
+) {}
+
+class EnvironmentAlwaysOnHttpApi extends HttpApiGroup.make("alwaysOn").add(
+  HttpApiEndpoint.post("submitEvent", "/api/always-on/events", {
+    headers: OptionalBearerHeaders,
+    payload: AlwaysOnEventSubmission,
+    success: AlwaysOnEventReceipt.pipe(HttpApiSchema.status(202)),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      EnvironmentHttpBadRequestError,
+      EnvironmentHttpForbiddenError,
+      EnvironmentHttpConflictError,
+      EnvironmentAlwaysOnUnavailableError,
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 export class EnvironmentEventOrchestrationError extends Schema.TaggedError<EnvironmentEventOrchestrationError>()(
   "EnvironmentEventOrchestrationError",
   { reason: Schema.String },
@@ -1164,5 +1186,6 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentProjectsHttpApi)
   .add(EnvironmentVoiceHttpApi)
   .add(EnvironmentConnectHttpApi)
+  .add(EnvironmentAlwaysOnHttpApi)
   .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi) {}

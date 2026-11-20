@@ -10,6 +10,7 @@ import {
   getProviderOptionCurrentLabel,
   getProviderOptionDescriptors,
   readCustomModelEntries,
+  resolveAlwaysOnSettingsModelSelection,
   modelSelectionsEqual,
   pickModelSelection,
   withImplicitFastModeDefault,
@@ -33,6 +34,38 @@ const codexCaps: ModelCapabilities = createModelCapabilities({
       type: "boolean",
     },
   ],
+});
+
+it("restores legacy Always On settings as a single model selection", () => {
+  const instanceId = ProviderInstanceId.make("codex");
+  const catalog = [
+    {
+      instanceId,
+      models: [
+        {
+          slug: "current",
+          name: "Current",
+          aliases: ["old"],
+          isCustom: false,
+          capabilities: codexCaps,
+        },
+      ],
+    },
+  ];
+  const legacy = { harness: instanceId, model: "old", effort: "xhigh" };
+  expect(resolveAlwaysOnSettingsModelSelection(legacy, catalog)).toEqual({
+    instanceId,
+    model: "current",
+    options: [{ id: "reasoningEffort", value: "xhigh" }],
+  });
+  const modelSelection = {
+    instanceId,
+    model: "current",
+    options: [{ id: "fastMode", value: true }],
+  };
+  expect(resolveAlwaysOnSettingsModelSelection({ ...legacy, modelSelection }, [])).toEqual(
+    modelSelection,
+  );
 });
 
 describe("descriptor helpers", () => {

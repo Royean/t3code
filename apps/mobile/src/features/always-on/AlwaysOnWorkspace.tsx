@@ -1,11 +1,12 @@
 import { useAtom, useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { useNavigation, useNavigationState } from "@react-navigation/native";
 import { alwaysOnAttentionCount } from "@t3tools/client-runtime/always-on-conversation";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { isAlwaysOnEventThread, type AlwaysOnPhase } from "@t3tools/contracts";
 import { msg, useGT, useMessages } from "gt-react-native";
 import type { ReactNode } from "react";
 import { Keyboard, Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import type { AlwaysOnPhase } from "@t3tools/contracts";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppBar } from "../../components/ui/AppBar";
@@ -24,7 +25,9 @@ import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspace
 import { WorkspaceTabPanes } from "../layout/workspace/WorkspaceTabPanes";
 import { useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
 import { openSettings } from "../settings/settings-navigation";
+import { resolveThreadListV2Status, type ThreadListV2Status } from "../threads/threadListV2";
 import {
+  alwaysOnEventThreadShellsAtom,
   alwaysOnWorkspaceEnvironmentsAtom,
   CHATS_WORKSPACE_TABS,
   chatsWorkspaceTabAtom,
@@ -39,6 +42,17 @@ export const ALWAYS_ON_PHASE_LABELS: Record<AlwaysOnPhase, string> = {
   needs_confirmation: msg("Needs confirmation"),
 };
 
+const EVENT_THREAD_STATUS: Record<ThreadListV2Status, string> = {
+  approval: msg("Waiting for approval"),
+  input: msg("Waiting for input"),
+  request: msg("Needs attention"),
+  working: msg("Running"),
+  waiting: msg("Waiting"),
+  failed: msg("Failed"),
+  limited: msg("Limited", { $context: "thread status, usage limit reached" }),
+  ready: msg("Ready"),
+};
+
 export function AlwaysOnWorkspace({
   renderThreads,
   sidebar = false,
@@ -49,14 +63,29 @@ export function AlwaysOnWorkspace({
   const gt = useGT();
   const { layout, openWorkspaceTab } = useAdaptiveWorkspaceLayout();
   const [tab, setTab] = useAtom(chatsWorkspaceTabAtom);
-  const focusedPage = useNavigationState((state) => state.routes[state.index]?.name);
+  const focusedRoute = useNavigationState((state) => state.routes[state.index]);
+  const focusedPage = focusedRoute?.name;
+  const focusedThread =
+    focusedRoute?.name === "Thread"
+      ? (focusedRoute.params as ReactNavigation.RootParamList["Thread"] | undefined)?.threadId
+      : undefined;
   const selected =
-    layout.usesSplitView && focusedPage === "Thread"
-      ? "threads"
-      : focusedPage === "AlwaysOnConversation"
-        ? "alwaysOn"
+    focusedPage === "AlwaysOnConversation" ||
+    (typeof focusedThread === "string" && isAlwaysOnEventThread(focusedThread))
+      ? "alwaysOn"
+      : layout.usesSplitView && focusedPage === "Thread"
+        ? "threads"
         : tab;
   const environments = useAtomValue(alwaysOnWorkspaceEnvironmentsAtom);
+  const threads = useAtomValue(alwaysOnEventThreadShellsAtom);
+  const actionableEnvironments = new Set(
+    environments.filter(({ canOperate }) => canOperate).map(({ environmentId }) => environmentId),
+  );
+  const eventAttention = threads.filter((thread) => {
+    if (!actionableEnvironments.has(thread.environmentId)) return false;
+    const status = resolveThreadListV2Status(thread);
+    return status === "approval" || status === "input" || status === "request";
+  }).length;
   const attention = environments.reduce(
     (total, environment) =>
       total +
@@ -66,7 +95,7 @@ export function AlwaysOnWorkspace({
             0,
           )
         : 0),
-    0,
+    eventAttention,
   );
   const selectTab = (next: ChatsWorkspaceTab) => {
     if (next === selected) return;
@@ -132,7 +161,7 @@ export function AlwaysOnWorkspace({
               />
             ) : null}
             {tabsInHeader ? null : tabs}
-            <AlwaysOnAgentList environments={environments} />
+            <AlwaysOnActivityList environments={environments} threads={threads} />
           </>
         )
       }
@@ -140,10 +169,12 @@ export function AlwaysOnWorkspace({
   );
 }
 
-function AlwaysOnAgentList({
+function AlwaysOnActivityList({
   environments,
+  threads,
 }: {
   readonly environments: readonly AlwaysOnWorkspaceEnvironment[];
+  readonly threads: readonly EnvironmentThreadShell[];
 }) {
   const gt = useGT();
   const navigation = useNavigation();
@@ -151,10 +182,10 @@ function AlwaysOnAgentList({
   const insets = useSafeAreaInsets();
   const workspace = useWorkspaceTabs();
   const { isLoadingConnections } = useWorkspaceConnectionState();
-  const showCreate = environments.some(
-    ({ result, canOperate }) => canOperate && result?._tag === "Success",
-  );
-  const hasAgents = environments.some(({ snapshot }) => (snapshot?.agents.length ?? 0) > 0);
+  const selectedThread =
+    focusedRoute?.name === "Thread"
+      ? (focusedRoute.params as ReactNavigation.RootParamList["Thread"] | undefined)
+      : undefined;
   const selected =
     focusedRoute?.name === "AlwaysOnConversation"
       ? (focusedRoute.params as ReactNavigation.RootParamList["AlwaysOnConversation"] | undefined)
@@ -173,21 +204,32 @@ function AlwaysOnAgentList({
         <AppActivityIndicator className="self-start p-4" />
       ) : environments.length === 0 ? (
         <Text className="text-foreground-muted">
-          {gt("Connect an environment to see always-on agents.")}
+          {gt("Connect an environment to use Always On.")}
         </Text>
       ) : null}
       {environments.map((environment) => (
-        <EnvironmentAgents
+        <EnvironmentActivity
           key={environment.environmentId}
           environment={environment}
+          threads={threads.filter(
+            (thread) =>
+              !environment.readDenied && thread.environmentId === environment.environmentId,
+          )}
+          selectedThreadId={
+            selectedThread?.environmentId === environment.environmentId &&
+            typeof selectedThread?.threadId === "string"
+              ? selectedThread.threadId
+              : undefined
+          }
           selectedAgentId={
             selected?.environmentId === environment.environmentId ? selected?.agentId : undefined
           }
         />
       ))}
-      {showCreate && !hasAgents ? (
+      {threads.length === 0 &&
+      environments.some(({ canConfigureRouting }) => canConfigureRouting) ? (
         <Button
-          label={gt("Create an agent in Settings")}
+          label={gt("Configure event routing")}
           onPress={() => openSettings(navigation, "SettingsAlwaysOn")}
         />
       ) : null}
@@ -195,14 +237,18 @@ function AlwaysOnAgentList({
   );
 }
 
-function EnvironmentAgents({
+function EnvironmentActivity({
   environment,
   selectedAgentId,
+  selectedThreadId,
+  threads,
 }: {
   readonly environment: AlwaysOnWorkspaceEnvironment;
   readonly selectedAgentId:
     | ReactNavigation.RootParamList["AlwaysOnConversation"]["agentId"]
     | undefined;
+  readonly selectedThreadId: string | undefined;
+  readonly threads: readonly EnvironmentThreadShell[];
 }) {
   const gt = useGT();
   const messages = useMessages();
@@ -211,6 +257,33 @@ function EnvironmentAgents({
   const refresh = useAtomRefresh(serverEnvironment.alwaysOnLive({ environmentId, input: {} }));
   return (
     <ListSection title={environment.label}>
+      {[...threads]
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .map((thread) => {
+          const status = resolveThreadListV2Status(thread);
+          const latestRunStatus = thread.latestRun?.status;
+          let label = messages(EVENT_THREAD_STATUS[status]);
+          if (status === "working" && thread.runtime?.status === "queued") {
+            label = gt("Queued");
+          } else if (status === "ready" || status === "waiting") {
+            if (latestRunStatus === "completed") label = gt("Completed");
+            if (latestRunStatus === "interrupted" || latestRunStatus === "cancelled") {
+              label = gt("Stopped");
+            }
+          }
+          return (
+            <ListRow
+              key={thread.id}
+              label={thread.title}
+              description={label}
+              detail={thread.modelSelection?.model}
+              selected={selectedThreadId === thread.id ? true : undefined}
+              onPress={() =>
+                selectDetail({ name: "Thread", params: { environmentId, threadId: thread.id } })
+              }
+            />
+          );
+        })}
       {!environment.connected ? (
         <Text className="px-4 py-3 text-foreground-muted">
           {gt("This environment is disconnected.")}
@@ -229,28 +302,37 @@ function EnvironmentAgents({
       ) : environment.snapshot === null ? (
         <AppActivityIndicator className="self-start px-4 py-3" />
       ) : environment.snapshot.agents.length === 0 ? (
-        <Text className="px-4 py-3 text-foreground-muted">{gt("No always-on agents yet.")}</Text>
+        threads.length === 0 ? (
+          <Text className="px-4 py-3 text-foreground-muted">{gt("No runs yet.")}</Text>
+        ) : null
       ) : (
-        [...environment.snapshot.agents]
-          .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-          .map((agent) => {
-            const count = alwaysOnAttentionCount(agent);
-            return (
-              <ListRow
-                key={agent.id}
-                label={agent.title}
-                description={messages(ALWAYS_ON_PHASE_LABELS[agent.phase])}
-                detail={count > 0 ? gt("{count} need attention", { count }) : undefined}
-                selected={selectedAgentId === agent.id ? true : undefined}
-                onPress={() =>
-                  selectDetail({
-                    name: "AlwaysOnConversation",
-                    params: { environmentId, agentId: agent.id },
-                  })
-                }
-              />
-            );
-          })
+        <>
+          {threads.length > 0 ? (
+            <Text textRole="footnote" className="px-4 pt-3 text-foreground-muted">
+              {gt("Always-on agents")}
+            </Text>
+          ) : null}
+          {[...environment.snapshot.agents]
+            .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+            .map((agent) => {
+              const count = alwaysOnAttentionCount(agent);
+              return (
+                <ListRow
+                  key={agent.id}
+                  label={agent.title}
+                  description={messages(ALWAYS_ON_PHASE_LABELS[agent.phase])}
+                  detail={count > 0 ? gt("{count} need attention", { count }) : undefined}
+                  selected={selectedAgentId === agent.id ? true : undefined}
+                  onPress={() =>
+                    selectDetail({
+                      name: "AlwaysOnConversation",
+                      params: { environmentId, agentId: agent.id },
+                    })
+                  }
+                />
+              );
+            })}
+        </>
       )}
     </ListSection>
   );

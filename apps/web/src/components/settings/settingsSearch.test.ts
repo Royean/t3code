@@ -88,8 +88,8 @@ describe("searchSettings", () => {
     });
   });
 
-  it("finds the Always-on agents page", () => {
-    expect(searchSettings("always-on")[0]).toMatchObject({
+  it("finds the Always On page", () => {
+    expect(searchSettings("always on")[0]).toMatchObject({
       id: "always-on",
       to: "/settings/always-on",
     });

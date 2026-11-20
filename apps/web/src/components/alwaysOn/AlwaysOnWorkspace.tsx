@@ -35,6 +35,7 @@ export function AlwaysOnWorkspace({
   const contentArea = workspaceAreaProps("home", 1, gt("Always On"));
   const pending = !isReady || entries.some((entry) => entry.status === "loading");
   const hasAgents = entries.some((entry) => entry.agents.length > 0);
+  const hasEvents = entries.some((entry) => entry.eventThreads.length > 0);
   const creator = entries.find((entry) => entry.canOperate);
   const ready = entries.some((entry) => entry.status === "ready");
 
@@ -59,23 +60,21 @@ export function AlwaysOnWorkspace({
                 <InfinityIcon />
               </EmptyMedia>
               <EmptyTitle>
-                {hasAgents
-                  ? gt("Select an agent")
+                {hasEvents || hasAgents
+                  ? gt("Select a conversation")
                   : pending
                     ? gt("Loading agents…")
                     : ready
-                      ? gt("No Always On agents")
+                      ? gt("No Always On activity")
                       : gt("No available environments")}
               </EmptyTitle>
-              {ready && !pending && !hasAgents ? (
+              {ready && !pending && !hasEvents && !hasAgents ? (
                 <EmptyDescription>
-                  {creator
-                    ? gt("Create an agent in Settings to get started.")
-                    : gt("An operator can create agents in Settings.")}
+                  {creator ? gt("Set defaults for incoming events in Settings.") : null}
                 </EmptyDescription>
               ) : null}
             </EmptyHeader>
-            {!hasAgents && creator && !pending ? (
+            {!hasEvents && !hasAgents && creator && !pending ? (
               <Button
                 render={
                   <Link to="/settings/always-on" search={{ machine: creator.environmentId }} />

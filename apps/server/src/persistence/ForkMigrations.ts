@@ -4,6 +4,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import AlwaysOn from "./ForkMigrations/002_AlwaysOn.ts";
 import EventOrchestration from "./ForkMigrations/001_EventOrchestration.ts";
+import AlwaysOnEventRouting from "./ForkMigrations/003_AlwaysOnEventRouting.ts";
 
 const TABLE = "t3_fork_migrations";
 const run = Migrator.make({});
@@ -34,7 +35,11 @@ export const hasPendingForkMigrations = Effect.gen(function* () {
     SELECT migration_id, name FROM ${sql(TABLE)}
   `;
   const applied = new Set(rows.map((row) => `${row.migration_id}:${row.name}`));
-  return !applied.has("1:EventOrchestration") || !applied.has("2:AlwaysOn");
+  return (
+    !applied.has("1:EventOrchestration") ||
+    !applied.has("2:AlwaysOn") ||
+    !applied.has("3:AlwaysOnEventRouting")
+  );
 });
 
 export const runForkMigrations = () =>
@@ -43,6 +48,7 @@ export const runForkMigrations = () =>
     loader: Migrator.fromRecord({
       "1_EventOrchestration": EventOrchestration,
       "2_AlwaysOn": AlwaysOn,
+      "3_AlwaysOnEventRouting": AlwaysOnEventRouting,
     }),
   });
 
