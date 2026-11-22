@@ -232,6 +232,7 @@ export type AuthTokenExchangeRequest = typeof AuthTokenExchangeRequest.Type;
 
 export const AuthAccessTokenResult = Schema.Struct({
   access_token: TrimmedNonEmptyString,
+  session_id: Schema.optionalKey(AuthSessionId),
   issued_token_type: Schema.Literal(AuthAccessTokenType),
   token_type: Schema.Literals(["Bearer", "DPoP"]),
   expires_in: Schema.Number,

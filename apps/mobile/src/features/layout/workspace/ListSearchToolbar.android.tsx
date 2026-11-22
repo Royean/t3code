@@ -5,12 +5,10 @@ import { BackHandler, Keyboard } from "react-native";
 import { AppBar } from "../../../components/ui/AppBar";
 import { appBarMenuItemsFromActions } from "../../../components/ui/menuActionItems";
 import { useHardwareKeyboardCommand } from "../../keyboard/hardwareKeyboardCommands";
-import { WorkspaceConnectionTitle } from "../../home/WorkspaceConnectionTitle";
 import type { SharedSlotTab } from "./navigation-tab-order";
-import { SharedSlotTitle } from "./SharedSlotTitle";
+import { SharedSlotTabs } from "./SharedSlotTabs";
 import { useWorkspaceTabs } from "./WorkspaceTabsContext";
 import type { PullRequestFilterMenu } from "../../pull-requests/PullRequestListFilters";
-import { openSettings } from "../../settings/settings-navigation";
 
 /** Pull request and issue search share the thread list's Android header. */
 export function ListSearchToolbar(props: {
@@ -59,14 +57,12 @@ export function ListSearchToolbar(props: {
   }, [searching, closeSearch, navigation, isTabActive, section]);
   return (
     <AppBar
-      title="T3 Code"
-      titleContent={
-        <WorkspaceConnectionTitle
-          grow
-          onPress={() => openSettings(navigation, "SettingsEnvironments")}
-          brand={<SharedSlotTitle tab={section} />}
-        />
+      title={
+        section === "issues"
+          ? gt("Issues", { $context: "screen title, list of issues" })
+          : gt("Pull requests")
       }
+      titleContent={<SharedSlotTabs tab={section} />}
       search={{
         value: tab.query,
         onChangeText: (query) => dispatch({ type: "query", tab: section, query }),

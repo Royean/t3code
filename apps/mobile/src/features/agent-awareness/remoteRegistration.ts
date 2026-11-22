@@ -1,10 +1,15 @@
 import { type LiveActivity } from "expo-widgets";
 import {
   configureAndroidAgentNotifications,
+  connectSelfHostedAndroidNotifications,
+  disconnectSelfHostedAndroidNotifications,
+  isSelfHostedAndroidNotificationServiceListening,
   clearAndroidAgentNotifications,
 } from "./androidNotifications";
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
+import * as Crypto from "expo-crypto";
+import * as Base64Url from "effect/encoding/Base64Url";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -56,6 +61,7 @@ import { makeRelayDeviceRegistrationRequest, resolveApsEnvironment } from "./reg
 const REMOTE_ACTIVITY_REGISTRATION_RETRY_MS = 15_000;
 
 const AgentAwarenessOperation = Schema.Literals([
+  "register-self-hosted-device",
   "read-notification-permissions",
   "read-native-push-token",
   "read-device-registration-relay-token",
@@ -143,6 +149,14 @@ export function subscribeAgentAwarenessRegistrationStatus(listener: () => void):
 let activeLiveActivityRegistrationRetry: ReturnType<typeof setTimeout> | null = null;
 let relayTokenProvider: (() => Promise<string | null>) | null = null;
 let relayTokenProviderIdentity: string | null = null;
+let selfHostedRegistration: {
+  readonly url: string;
+  readonly register: (
+    body: RelayDeviceRegistrationRequest,
+    deliveryTokenHash: string,
+  ) => Promise<boolean>;
+} | null = null;
+let selfHostedDelivery: Promise<{ readonly token: string; readonly hash: string }> | null = null;
 let deviceRegistrationGeneration = 0;
 let activeDeviceRegistration: {
   readonly input: DeviceRegistrationInput;
@@ -169,7 +183,7 @@ function mergeAgentAwarenessRegistrationPreferences(
 }
 
 function readRelayConfig(): { readonly url: string } | null {
-  const relayUrl = resolveCloudPublicConfig().relay.url;
+  const relayUrl = selfHostedRegistration?.url ?? resolveCloudPublicConfig().relay.url;
   if (!relayUrl) {
     return null;
   }
@@ -195,16 +209,19 @@ function shouldRegisterAgentAwarenessDeviceForProvider(
 export function setAgentAwarenessRelayTokenProvider(
   provider: (() => Promise<string | null>) | null,
   identity?: string,
+  registration: typeof selfHostedRegistration = null,
 ): void {
+  const hasAccount = provider !== null || registration !== null;
   const isExistingIdentity =
-    provider !== null &&
+    hasAccount &&
     !shouldRegisterAgentAwarenessDeviceForProvider(relayTokenProviderIdentity, identity);
   if (!isExistingIdentity) {
     // An unset JS identity may mean remount; native configure checks the persisted account on cold start.
     if (relayTokenProviderIdentity && identity !== relayTokenProviderIdentity) {
+      selfHostedDelivery = null;
       clearAndroidAgentNotifications();
     }
-    if (provider) {
+    if (hasAccount) {
       publishWidget({ kind: "loading" });
     }
     androidDeviceReplayedAt = null;
@@ -214,8 +231,10 @@ export function setAgentAwarenessRelayTokenProvider(
     registeredActivityPushTokens.clear();
   }
   relayTokenProvider = provider;
-  relayTokenProviderIdentity = provider ? (identity ?? null) : null;
-  if (!provider) {
+  selfHostedRegistration = registration;
+  relayTokenProviderIdentity = hasAccount ? (identity ?? null) : null;
+  if (!hasAccount) {
+    selfHostedDelivery = null;
     clearAndroidAgentNotifications();
     pushTokenSubscription?.remove();
     pushTokenSubscription = null;
@@ -234,7 +253,7 @@ export function setAgentAwarenessRelayTokenProvider(
     });
     return;
   }
-  ensurePushTokenListener();
+  if (!registration) ensurePushTokenListener();
   ensureAppStateListener();
   runRegistrationInBackground(
     refreshActiveLiveActivityRemoteRegistration(),
@@ -252,6 +271,7 @@ export function setAgentAwarenessRelayTokenProvider(
 // Provider remounts retain a valid relay registration; teardown must preserve it and lock-screen activities.
 export function releaseAgentAwarenessRelayTokenProvider(): void {
   relayTokenProvider = null;
+  selfHostedRegistration = null;
   relayTokenProviderIdentity = null;
   deviceRegistrationGeneration++;
   activeDeviceRegistration = null;
@@ -277,7 +297,7 @@ function iosMajorVersion(): number {
 }
 
 const nativePushTokenRegistration = Effect.fn("remoteRegistration.nativePushTokenRegistration")(
-  function* (observedPushToken?: string) {
+  function* (observedPushToken?: string, selfHosted = false) {
     if (!canRegisterPushNotifications() || !supportsAgentAwarenessPush()) {
       return { notificationsEnabled: false, pushToken: null, notificationPermissionGranted: false };
     }
@@ -308,6 +328,13 @@ const nativePushTokenRegistration = Effect.fn("remoteRegistration.nativePushToke
             Effect.orElseSucceed(() => false),
           )
         : true);
+    if (selfHosted) {
+      return {
+        notificationsEnabled: alertsEnabled,
+        pushToken: null,
+        notificationPermissionGranted: permissions.granted,
+      };
+    }
     if (observedPushToken) {
       lastNativePushToken = observedPushToken;
       nativePushTokenRotations++;
@@ -396,11 +423,12 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
     setRegistrationStatus("unknown");
     return;
   }
-  const token = yield* relayToken("read-device-registration-relay-token");
+  const register = selfHostedRegistration?.register;
+  const token = register ? null : yield* relayToken("read-device-registration-relay-token");
   if (expectedGeneration !== deviceRegistrationGeneration) {
     return;
   }
-  if (!token) {
+  if (!token && !register) {
     setRegistrationStatus("unknown");
     return;
   }
@@ -422,9 +450,13 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
   // foreground bursts, but repair missed pushes on cold start or a return
   // after time away, just like re-registering an iOS activity token.
   const now = yield* Clock.currentTimeMillis;
+  const usesSelfHostedDelivery =
+    body.platform === "android" &&
+    (body.preferences.notificationsEnabled || body.preferences.liveActivitiesEnabled);
   const needsAndroidReplay =
     body.platform === "android" &&
-    (androidDeviceReplayedAt === null ||
+    ((register && usesSelfHostedDelivery && !isSelfHostedAndroidNotificationServiceListening()) ||
+      androidDeviceReplayedAt === null ||
       now - androidDeviceReplayedAt >= ACTIVITY_TOKEN_REREGISTER_INTERVAL_MS);
   if (
     persisted &&
@@ -432,15 +464,58 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
     persisted.signature === signature &&
     !needsAndroidReplay
   ) {
-    setRegistrationStatus("registered", Boolean(payload.pushToken));
+    setRegistrationStatus(
+      "registered",
+      register ? registeredWithPushToken : Boolean(payload.pushToken),
+    );
     return;
   }
 
-  const client = yield* ManagedRelay.ManagedRelayClient;
-  yield* client.registerDevice({
-    clerkToken: token,
-    payload,
-  });
+  let connected = Boolean(payload.pushToken);
+  if (register) {
+    if (!usesSelfHostedDelivery) disconnectSelfHostedAndroidNotifications();
+    const result = yield* Effect.tryPromise({
+      try: async () => {
+        // Reuse the credential across concurrent registrations and lost responses.
+        // Only its hash is sent to the account server during registration.
+        const pending = (selfHostedDelivery ??= (async () => {
+          const token = Base64Url.encode(await Crypto.getRandomBytesAsync(32));
+          const hash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, token);
+          return { token, hash };
+        })());
+        let credential: Awaited<typeof pending>;
+        try {
+          credential = await pending;
+        } catch (cause) {
+          if (selfHostedDelivery === pending) selfHostedDelivery = null;
+          throw cause;
+        }
+        if (expectedGeneration !== deviceRegistrationGeneration) return null;
+        if (!(await register(payload, credential.hash))) {
+          throw new Error("Self-hosted device registration failed.");
+        }
+        return credential;
+      },
+      catch: (cause) =>
+        new AgentAwarenessOperationError({
+          operation: "register-self-hosted-device",
+          cause,
+        }),
+    });
+    if (!result || expectedGeneration !== deviceRegistrationGeneration) return;
+    if (usesSelfHostedDelivery) {
+      connected = connectSelfHostedAndroidNotifications(relayConfig.url, result.token);
+      if (!connected) {
+        return yield* new AgentAwarenessOperationError({
+          operation: "register-self-hosted-device",
+          cause: new Error("The Android notification service could not start."),
+        });
+      }
+    }
+  } else if (token) {
+    const client = yield* ManagedRelay.ManagedRelayClient;
+    yield* client.registerDevice({ clerkToken: token, payload });
+  }
   if (expectedGeneration !== deviceRegistrationGeneration) {
     // Signed out while the request was in flight: the sign-out path already
     // reset the status and cleared the record for the next account, so a
@@ -448,7 +523,7 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
     return;
   }
   if (body.platform === "android") androidDeviceReplayedAt = yield* Clock.currentTimeMillis;
-  setRegistrationStatus("registered", Boolean(payload.pushToken));
+  setRegistrationStatus("registered", connected);
   yield* Effect.promise(() =>
     saveAgentAwarenessRegistrationRecord({
       identity,
@@ -720,14 +795,22 @@ const registerDevice = Effect.fn("remoteRegistration.registerDevice")(function* 
     input.preferencesOverride,
   );
   if (expectedGeneration !== deviceRegistrationGeneration) return;
-  if (relayTokenProvider && relayTokenProviderIdentity) {
+  if ((relayTokenProvider || selfHostedRegistration) && relayTokenProviderIdentity) {
     configureAndroidAgentNotifications(
       deviceId,
       relayTokenProviderIdentity,
       preferences.liveActivitiesEnabled !== false,
     );
   }
-  const pushTokenRegistration = yield* nativePushTokenRegistration(input?.observedPushToken);
+  const selfHosted = selfHostedRegistration !== null;
+  const pushTokenRegistration = yield* nativePushTokenRegistration(
+    input?.observedPushToken,
+    selfHosted,
+  );
+  if (expectedGeneration !== deviceRegistrationGeneration) return;
+  if (selfHosted && !pushTokenRegistration.notificationPermissionGranted) {
+    disconnectSelfHostedAndroidNotifications();
+  }
   const bundleId =
     Platform.OS === "android"
       ? Constants.expoConfig?.android?.package?.trim()
@@ -753,6 +836,7 @@ const registerDevice = Effect.fn("remoteRegistration.registerDevice")(function* 
         : {}),
       ...(pushTokenRegistration.pushToken ? { pushToken: pushTokenRegistration.pushToken } : {}),
       notificationsEnabled: pushTokenRegistration.notificationsEnabled,
+      selfHostedDelivery: selfHosted,
       preferences,
     }),
     expectedGeneration,
@@ -870,6 +954,8 @@ export function updateAgentAwarenessRegistrationPreferences(
 }
 
 export function __resetAgentAwarenessRemoteRegistrationForTest(): void {
+  selfHostedRegistration = null;
+  selfHostedDelivery = null;
   pushTokenSubscription?.remove();
   pushTokenSubscription = null;
   appStateSubscription?.remove();

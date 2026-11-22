@@ -104,6 +104,7 @@ const LEGACY_DELIVERY_OUTCOMES: ReadonlySet<string> = new Set([
 
 interface WebhookOrigin {
   readonly relayHookBaseUrl: string | null;
+  readonly sign?: (hookId: string, token: string) => string;
 }
 
 const ENDPOINT_KEY = /^[0-9a-f]{16}$/;
@@ -387,7 +388,12 @@ function webhookEndpoint(
   const base = origin?.relayHookBaseUrl ?? null;
   return {
     path: webhookPath(row.task_id, row.webhook_token),
-    url: base === null ? null : `${base}/${encodeURIComponent(row.task_id)}/${row.webhook_token}`,
+    url:
+      base === null
+        ? null
+        : `${base}/${encodeURIComponent(row.task_id)}/${row.webhook_token}${
+            origin?.sign ? `/${origin.sign(row.task_id, row.webhook_token)}` : ""
+          }`,
     hasSecret: row.webhook_secret !== null,
   };
 }

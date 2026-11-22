@@ -55,7 +55,7 @@ export function ConnectionEnvironmentRow(props: {
   readonly opensDetails?: boolean;
   readonly onToggle: () => void;
   readonly onReconnect: (environmentId: EnvironmentId) => void;
-  readonly onRemove: (environmentId: EnvironmentId) => void;
+  readonly onRemove?: (environmentId: EnvironmentId) => void;
   readonly onSetEnabled: (environmentId: EnvironmentId, enabled: boolean) => void;
   readonly onUpdate: (
     environmentId: EnvironmentId,
@@ -289,12 +289,14 @@ export function ConnectionEnvironmentRow(props: {
                 disabled={!enabled}
                 onPress={() => props.onReconnect(props.environment.environmentId)}
               />
-              <IconButton
-                accessibilityLabel={gt("Remove environment")}
-                icon="trash"
-                variant="danger"
-                onPress={() => props.onRemove(props.environment.environmentId)}
-              />
+              {props.onRemove ? (
+                <IconButton
+                  accessibilityLabel={gt("Remove environment")}
+                  icon="trash"
+                  variant="danger"
+                  onPress={() => props.onRemove?.(props.environment.environmentId)}
+                />
+              ) : null}
             </View>
           ) : (
             <View className="flex-row justify-end gap-2">
@@ -331,19 +333,21 @@ export function ConnectionEnvironmentRow(props: {
                 />
               </Pressable>
 
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel={gt("Remove environment")}
-                className="h-[42px] w-[42px] items-center justify-center rounded-[14px] border border-danger-border bg-danger active:opacity-70"
-                onPress={() => props.onRemove(props.environment.environmentId)}
-              >
-                <SymbolView
-                  name="trash"
-                  size={14}
-                  tintColorClassName="accent-danger-foreground"
-                  type="monochrome"
-                />
-              </Pressable>
+              {props.onRemove ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={gt("Remove environment")}
+                  className="h-[42px] w-[42px] items-center justify-center rounded-[14px] border border-danger-border bg-danger active:opacity-70"
+                  onPress={() => props.onRemove?.(props.environment.environmentId)}
+                >
+                  <SymbolView
+                    name="trash"
+                    size={14}
+                    tintColorClassName="accent-danger-foreground"
+                    type="monochrome"
+                  />
+                </Pressable>
+              ) : null}
             </View>
           )}
         </Animated.View>

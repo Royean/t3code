@@ -1,6 +1,18 @@
-# Self-hosted connection pilot
+# Self-hosted connection
 
-The optional [account service](../../infra/self-hosted/README.md) lists a fixed set of environments for one account. Clients sign in under **Self-hosted connection** in connection settings, choose a computer, and redeem its ordinary T3 pairing credential. Official T3 Connect remains available independently.
+The optional [account service](../../infra/self-hosted/README.md) lists a fixed set of environments for one account. On mobile, open **Settings → T3 Account → Self-hosted connection**. On web and desktop, open **T3 Account** from the account button at the bottom of the settings sidebar. T3 Pro and mobile use the configured server. Other builds accept a server URL. On web and desktop, use **Import environments** to choose a computer.
+
+## T3 Pro preview
+
+Build with `T3CODE_SELF_HOSTED_ONLY=1` to use only the self-hosted **T3 Account → T3 Connect**. The default account origin is `https://t3.vivid-dream.online`. Set `T3CODE_SELF_HOSTED_CONNECT_URL` for a separate preview service. Upgrade the account service and the host environment before testing this client.
+
+The preview reuses the environment ID and uses account-owned connection routes. Removing a computer from **Environments** remembers that preference on the current client. You can add it back from the account. The account's device list can sign out other devices and revoke their account-issued environment sessions. If an environment is offline when a device is revoked, the service retries revocation when it can reach the environment again.
+
+For activity updates and held webhooks, provision a separate random 32-byte base64url key per configured environment. Set `activityKey` on that environment in the account service's private configuration. Provide the same key to the environment server as `T3CODE_SELF_HOSTED_ACTIVITY_KEY` and set `T3CODE_SELF_HOSTED_ACTIVITY_URL` to the account origin. Official webhook URLs need to be replaced with the new URL displayed by each scheduled task.
+
+On Android, grant notification permission with the app open. A quiet **Background notifications** entry keeps a native connection to this account server while the app is in the background. Battery restrictions may delay delivery, and stopping the app from Android settings stops the connection until you reopen it. If you customize the APK package instead of using `com.royean.t3code`, set the server's `androidPackageName` accordingly. The account origin's proxy should allow HTTPS requests to wait at least 25 seconds.
+
+After upgrading and migrating every account client, set `allowLegacyPairing: false` to turn off account connections that cannot be revoked from the device list.
 
 ## Route an environment through your server
 
@@ -17,9 +29,9 @@ ssh -N -i /private/path/tunnel-key \
 
 Use a dedicated key and account. Restrict its authorized key to the chosen loopback listener, deny command execution and interactive access, and deny unrelated forwarding. Keep the remote listener on loopback; the HTTPS proxy is the public entry point. The account service's `pairingOrigin` can then be `http://127.0.0.1:13773`, while `origin` is `https://computer.example.com`.
 
-Generate the account service's environment credential with the environment's existing `auth session issue` command. Store it only in the private service configuration, with the configured expiry recorded for renewal. It must grant `AuthStandardClientScopes` to delegate ordinary clients. Account logout revokes the account session and removes that account's saved environments from the current client; environment session revocation remains an environment operation.
+Generate the account service's environment credential with the environment's existing `auth session issue` command. Store it only in the private service configuration, with the configured expiry recorded for renewal. It must grant `AuthStandardClientScopes` to delegate ordinary clients. Account logout removes account-owned routes from the current client. Other saved routes on the same environment remain usable.
 
-The account service contacts an environment only to read `/.well-known/t3/environment` and to ask `/api/auth/pairing-token` for a one-time link. Always-on agents, memory, timers, and provider credentials stay in that environment's database. The directory cannot read or run them, and a directory session is not an environment session. A client uses always-on only after pairing, under `orchestration:read` or `orchestration:operate` on that environment. Official T3 Connect is a separate sign-in and is not replaced by this directory.
+The account service probes each configured environment and uses the environment's authentication API to issue and revoke client access. Always On agents, memory, timers, and provider credentials stay in the environment database. Clients use the environment's session and scopes for orchestration.
 
 ## Verify before exposing a real workspace
 

@@ -86,7 +86,11 @@ export const layer = HttpApiBuilder.group(
       // The relay's delivery id and receive time count only with its signed
       // proof; the URL can also be called directly. The receive time matters
       // for requests the relay held while we were offline.
-      const relay = yield* relayDeliveryProof.verify({ headers, hookId: params.hookId });
+      const relay = yield* relayDeliveryProof.verify({
+        headers,
+        hookId: params.hookId,
+        token: params.token,
+      });
       const relayDeliveryId = Option.isSome(relay) ? relay.value.deliveryId : undefined;
       const relayReceivedAt = Option.isSome(relay) ? relay.value.receivedAt : undefined;
 

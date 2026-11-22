@@ -3,8 +3,15 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The persistence fixture uses an OS temporary directory path.
 import * as NodePath from "node:path";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Signs the fixture webhook link.
+import * as NodeCrypto from "node:crypto";
 import { expect, it } from "@effect/vitest";
-import { AuthStandardClientScopes } from "@t3tools/contracts";
+import {
+  AuthStandardClientScopes,
+  AuthAccessTokenType,
+  EnvironmentId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -31,6 +38,8 @@ const config = (overrides: Partial<SelfHostedConfig> = {}): SelfHostedConfig => 
   ...overrides,
 });
 const credentials = { username: "owner", password: PASSWORD };
+const ACTIVITY_KEY = "a".repeat(43);
+const packageName = "com.example.t3pro";
 const online: typeof fetch = async () =>
   Response.json({
     credential: "one-time-pairing",
@@ -61,6 +70,210 @@ it.effect("denies incorrect credentials, rate-limits logins, and expires the bud
     yield* TestClock.adjust("1 minute");
     expect((yield* service.login(credentials, "client")).accountId).toBe("owner");
   }).pipe(Effect.provide(SelfHostedConnect.layer(config(), { fetch: online }))),
+);
+
+it.effect("lists named devices and revokes their complete session family", () =>
+  Effect.gen(function* () {
+    const service = yield* SelfHostedConnect.SelfHostedConnect;
+    const phone = yield* service.login({ ...credentials, deviceLabel: "Android phone" }, "phone");
+    const desktop = yield* service.login({ ...credentials, deviceLabel: "MacBook Air" }, "mac");
+    const rotated = yield* service.refresh(phone.refreshToken);
+    const devices = yield* service.listDevices(desktop.accessToken);
+    const phoneDevice = devices.devices.find((device) => device.label === "Android phone")!;
+    expect(phoneDevice.current).toBe(false);
+    expect(devices.devices).toContainEqual(
+      expect.objectContaining({ label: "MacBook Air", current: true }),
+    );
+    expect((yield* Effect.flip(service.revokeDevice("invalid", phoneDevice.id)))._tag).toBe(
+      "Unauthorized",
+    );
+    yield* service.revokeDevice(desktop.accessToken, phoneDevice.id);
+    expect((yield* Effect.flip(service.listEnvironments(rotated.accessToken)))._tag).toBe(
+      "Unauthorized",
+    );
+    expect((yield* Effect.flip(service.refresh(rotated.refreshToken)))._tag).toBe("Unauthorized");
+    expect((yield* service.listDevices(desktop.accessToken)).devices).toHaveLength(1);
+  }).pipe(Effect.provide(SelfHostedConnect.layer(config()))),
+);
+
+it.effect("revokes the environment credential issued to an account device", () => {
+  const revoked: unknown[] = [];
+  const fetchRequest: typeof fetch = async (url, init) => {
+    switch (new URL(String(url)).pathname) {
+      case "/api/auth/clients/revoke":
+        revoked.push(JSON.parse(String(init?.body)));
+        return Response.json({ revoked: true });
+      case "/oauth/token":
+        return Response.json({
+          session_id: "host-session",
+          access_token: "host-access",
+          issued_token_type: AuthAccessTokenType,
+          token_type: "Bearer",
+          expires_in: 600,
+          scope: "orchestration:read",
+        });
+      default:
+        return online(url, init);
+    }
+  };
+  return Effect.gen(function* () {
+    const service = yield* SelfHostedConnect.SelfHostedConnect;
+    const phone = yield* service.login({ ...credentials, deviceLabel: "Phone" }, "phone");
+    const mac = yield* service.login(credentials, "mac");
+    expect(yield* service.connectAccount(phone.accessToken, "office")).toEqual({
+      environmentId: "office",
+      httpBaseUrl: "https://office.example.com",
+      accessToken: "host-access",
+    });
+    const device = (yield* service.listDevices(mac.accessToken)).devices.find(
+      ({ label }) => label === "Phone",
+    )!;
+    yield* service.revokeDevice(mac.accessToken, device.id);
+    expect(revoked).toEqual([{ sessionId: "host-session" }]);
+    expect((yield* Effect.flip(service.connectAccount(phone.accessToken, "office")))._tag).toBe(
+      "Unauthorized",
+    );
+  }).pipe(Effect.provide(SelfHostedConnect.layer(config(), { fetch: fetchRequest })));
+});
+
+it.effect("delivers and acknowledges Android activity using a revocable device credential", () => {
+  const settings = config({
+    environments: [{ ...config().environments[0]!, activityKey: ACTIVITY_KEY }],
+    androidPackageName: packageName,
+  });
+  return Effect.gen(function* () {
+    const service = yield* SelfHostedConnect.SelfHostedConnect;
+    const phone = yield* service.login({ ...credentials, deviceLabel: "Phone" }, "phone");
+    const mac = yield* service.login(credentials, "mac");
+    const deliveryToken = "d".repeat(43);
+    const deliveryTokenHash = NodeCrypto.createHash("sha256").update(deliveryToken).digest("hex");
+    const registration = {
+      deviceId: "fixture-installation",
+      label: "Phone",
+      platform: "android",
+      androidApiLevel: 34,
+      bundleId: packageName,
+      preferences: {
+        liveActivitiesEnabled: true,
+        notificationsEnabled: true,
+        notifyOnApproval: true,
+        notifyOnCompletion: true,
+        notifyOnInput: true,
+        notifyOnFailure: true,
+      },
+    } as const;
+    yield* service.registerAndroid(phone.accessToken, registration, deliveryTokenHash);
+    const state = {
+      environmentId: EnvironmentId.make("office"),
+      threadId: ThreadId.make("thread"),
+      projectTitle: "Project",
+      threadTitle: "Task",
+      phase: "completed",
+      headline: "Done",
+      modelTitle: "Replay",
+      updatedAt: "1970-01-01T00:00:00.000Z",
+      deepLink: "//untrusted.example",
+    } as const;
+    expect(
+      (yield* Effect.flip(service.publishActivity(phone.accessToken, "office", "thread", state)))
+        ._tag,
+    ).toBe("Unauthorized");
+    yield* service.publishActivity(ACTIVITY_KEY, "office", "thread", state);
+    const deliveries = (yield* service.readAndroid(deliveryToken, 0)).messages;
+    const alerts = deliveries.filter(({ data }) => data.alert_id);
+    expect(alerts).toEqual([
+      expect.objectContaining({
+        data: expect.objectContaining({
+          alert_title: "Task",
+          alert_path: "/threads/office/thread",
+          device_id: "fixture-installation",
+        }),
+      }),
+    ]);
+    expect((yield* service.readAndroid(deliveryToken, 0)).messages).toEqual(deliveries);
+    expect((yield* Effect.flip(service.readAndroid(phone.accessToken, 0)))._tag).toBe(
+      "Unauthorized",
+    );
+    expect((yield* Effect.flip(service.listDevices(deliveryToken)))._tag).toBe("Unauthorized");
+    const rotated = yield* service.refresh(phone.refreshToken);
+    yield* service.registerAndroid(rotated.accessToken, registration, deliveryTokenHash);
+    yield* service.publishActivity(ACTIVITY_KEY, "office", "thread", { ...state, phase: "failed" });
+    const batch = (yield* service.readAndroid(deliveryToken, alerts[0]!.id)).messages;
+    const next = batch.filter(({ data }) => data.alert_id);
+    expect(next).toHaveLength(1);
+    expect(next[0]!.id).toBeGreaterThan(alerts[0]!.id);
+    yield* service.publishActivity(ACTIVITY_KEY, "office", "thread", {
+      ...state,
+      phase: "running",
+    });
+    yield* TestClock.adjust("6 minutes");
+    expect((yield* service.readAndroid(deliveryToken, next[0]!.id, true)).messages).toEqual([
+      expect.objectContaining({
+        data: expect.objectContaining({
+          active: "true",
+          activity_phase: "running",
+          activity_expires_at: "7200000",
+        }),
+      }),
+    ]);
+    const phoneId = (yield* service.listDevices(mac.accessToken)).devices.find(
+      (device) => device.label === "Phone",
+    )!.id;
+    yield* service.revokeDevice(mac.accessToken, phoneId);
+    expect((yield* Effect.flip(service.readAndroid(deliveryToken, 0)))._tag).toBe("Unauthorized");
+  }).pipe(Effect.provide(SelfHostedConnect.layer(settings)));
+});
+
+it.effect(
+  "holds a signed webhook while its environment is offline and replays the same delivery",
+  () => {
+    const attempts: Array<{
+      readonly url: string;
+      readonly proof: string | null;
+      readonly id: string | null;
+    }> = [];
+    const fetchRequest: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      attempts.push({
+        url: String(url),
+        id: headers.get("x-t3-relay-delivery-id"),
+        proof: headers.get("x-t3-self-hosted-delivery"),
+      });
+      return Response.json({}, { status: attempts.length === 1 ? 502 : 202 });
+    };
+    const settings = config({
+      environments: [{ ...config().environments[0]!, activityKey: ACTIVITY_KEY }],
+    });
+    return Effect.gen(function* () {
+      const service = yield* SelfHostedConnect.SelfHostedConnect;
+      const delivery = {
+        environmentId: "office",
+        hookId: "hook",
+        token: "x".repeat(43),
+        signature: "",
+        method: "POST",
+        query: "source=fixture",
+        headers: { "content-type": "application/json" },
+        body: new TextEncoder().encode("{}"),
+      };
+      expect((yield* Effect.flip(service.queueWebhook(delivery)))._tag).toBe("EnvironmentNotFound");
+      const signature = NodeCrypto.createHmac("sha256", ACTIVITY_KEY)
+        .update(
+          JSON.stringify(["ingress", delivery.environmentId, delivery.hookId, delivery.token]),
+        )
+        .digest("base64url");
+      const { deliveryId } = yield* service.queueWebhook({ ...delivery, signature });
+      yield* TestClock.adjust("4 seconds");
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({
+        id: deliveryId,
+        url: `http://127.0.0.1:3773/api/hooks/hook/${delivery.token}?source=fixture`,
+        proof: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      });
+      yield* TestClock.adjust("32 seconds");
+      expect(attempts).toEqual([attempts[0], attempts[0]]);
+    }).pipe(Effect.provide(SelfHostedConnect.layer(settings, { fetch: fetchRequest })));
+  },
 );
 
 it.effect("rotates refresh tokens atomically and revokes descendants after replay", () =>

@@ -14,7 +14,11 @@ deployment workflows retain their repository guards and credentials.
   for 14 days after the full checks and every required platform build pass.
 
 The workflow builds macOS Apple Silicon DMG/ZIP and Linux x64 AppImage/DEB desktop
-packages, plus standalone CLI archives for both platforms. Each CLI archive
+packages, plus standalone CLI archives for both platforms. On macOS, install
+**T3 Pro.app** alongside the official desktop app. T3 Pro uses its own
+`~/.t3-pro` data directory and starts with a fresh profile. Build it locally with
+`T3CODE_DESKTOP_MAC_PRO=true T3CODE_SELF_HOSTED_ONLY=1 vp run dist:desktop:dmg:arm64`.
+Fork packages use the self-hosted T3 Account at `https://t3.vivid-dream.online`. Each CLI archive
 includes the web client and native runtime dependencies; extract it and run its
 `t3` executable without installing Node. Release assets include `SHA256SUMS` and
 `BUILD-INFO.json` with the source commit, version, platforms, build time and run URL.
@@ -65,9 +69,9 @@ signs the unsigned artifact, verifies the APK signature and compares its
 certificate with the configured keystore. It never executes candidate Gradle or
 JavaScript with signing credentials.
 
-Android uses the existing public Clerk/relay identifiers in `.env.example` for T3
-account connections. Native Google sign-in and push notifications may require
-registration of the fork package and certificate; they require device validation.
+The Android fork delivers notifications over HTTPS from the account service. Upgrade
+that service and verify background receipt and notification links from the signed APK
+on a physical Android device before tagging.
 The workflow does not publish to npm, deploy upstream services, use EAS cloud
 builders or publish mobile store builds. Intel macOS and Linux arm64 packages are
 outside this workflow's current platform coverage.

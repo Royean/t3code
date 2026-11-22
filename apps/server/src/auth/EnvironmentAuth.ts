@@ -1095,6 +1095,7 @@ export const make = Effect.gen(function* () {
               (now) =>
                 ({
                   access_token: session.token,
+                  session_id: session.sessionId,
                   issued_token_type: AuthAccessTokenType,
                   token_type: input?.proofKeyThumbprint ? "DPoP" : "Bearer",
                   expires_in: Math.max(

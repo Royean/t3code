@@ -399,6 +399,9 @@ describe("movedSettingsPath", () => {
     expect(movedSettingsPath("/settings/general", "time-format")).toBeNull();
     expect(movedSettingsPath("/settings/projects", "project-defaults")).toBeNull();
     expect(movedSettingsPath("/settings/connections", "remote-environments")).toBeNull();
+    expect(movedSettingsPath("/settings/connections", "self-hosted-connect")).toBe(
+      "/settings/account",
+    );
     expect(movedSettingsPath("/settings/appearance", "theme")).toBeNull();
   });
 });

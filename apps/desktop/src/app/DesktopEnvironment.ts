@@ -4,6 +4,7 @@ import type {
   DesktopRuntimeArch,
   DesktopRuntimeInfo,
 } from "@t3tools/contracts";
+import { DESKTOP_PRO_IDENTITY } from "@t3tools/shared/desktopProIdentity";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -26,6 +27,7 @@ export interface MakeDesktopEnvironmentInput {
   readonly appVersion: string;
   readonly appPath: string;
   readonly isPackaged: boolean;
+  readonly isT3Pro?: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
 }
@@ -38,6 +40,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly platform: NodeJS.Platform;
     readonly processArch: string;
     readonly isPackaged: boolean;
+    readonly isT3Pro: boolean;
     readonly isDevelopment: boolean;
     readonly appVersion: string;
     readonly appPath: string;
@@ -148,6 +151,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const homeDirectory = input.homeDirectory;
   const devServerUrl = config.devServerUrl;
   const isDevelopment = Option.isSome(devServerUrl);
+  const isT3Pro = input.isPackaged && input.platform === "darwin" && input.isT3Pro === true;
   const appDataDirectory =
     input.platform === "win32"
       ? Option.getOrElse(config.appDataDirectory, () =>
@@ -160,6 +164,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     homeDirectory,
     joinPath: path.join,
     t3Home: config.t3Home,
+    ...(isT3Pro ? { defaultDirectoryName: DESKTOP_PRO_IDENTITY.homeDirectoryName } : {}),
   });
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
@@ -167,10 +172,17 @@ const make = Effect.fn("desktop.environment.make")(function* (
     input.isPackaged && input.platform === "win32"
       ? path.join(input.resourcesPath, "server.asar")
       : appRoot;
-  const branding = resolveDesktopAppBranding({
+  const defaultBranding = resolveDesktopAppBranding({
     isDevelopment,
     appVersion: input.appVersion,
   });
+  const branding = isT3Pro
+    ? {
+        ...defaultBranding,
+        baseName: DESKTOP_PRO_IDENTITY.productName,
+        displayName: DESKTOP_PRO_IDENTITY.productName,
+      }
+    : defaultBranding;
   const displayName = branding.displayName;
   const stateDir = resolveDesktopStateDir({
     baseDir,
@@ -190,6 +202,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     platform: input.platform,
     processArch: input.processArch,
     isPackaged: input.isPackaged,
+    isT3Pro,
     isDevelopment,
     appVersion: input.appVersion,
     appPath: input.appPath,

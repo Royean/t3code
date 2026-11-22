@@ -41,6 +41,7 @@ import {
 } from "../agent-awareness/remoteRegistration";
 import { refreshManagedRelayEnvironments } from "../cloud/managedRelayState";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "../cloud/publicConfig";
+import { selfHostedOnly, selfHostedSession } from "../connection/selfHostedConnection";
 import { makePermissionStatusAtom } from "../../lib/permissionStatusAtom";
 import { runtime } from "../../lib/runtime";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
@@ -119,6 +120,9 @@ function useNotificationsReady(): boolean {
 
 export function SettingsNotificationsRouteScreen() {
   const gt = useGT();
+  if (selfHostedOnly && Platform.OS === "android") {
+    return <SelfHostedSettingsNotificationsRouteScreen />;
+  }
   if (!hasCloudPublicConfig()) {
     return (
       <SettingsScreen title={gt("Notifications")}>
@@ -134,10 +138,40 @@ export function SettingsNotificationsRouteScreen() {
     );
   }
 
-  return <ConfiguredSettingsNotificationsRouteScreen />;
+  return <OfficialSettingsNotificationsRouteScreen />;
 }
 
-function ConfiguredSettingsNotificationsRouteScreen() {
+function OfficialSettingsNotificationsRouteScreen() {
+  const { getToken, isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
+  return (
+    <ConfiguredSettingsNotificationsRouteScreen
+      isLoaded={isLoaded}
+      isSignedIn={isSignedIn}
+      getRelayToken={() => getToken(resolveRelayClerkTokenOptions())}
+    />
+  );
+}
+
+function SelfHostedSettingsNotificationsRouteScreen() {
+  const account = useSyncExternalStore(selfHostedSession.subscribe, selfHostedSession.getSnapshot);
+  return (
+    <ConfiguredSettingsNotificationsRouteScreen
+      isLoaded={account.signedIn || !account.busy}
+      isSignedIn={account.signedIn}
+      getRelayToken={null}
+    />
+  );
+}
+
+function ConfiguredSettingsNotificationsRouteScreen({
+  isLoaded,
+  isSignedIn,
+  getRelayToken,
+}: {
+  readonly isLoaded: boolean;
+  readonly isSignedIn: boolean | undefined;
+  readonly getRelayToken: (() => Promise<string | null>) | null;
+}) {
   const gt = useGT();
   const m = useMessages();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
@@ -150,7 +184,6 @@ function ConfiguredSettingsNotificationsRouteScreen() {
       : agentAwarenessPlatform.subtitle;
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
-  const { getToken, isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
   const { savedConnectionsById } = useSavedRemoteConnections();
   const notificationStatus = useAtomValue(notificationStatusAtom);
   const setNotificationStatus = useAtomSet(notificationStatusAtom);
@@ -251,7 +284,10 @@ function ConfiguredSettingsNotificationsRouteScreen() {
         { text: gt("Cancel"), style: "cancel" },
         {
           text: gt("Continue"),
-          onPress: () => navigation.navigate("SettingsAuth"),
+          onPress: () => {
+            if (getRelayToken) navigation.navigate("SettingsAuth", { method: "official" });
+            else navigation.navigate("SettingsAuth");
+          },
         },
       ],
     );
@@ -293,7 +329,7 @@ function ConfiguredSettingsNotificationsRouteScreen() {
       }
       setNotificationStatus("enabled");
     }
-    const tokenResult = await settlePromise(() => getToken(resolveRelayClerkTokenOptions()));
+    const tokenResult = await settlePromise(() => getRelayToken?.() ?? Promise.resolve(null));
     if (tokenResult._tag === "Failure") {
       setLiveActivityStatus("disabled");
       const error = squashAtomCommandFailure(tokenResult);
@@ -307,7 +343,7 @@ function ConfiguredSettingsNotificationsRouteScreen() {
       );
       return;
     }
-    if (!tokenResult.value) {
+    if (!tokenResult.value && getRelayToken) {
       promptSignIn();
       setLiveActivityStatus("signed-out");
       return;
@@ -341,7 +377,7 @@ function ConfiguredSettingsNotificationsRouteScreen() {
     }
 
     savePreferences({ liveActivitiesEnabled: true });
-    refreshManagedRelayEnvironments();
+    if (getRelayToken) refreshManagedRelayEnvironments();
     setLiveActivityStatus("enabled");
     // Environment linking can precede device registration; only registered devices can receive Live Activities.
     if (getAgentAwarenessRegistrationStatus() === "registered") {
@@ -386,8 +422,8 @@ function ConfiguredSettingsNotificationsRouteScreen() {
 
   async function disableLiveActivities() {
     let token: string | null = null;
-    if (isSignedIn) {
-      const tokenResult = await settlePromise(() => getToken(resolveRelayClerkTokenOptions()));
+    if (isSignedIn && getRelayToken) {
+      const tokenResult = await settlePromise(getRelayToken);
       if (tokenResult._tag === "Failure") {
         setLiveActivityStatus("enabled");
         reportAtomCommandResult(tokenResult, {
@@ -417,7 +453,7 @@ function ConfiguredSettingsNotificationsRouteScreen() {
       return;
     }
     savePreferences({ liveActivitiesEnabled: false });
-    refreshManagedRelayEnvironments();
+    if (getRelayToken) refreshManagedRelayEnvironments();
     setLiveActivityStatus("disabled");
   }
 

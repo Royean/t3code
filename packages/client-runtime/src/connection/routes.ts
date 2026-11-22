@@ -27,6 +27,25 @@ export type ConnectionRouteKind =
 
 export const RELAY_ROUTE_ID = "relay";
 
+export function selfHostedConnectionId(environmentId: string, bound = false): string {
+  return bound ? `self-hosted-account:${environmentId}` : `self-hosted:${environmentId}`;
+}
+
+export function hasRouteToOrigin(
+  entry: ConnectionCatalogEntry,
+  origin: string,
+  routeId?: string,
+): boolean {
+  return connectionRoutes(entry).some((route) => {
+    const address = routeHttpBaseUrl(route);
+    return (
+      !isLearned(route) &&
+      (!routeId || routeId === connectionRouteId(route.target)) &&
+      address?.replace(/\/+$/, "") === origin.replace(/\/+$/, "")
+    );
+  });
+}
+
 export function connectionRouteId(target: ConnectionTarget): string {
   switch (target._tag) {
     case "PrimaryConnectionTarget":

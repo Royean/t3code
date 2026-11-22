@@ -3,8 +3,11 @@ import {
   RelayManagedEndpointRuntimeConfig,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as Config from "effect/Config";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Redacted from "effect/Redacted";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 
@@ -18,6 +21,19 @@ export const RELAY_ENVIRONMENT_CREDENTIAL_SECRET = "cloud-relay-environment-cred
 export const PUBLISH_AGENT_ACTIVITY_SECRET = "cloud-publish-agent-activity";
 export const HOLD_WEBHOOKS_WHILE_OFFLINE_SECRET = "cloud-hold-webhooks-while-offline";
 export const CLOUD_LINK_REVOKED = "cloud-link-revoked";
+
+export const readSelfHostedConnectConfig = Effect.fn("config.readSelfHostedConnectConfig")(
+  function* () {
+    const [url, key] = yield* Effect.all([
+      Config.String("T3CODE_SELF_HOSTED_ACTIVITY_URL").pipe(Config.option),
+      Config.Redacted("T3CODE_SELF_HOSTED_ACTIVITY_KEY").pipe(Config.option),
+    ]).pipe(Effect.orElseSucceed(() => [Option.none(), Option.none()] as const));
+    if (Option.isNone(url) || Option.isNone(key)) return null;
+    const origin = normalizeSecureRelayUrl(url.value);
+    const token = Redacted.value(key.value);
+    return origin && /^[A-Za-z0-9_-]{43}$/.test(token) ? { origin, key: token } : null;
+  },
+);
 
 export const encodeEndpointRuntimeConfigJson = Schema.encodeEffect(
   Schema.fromJsonString(RelayManagedEndpointRuntimeConfig),
@@ -52,6 +68,7 @@ export const readAgentActivityPublishingActive: (
   secrets: ServerSecretStore.ServerSecretStore["Service"],
 ) => Effect.Effect<boolean> = Effect.fn("config.readAgentActivityPublishingActive")(
   function* (secrets: ServerSecretStore.ServerSecretStore["Service"]) {
+    if (yield* readSelfHostedConnectConfig()) return true;
     const readSecretString = (name: string) =>
       secrets
         .get(name)

@@ -1,14 +1,19 @@
 import {
   SelfHostedConnection,
+  SelfHostedDevices,
+  SelfHostedEnvironmentSession,
   SelfHostedEnvironments,
   SelfHostedErrorResponse,
+  SelfHostedOk,
   SelfHostedSession,
 } from "@t3tools/contracts/self-hosted-connect";
 import * as Schema from "effect/Schema";
+import type { RelayDeviceRegistrationRequest } from "@t3tools/contracts/relay";
 const decodeErrorResponse = Schema.decodeUnknownSync(SelfHostedErrorResponse);
 
 export type {
   SelfHostedConnection,
+  SelfHostedDevice,
   SelfHostedEnvironment,
   SelfHostedEnvironments,
   SelfHostedSession,
@@ -99,17 +104,41 @@ export function createSelfHostedConnectClient(options: {
     }
   };
   return {
-    login: (username: string, password: string) =>
-      request("/v1/auth/login", SelfHostedSession, { body: { username, password } }),
+    login: (username: string, password: string, deviceLabel?: string) =>
+      request("/v1/auth/login", SelfHostedSession, {
+        body: { username, password, deviceLabel },
+      }),
     refresh: (refreshToken: string) =>
       request("/v1/auth/refresh", SelfHostedSession, { body: { refreshToken } }),
     logout: async (refreshToken: string): Promise<void> => {
-      await request("/v1/auth/logout", Schema.Struct({ ok: Schema.Boolean }), {
+      await request("/v1/auth/logout", SelfHostedOk, {
         body: { refreshToken },
       });
     },
+    listDevices: (accessToken: string) =>
+      request("/v1/devices", SelfHostedDevices, { accessToken }),
+    revokeDevice: (accessToken: string, id: string) =>
+      request("/v1/devices/revoke", SelfHostedOk, { accessToken, body: { id } }),
+    registerAndroidDevice: (
+      accessToken: string,
+      body: RelayDeviceRegistrationRequest,
+      deliveryTokenHash: string,
+    ) =>
+      request("/v1/mobile/devices", SelfHostedOk, {
+        accessToken,
+        body: { registration: body, deliveryTokenHash },
+      }),
     listEnvironments: (accessToken: string) =>
       request("/v1/environments", SelfHostedEnvironments, { accessToken }),
+    connectAccount: (accessToken: string, environmentId: string) =>
+      request(
+        `/v1/environments/${encodeURIComponent(environmentId)}/session`,
+        SelfHostedEnvironmentSession,
+        {
+          accessToken,
+          body: {},
+        },
+      ),
     connect: (accessToken: string, environmentId: string) =>
       request(
         `/v1/environments/${encodeURIComponent(environmentId)}/connect`,

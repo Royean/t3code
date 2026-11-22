@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
+import { DESKTOP_PRO_IDENTITY } from "@t3tools/shared/desktopProIdentity";
 
 export interface T3CodePublicConfig {
   readonly clerkPublishableKey: string | undefined;
@@ -30,12 +31,29 @@ export function loadRepoEnv({
 } = {}): Record<string, string | undefined> {
   const rootEnv = readEnvFile(NodePath.join(repoRoot, ".env"));
   const localEnv = readEnvFile(NodePath.join(repoRoot, ".env.local"));
-  const config = resolvePublicConfig(baseEnv, localEnv, rootEnv);
+  const macPro = ["true", "1"].includes(baseEnv.T3CODE_DESKTOP_MAC_PRO?.trim().toLowerCase() ?? "");
+  const selfHostedOnly = ["true", "1"].includes(
+    firstNonEmpty([baseEnv, localEnv, rootEnv], "T3CODE_SELF_HOSTED_ONLY")?.toLowerCase() ?? "",
+  );
+  const exampleEnv = macPro ? readEnvFile(NodePath.join(repoRoot, ".env.example")) : {};
+  const config = resolvePublicConfig(baseEnv, localEnv, rootEnv, {
+    T3CODE_CLERK_PUBLISHABLE_KEY: exampleEnv.T3CODE_CLERK_PUBLISHABLE_KEY,
+    T3CODE_CLERK_JWT_TEMPLATE: exampleEnv.T3CODE_CLERK_JWT_TEMPLATE,
+    T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: exampleEnv.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID,
+    T3CODE_RELAY_URL: exampleEnv.T3CODE_RELAY_URL,
+  });
 
-  return {
+  const env: Record<string, string | undefined> = {
     ...rootEnv,
     ...localEnv,
     ...baseEnv,
+    ...(macPro || selfHostedOnly
+      ? {
+          VITE_T3CODE_SELF_HOSTED_CONNECT_URL:
+            firstNonEmpty([baseEnv, localEnv, rootEnv], "T3CODE_SELF_HOSTED_CONNECT_URL") ??
+            DESKTOP_PRO_IDENTITY.selfHostedAccountOrigin,
+        }
+      : {}),
     ...(config.clerkPublishableKey
       ? {
           T3CODE_CLERK_PUBLISHABLE_KEY: config.clerkPublishableKey,
@@ -99,6 +117,19 @@ export function loadRepoEnv({
         }
       : {}),
   };
+  if (!selfHostedOnly) return env;
+  env.VITE_T3CODE_SELF_HOSTED_ONLY = "1";
+
+  for (const key of Object.keys(env)) {
+    if (
+      /^(T3CODE|VITE|EXPO_PUBLIC)_CLERK_/.test(key) ||
+      /^(T3CODE|VITE_T3CODE)_RELAY_URL$/.test(key) ||
+      /^(T3CODE_RELAY_CLIENT|VITE_RELAY)_OTLP_TRACES_/.test(key)
+    ) {
+      env[key] = "";
+    }
+  }
+  return env;
 }
 
 function resolvePublicConfig(...sources: readonly Environment[]): T3CodePublicConfig {

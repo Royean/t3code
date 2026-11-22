@@ -18,6 +18,7 @@ export function makeRelayDeviceRegistrationRequest(
     readonly pushToken?: string;
     readonly pushToStartToken?: string;
     readonly notificationsEnabled: boolean;
+    readonly selfHostedDelivery?: boolean;
     readonly preferences: Preferences;
   } & (
     | { readonly platform?: "ios"; readonly iosMajorVersion: number }
@@ -33,7 +34,8 @@ export function makeRelayDeviceRegistrationRequest(
     pushAvailable &&
     input.preferences.liveActivitiesEnabled !== false &&
     (input.platform !== "android" ||
-      (input.notificationPermissionGranted && Boolean(input.pushToken)));
+      (input.notificationPermissionGranted &&
+        (input.selfHostedDelivery || Boolean(input.pushToken))));
   return {
     deviceId: input.deviceId,
     label: input.label,

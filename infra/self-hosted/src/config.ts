@@ -27,9 +27,11 @@ export const SelfHostedConfig = Schema.Struct({
       origin: BoundedString,
       pairingOrigin: BoundedString,
       credential: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(16_384)),
+      activityKey: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{43}$/))),
     }),
   ).check(Schema.isMaxLength(64)),
   allowedOrigins: Schema.optionalKey(Schema.Array(BoundedString).check(Schema.isMaxLength(32))),
+  allowLegacyPairing: Schema.optionalKey(Schema.Boolean),
   requestTimeoutMs: Schema.optionalKey(
     Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 30_000 })),
   ),
@@ -37,6 +39,7 @@ export const SelfHostedConfig = Schema.Struct({
     Schema.Int.check(Schema.isBetween({ minimum: 60, maximum: 3_600 })),
   ),
   refreshTokenTtlSeconds: Schema.optionalKey(Seconds),
+  androidPackageName: Schema.optionalKey(BoundedString),
 });
 export type SelfHostedConfig = typeof SelfHostedConfig.Type;
 const decodeSelfHostedConfig = Schema.decodeUnknownSync(SelfHostedConfig);

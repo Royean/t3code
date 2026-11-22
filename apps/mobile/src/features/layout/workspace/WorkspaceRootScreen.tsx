@@ -1,6 +1,6 @@
 import { WorkspaceNoTabs } from "./WorkspaceNoTabs";
 import { isSharedSlotTab } from "./navigation-tab-order";
-import { SharedSlotTitle } from "./SharedSlotTitle";
+import { SharedSlotTabs } from "./SharedSlotTabs";
 import { WORKSPACE_TAB_LABELS, useEnabledNavigationTabs } from "./navigation-tabs";
 import { WorkspaceExtraTab } from "./WorkspaceExtraTab";
 import { WorkspaceSettingsList } from "../../settings/SettingsRouteScreen";
@@ -64,20 +64,20 @@ function WorkspaceRootTitle(props: {
       : gt("Navigation", { $context: "screen title when every navigation tab is hidden" });
   return (
     <View style={{ width: maxWidth, minHeight: 32, justifyContent: "center" }}>
-      <WorkspaceConnectionTitle
-        brand={
-          !settingsOpen && isSharedSlotTab(state.selectedTab) ? (
-            <SharedSlotTitle tab={state.selectedTab} />
-          ) : (
+      {!settingsOpen && isSharedSlotTab(state.selectedTab) ? (
+        <SharedSlotTabs tab={state.selectedTab} />
+      ) : (
+        <WorkspaceConnectionTitle
+          brand={
             <CompactBrandTitle
               accessibilityLabel={gt("{product}, {title}", { product: "T3 Code", title: tabTitle })}
               fit
             />
-          )
-        }
-        maxWidth={maxWidth}
-        onPress={props.onOpenEnvironments}
-      />
+          }
+          maxWidth={maxWidth}
+          onPress={props.onOpenEnvironments}
+        />
+      )}
     </View>
   );
 }

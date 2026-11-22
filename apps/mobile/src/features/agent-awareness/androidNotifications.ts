@@ -5,6 +5,9 @@ import { Linking, Platform } from "react-native";
 interface AndroidAgentNotifications {
   configure(deviceId: string, userId: string, scheme: string, ongoingEnabled: boolean): void;
   clear(): void;
+  connectSelfHosted?(origin: string, token: string): boolean;
+  disconnectSelfHosted?(): void;
+  selfHostedListening?(): boolean;
   setThreadOnScreen?(path: string | null): void;
   openLiveUpdateSettings?(): boolean;
   showShowcaseActivity?(scheme: string, data: Record<string, string>): void;
@@ -30,6 +33,18 @@ export function configureAndroidAgentNotifications(
   ongoingEnabled: boolean,
 ): void {
   native?.configure?.(deviceId, userId, appScheme(), ongoingEnabled);
+}
+
+export function connectSelfHostedAndroidNotifications(origin: string, token: string): boolean {
+  return native?.connectSelfHosted?.(origin, token) ?? false;
+}
+
+export function isSelfHostedAndroidNotificationServiceListening(): boolean {
+  return native?.selfHostedListening?.() ?? false;
+}
+
+export function disconnectSelfHostedAndroidNotifications(): void {
+  native?.disconnectSelfHosted?.();
 }
 
 export function showAndroidShowcaseAgentActivity(data: Record<string, string>): boolean {

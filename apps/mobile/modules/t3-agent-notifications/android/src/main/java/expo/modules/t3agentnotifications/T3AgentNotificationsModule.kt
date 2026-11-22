@@ -22,8 +22,21 @@ class T3AgentNotificationsModule : Module() {
       }
     }
 
+    Function("connectSelfHosted") { origin: String, token: String ->
+      appContext.reactContext?.let { SelfHostedNotificationService.connect(it, origin, token) } ?: false
+    }
+
+    Function("selfHostedListening") { SelfHostedNotificationService.listening }
+
+    Function("disconnectSelfHosted") {
+      appContext.reactContext?.let { SelfHostedNotificationService.disconnect(it) }
+    }
+
     Function("clear") {
-      appContext.reactContext?.let { AgentNotifications.clear(it) }
+      appContext.reactContext?.let {
+        SelfHostedNotificationService.disconnect(it)
+        AgentNotifications.clear(it)
+      }
     }
 
     Function("showShowcaseActivity") { scheme: String, data: Map<String, String> ->

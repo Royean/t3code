@@ -1,4 +1,6 @@
 // Trust relay headers only with a mint-key-signed proof; otherwise handle the webhook as a direct request.
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Verification compares the configured self-hosted relay MAC in constant time.
+import * as NodeCrypto from "node:crypto";
 import { RelayHookDeliveryProofPayload } from "@t3tools/contracts/relay";
 import {
   normalizeRelayIssuer,
@@ -7,17 +9,25 @@ import {
   verifyRelayJwt,
 } from "@t3tools/shared/relayJwt";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Signature from "effect/crypto/Signature";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
-import { CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET, RELAY_URL_SECRET } from "../cloud/config.ts";
+import {
+  CLOUD_MINT_PUBLIC_KEY,
+  readSelfHostedConnectConfig,
+  RELAY_ISSUER_SECRET,
+  RELAY_URL_SECRET,
+} from "../cloud/config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 
 /** Covers the relay's 24-hour hold plus a margin. */
 const MAX_PROOF_AGE = "25 hours";
+const encodeProofFields = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 const text = (bytes: Option.Option<Uint8Array>) =>
   Option.map(bytes, (value) => new TextDecoder().decode(value));
@@ -28,6 +38,7 @@ export class RelayDeliveryProof extends Context.Service<
     readonly verify: (input: {
       readonly headers: Readonly<Record<string, string>>;
       readonly hookId: string;
+      readonly token: string;
     }) => Effect.Effect<
       Option.Option<{ readonly deliveryId: string; readonly receivedAt: string }>
     >;
@@ -41,11 +52,42 @@ const make = Effect.gen(function* () {
   const verify: RelayDeliveryProof["Service"]["verify"] = Effect.fn("webhook.verifyRelayDelivery")(
     function* (input) {
       const proof = input.headers[RELAY_HOOK_DELIVERY_HEADER];
+      const selfHostedProof = input.headers["x-t3-self-hosted-delivery"];
       const deliveryId = input.headers["x-t3-relay-delivery-id"];
       const receivedAt = input.headers["x-t3-relay-received-at"];
-      if (proof === undefined || deliveryId === undefined || receivedAt === undefined) {
+      if (deliveryId === undefined || receivedAt === undefined) {
         return Option.none();
       }
+      const environmentId = yield* environment.getEnvironmentId;
+      if (selfHostedProof !== undefined) {
+        const selfHosted = yield* readSelfHostedConnectConfig();
+        const received = Date.parse(receivedAt);
+        const now = yield* Clock.currentTimeMillis;
+        if (
+          !selfHosted ||
+          !/^[A-Za-z0-9_-]{43}$/.test(selfHostedProof) ||
+          !Number.isFinite(received) ||
+          received > now + 60_000 ||
+          received < now - 90_000_000
+        )
+          return Option.none();
+        const expected = NodeCrypto.createHmac("sha256", selfHosted.key)
+          .update(
+            encodeProofFields([
+              "delivery",
+              environmentId,
+              input.hookId,
+              input.token,
+              deliveryId,
+              receivedAt,
+            ]),
+          )
+          .digest("base64url");
+        return NodeCrypto.timingSafeEqual(Buffer.from(expected), Buffer.from(selfHostedProof))
+          ? Option.some({ deliveryId, receivedAt })
+          : Option.none();
+      }
+      if (proof === undefined) return Option.none();
       const publicKey = text(yield* secrets.get(CLOUD_MINT_PUBLIC_KEY));
       const issuer = Option.orElse(text(yield* secrets.get(RELAY_ISSUER_SECRET)), () =>
         Option.none<string>(),
@@ -53,7 +95,6 @@ const make = Effect.gen(function* () {
       const relayUrl = text(yield* secrets.get(RELAY_URL_SECRET));
       const relayIssuer = Option.isSome(issuer) ? issuer : relayUrl;
       if (Option.isNone(publicKey) || Option.isNone(relayIssuer)) return Option.none();
-      const environmentId = yield* environment.getEnvironmentId;
       const payload = yield* verifyRelayJwt(RelayHookDeliveryProofPayload, {
         publicKey: publicKey.value,
         token: proof,

@@ -145,7 +145,8 @@ import {
   SavedBackendListRow,
 } from "./SavedEnvironmentRows";
 import { AddEnvironmentDialog } from "./AddEnvironmentDialog";
-import { SelfHostedConnectSettings } from "./SelfHostedConnectSettings";
+import { SelfHostedEnvironmentImports } from "./SelfHostedConnectSettings";
+import { selfHostedOnly, selfHostedSession } from "../../connection/selfHostedConnection";
 import {
   type ConnectDeviceRevokeRequest,
   RevokeConnectDeviceDialog,
@@ -722,6 +723,7 @@ function ConnectionsSettingsContent({
     const environmentId = environment.environmentId;
     setRemovingSavedEnvironmentId(environmentId);
     setSavedBackendError(null);
+    if (selfHostedOnly) await selfHostedSession.excludeEnvironment(environmentId);
     const result = await removeEnvironment(environmentId);
     setRemovingSavedEnvironmentId(null);
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -1817,7 +1819,7 @@ function ConnectionsSettingsContent({
           savedEnvironments={savedEnvironments}
         />
       </SettingsSection>
-      <SelfHostedConnectSettings />
+      <SelfHostedEnvironmentImports />
       {hasCloudPublicConfig() ? (
         <RemoveT3ConnectEnvironmentDialog
           environmentLabel={pendingT3ConnectRemoval?.label ?? null}

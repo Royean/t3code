@@ -20,6 +20,7 @@ import type { ResolvedSettingsScope } from "./settingsScope";
 export type SettingsPath =
   | "/settings/projects"
   | "/settings/general"
+  | "/settings/account"
   | "/settings/diagnostics"
   | "/settings/voice"
   | "/settings/appearance"
@@ -98,6 +99,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/diagnostics": msg("Diagnostics"),
   "/settings/projects": msg("Projects"),
   "/settings/general": msg("General"),
+  "/settings/account": msg("T3 Account"),
   "/settings/appearance": msg("Appearance"),
   "/settings/chat": msg("Chat"),
   "/settings/diffs": msg("Diffs & pull requests"),
@@ -1440,6 +1442,18 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "t3-connect-account",
+    title: msg("T3 Connect"),
+    to: "/settings/account",
+    searchTerms: [msg("account sign in login relay")],
+  },
+  {
+    id: "self-hosted-connect",
+    title: msg("Self-hosted connection"),
+    to: "/settings/account",
+    searchTerms: [msg("account sign in login relay")],
+  },
+  {
     id: "pull-request-routing",
     title: msg("Pull request sharing"),
     to: "/settings/connections",
@@ -1478,6 +1492,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/diagnostics": "environment",
   "/settings/projects": "project",
   "/settings/general": null,
+  "/settings/account": null,
   "/settings/voice": null,
   "/settings/appearance": null,
   "/settings/chat": null,

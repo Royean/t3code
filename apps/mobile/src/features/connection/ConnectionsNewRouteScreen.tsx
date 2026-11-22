@@ -29,7 +29,6 @@ import { useRemoteConnections } from "../../state/use-remote-environment-registr
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
 import { CloudEnvironmentRows } from "./CloudEnvironmentRows";
-import { SelfHostedConnectSection } from "./SelfHostedConnectSection";
 import { autoConnectReport, devAutoConnectAttemptAtom } from "./devAutoConnect";
 import { splitEnvironmentSections } from "./environmentSections";
 import { leaveSettingsPage } from "../settings/settings-navigation";
@@ -187,14 +186,6 @@ function PairingForm({
     }
   };
 
-  const handleSelfHostedConnected = () => {
-    if (!navigation.canGoBack()) {
-      navigation.dispatch(StackActions.replace("Home"));
-    } else {
-      leaveSettingsPage(navigation, workspaceHasColumns(), "SettingsEnvironments");
-    }
-  };
-
   return (
     <SettingsScreen
       title={gt("Add environment")}
@@ -278,8 +269,7 @@ function PairingForm({
             </Text>
           </View>
 
-          {hasCloudPublicConfig() ? <T3ConnectSection /> : null}
-          <SelfHostedConnectSection onConnected={handleSelfHostedConnected} />
+          <T3ConnectSection />
         </View>
       </ScrollView>
     </SettingsScreen>
@@ -382,9 +372,21 @@ function PairingScanCard(props: {
 }
 
 function T3ConnectSection() {
-  const gt = useGT();
-  const { isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
   const navigation = useNavigation();
+  return (
+    <View collapsable={false} className="gap-2">
+      <ListRow
+        icon="globe"
+        label="T3 Connect"
+        onPress={() => navigation.navigate("SettingsAuth")}
+      />
+      {hasCloudPublicConfig() ? <ConnectedT3Environments /> : null}
+    </View>
+  );
+}
+
+function ConnectedT3Environments() {
+  const { isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
   const { connectedEnvironments, onSetEnvironmentEnabled, onRemoveEnvironmentPress } =
     useRemoteConnections();
   const { connectedCloudEnvironments } = splitEnvironmentSections({
@@ -392,28 +394,14 @@ function T3ConnectSection() {
     cloudEnvironments: null,
   });
 
-  return (
-    <View collapsable={false} className="gap-2">
-      <Text className="px-4 text-sm font-t3-medium text-foreground-muted">
-        <T>Or use the managed relay</T>
-      </Text>
-      {isSignedIn ? (
-        <CloudEnvironmentRows
-          connectedCloudEnvironments={connectedCloudEnvironments}
-          onSetEnvironmentEnabled={onSetEnvironmentEnabled}
-          onRemoveEnvironment={onRemoveEnvironmentPress}
-          showHeader={false}
-        />
-      ) : (
-        <ListRow
-          label={gt("Sign in to {product}", { product: "T3 Connect" })}
-          description={gt("Reach your machines from anywhere, no network setup.")}
-          disabled={!isLoaded}
-          onPress={() => navigation.navigate("SettingsAuth")}
-        />
-      )}
-    </View>
-  );
+  return isSignedIn ? (
+    <CloudEnvironmentRows
+      connectedCloudEnvironments={connectedCloudEnvironments}
+      onSetEnvironmentEnabled={onSetEnvironmentEnabled}
+      onRemoveEnvironment={onRemoveEnvironmentPress}
+      showHeader={false}
+    />
+  ) : null;
 }
 
 function PairingInputRow({

@@ -554,6 +554,29 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
+  it.effect("packages T3 Pro with its own Mac identity and URL scheme", () =>
+    Effect.gen(function* () {
+      const pro = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.41-preview.20260912.1589",
+        false,
+        false,
+        undefined,
+        undefined,
+        false,
+        "arm64",
+        true,
+      );
+
+      assert.equal(pro.appId, "com.royean.t3code.pro");
+      assert.equal(pro.productName, "T3 Pro");
+      assert.equal(pro.artifactName, "T3-Pro-${version}-${arch}.${ext}");
+      assert.nestedPropertyVal(pro, "mac.protocols[0].schemes[0]", "t3code-pro");
+      assert.nestedPropertyVal(pro, "mac.protocols[0].schemes.length", 1);
+    }),
+  );
+
   it.effect("names the Electron window class in the Linux desktop entry", () =>
     Effect.gen(function* () {
       const linux = yield* createBuildConfig(

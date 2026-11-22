@@ -25,7 +25,7 @@ function deferred<T>() {
   return Promise.withResolvers<T>();
 }
 
-function setup(saved: SelfHostedStoredProfile | null = null) {
+function setup(saved: SelfHostedStoredProfile | null = null, autoConnect = false) {
   let stored = saved;
   const storage = {
     load: vi.fn(async () => stored),
@@ -40,6 +40,17 @@ function setup(saved: SelfHostedStoredProfile | null = null) {
     login: vi.fn(async () => session()),
     refresh: vi.fn(async () => session("rotated")),
     logout: vi.fn(async () => {}),
+    listDevices: vi.fn(async () => ({ devices: [] })),
+    revokeDevice: vi.fn(async () => ({ ok: true as const })),
+    registerAndroidDevice: vi.fn(async () => ({
+      ok: true as const,
+      deliveryToken: "t".repeat(43),
+    })),
+    connectAccount: vi.fn(async () => ({
+      environmentId: "air",
+      httpBaseUrl: "https://air.example.test",
+      accessToken: "environment-session",
+    })),
     listEnvironments: vi.fn<SelfHostedConnectClient["listEnvironments"]>(async () => ({
       environments: [environment],
     })),
@@ -59,6 +70,7 @@ function setup(saved: SelfHostedStoredProfile | null = null) {
     removeEnvironment,
     isRegistered,
     createClient,
+    autoConnect,
     now: () => NOW,
   });
   return {
@@ -86,6 +98,23 @@ const profile = {
 };
 
 describe("self-hosted account session", () => {
+  it("automatically imports available computers but remembers local removals across sign-in", async () => {
+    const h = setup(null, true);
+    expect(await h.controller.login(credentials)).toBe(true);
+    expect(h.pair).toHaveBeenCalledExactlyOnceWith(
+      "https://air.example.test/pair#token=once",
+      "air",
+    );
+    await h.controller.excludeEnvironment("air");
+    await h.controller.signOut();
+    const restarted = setup(h.stored(), true);
+    expect(await restarted.controller.restore()).toBe(true);
+    expect(await restarted.controller.login(credentials)).toBe(true);
+    expect(restarted.pair).not.toHaveBeenCalled();
+    expect(await restarted.controller.connect("air")).toBe(true);
+    expect(restarted.stored()?.excludedEnvironmentIds).toEqual([]);
+  });
+
   it("restores with a rotated refresh token, lists automatically, and forgets only this profile's computers", async () => {
     const h = setup(profile);
     expect(await h.controller.restore()).toBe(true);

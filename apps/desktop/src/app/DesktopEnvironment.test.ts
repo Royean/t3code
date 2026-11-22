@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
+import * as DesktopUserData from "./DesktopUserData.ts";
 
 const defaultInput = {
   dirname: "/repo/apps/desktop/dist-electron",
@@ -71,5 +72,24 @@ describe("DesktopEnvironment", () => {
       assert.equal(development.stateDir, "/Users/alice/.t3/dev");
       assert.equal(production.stateDir, "/Users/alice/.t3/userdata");
     }),
+  );
+
+  it.effect("uses a separate backend and Electron profile for the packaged Mac fork", () =>
+    Effect.gen(function* () {
+      const pro = yield* makeEnvironment({ isPackaged: true, isT3Pro: true });
+      const official = yield* makeEnvironment({ isPackaged: true });
+
+      assert.equal(pro.displayName, "T3 Pro");
+      assert.equal(pro.stateDir, "/Users/alice/.t3-pro/userdata");
+      assert.equal(official.stateDir, "/Users/alice/.t3/userdata");
+      assert.equal(
+        yield* DesktopUserData.resolveUserDataPath(pro),
+        "/Users/alice/Library/Application Support/t3code-pro",
+      );
+      assert.equal(
+        yield* DesktopUserData.resolveUserDataPath(official),
+        "/Users/alice/Library/Application Support/t3code-v2",
+      );
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodePath.layerPosix))),
   );
 });

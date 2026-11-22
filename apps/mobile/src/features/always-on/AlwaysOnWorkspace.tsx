@@ -116,8 +116,6 @@ export function AlwaysOnWorkspace({
   const tabsInHeader = Platform.OS === "android" && !sidebar && !layout.usesSplitView;
   const switcher = (
     <SegmentedControl
-      variant="card"
-      size="compact"
       role="tab"
       className="w-full max-w-64"
       selected={selected}

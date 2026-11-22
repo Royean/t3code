@@ -16,10 +16,12 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 
 import * as Electron from "electron";
 
 import * as NetService from "@t3tools/shared/Net";
+import { DESKTOP_PRO_IDENTITY } from "@t3tools/shared/desktopProIdentity";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as DesktopIpc from "./ipc/DesktopIpc.ts";
@@ -89,6 +91,10 @@ if (process.argv.includes("--version")) {
   Electron.app.exit(0);
 }
 
+const decodePackagedAppIdentity = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ name: Schema.optional(Schema.String) })),
+);
+
 const layerDesktopEnvironment = Layer.unwrap(
   Effect.gen(function* () {
     const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(
@@ -96,11 +102,19 @@ const layerDesktopEnvironment = Layer.unwrap(
     );
     const platform = yield* HostProcess.Platform;
     const processArch = yield* HostProcess.Architecture;
+    // Read the staged package identity synchronously before Clerk registers its scheme.
+    const packagedApp =
+      platform === "darwin" && metadata.isPackaged
+        ? yield* DesktopPreReadyFileSystem.make
+            .readFileString(`${metadata.appPath}/package.json`)
+            .pipe(Effect.flatMap(decodePackagedAppIdentity))
+        : undefined;
     return DesktopEnvironment.layer({
       dirname: __dirname,
       homeDirectory: NodeOS.homedir(),
       platform,
       processArch,
+      isT3Pro: packagedApp?.name === DESKTOP_PRO_IDENTITY.packageName,
       ...metadata,
     });
   }),

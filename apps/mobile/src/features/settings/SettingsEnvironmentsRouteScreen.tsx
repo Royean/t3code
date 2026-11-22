@@ -10,7 +10,6 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { SettingsScreen } from "./components/SettingsScreen";
 import { CloudEnvironmentRows } from "../connection/CloudEnvironmentRows";
-import { SelfHostedConnectSection } from "../connection/SelfHostedConnectSection";
 import { LocalEnvironmentList } from "../connection/LocalEnvironmentList";
 import { PullRequestRoutingSettings } from "../connection/PullRequestRoutingSettings";
 import { splitEnvironmentSections } from "../connection/environmentSections";
@@ -155,7 +154,6 @@ export function SettingsEnvironmentsRouteScreen() {
               }
             : {})}
         />
-        <SelfHostedConnectSection />
         <PullRequestRoutingSettings />
       </ScrollView>
     </SettingsScreen>

@@ -1,6 +1,7 @@
 import { msg } from "gt-i18n";
 import { detailFromError, translatableDetail } from "../errors/translatable.ts";
 import type { DesktopSshEnvironmentTarget, EnvironmentId } from "@t3tools/contracts";
+import type { SelfHostedEnvironmentSession } from "@t3tools/contracts/self-hosted-connect";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -34,13 +35,15 @@ import {
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
-import { connectionRoutes, routeEntry, sshTargetKey } from "./routes.ts";
+import { connectionRoutes, routeEntry, selfHostedConnectionId, sshTargetKey } from "./routes.ts";
 
 export interface PairingConnectionInput {
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
   readonly expectedEnvironmentId?: EnvironmentId;
+  readonly selfHosted?: true;
+  readonly accountSession?: SelfHostedEnvironmentSession;
 }
 
 export interface SshConnectionInput {
@@ -110,19 +113,30 @@ function differentMachineError(label: string) {
 export const preparePairingRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.preparePairingRegistration",
 )(function* (input: PairingConnectionInput) {
-  const target = yield* resolvePairingTarget(input);
+  const accountSession = input.accountSession;
+  const target = accountSession
+    ? {
+        httpBaseUrl: normalizeHttpBaseUrl(accountSession.httpBaseUrl),
+        wsBaseUrl: deriveWsBaseUrl(accountSession.httpBaseUrl),
+        credential: "",
+      }
+    : yield* resolvePairingTarget(input);
   const presentation = yield* ClientCapabilities.ClientPresentation;
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
   // Checked before redeeming the one-time code, so a wrong link is not spent.
   if (
-    input.expectedEnvironmentId !== undefined &&
-    descriptor.environmentId !== input.expectedEnvironmentId
+    (input.expectedEnvironmentId !== undefined &&
+      descriptor.environmentId !== input.expectedEnvironmentId) ||
+    (accountSession && descriptor.environmentId !== accountSession.environmentId)
   ) {
     return yield* differentMachineError(descriptor.label);
   }
-  const connectionId = bearerConnectionId(descriptor.environmentId, target.httpBaseUrl);
+  const connectionId =
+    input.selfHosted || accountSession
+      ? selfHostedConnectionId(descriptor.environmentId, Boolean(accountSession))
+      : bearerConnectionId(descriptor.environmentId, target.httpBaseUrl);
   const route = {
     target: new BearerConnectionTarget({
       environmentId: descriptor.environmentId,
@@ -147,16 +161,18 @@ export const preparePairingRegistration = Effect.fn(
   if (compatibilityError !== null && compatibilityError.serverUpdateRequired !== true) {
     return yield* compatibilityError;
   }
-  const access = yield* bootstrapRemoteBearerSession({
-    httpBaseUrl: target.httpBaseUrl,
-    credential: target.credential,
-    clientMetadata: presentation.metadata,
-  }).pipe(Effect.mapError(mapRemoteEnvironmentError));
+  const token =
+    accountSession?.accessToken ??
+    (yield* bootstrapRemoteBearerSession({
+      httpBaseUrl: target.httpBaseUrl,
+      credential: target.credential,
+      clientMetadata: presentation.metadata,
+    }).pipe(Effect.mapError(mapRemoteEnvironmentError))).access_token;
 
   return new BearerConnectionRegistration({
     ...route,
     credential: new BearerConnectionCredential({
-      token: access.access_token,
+      token,
     }),
   });
 });

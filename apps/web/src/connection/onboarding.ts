@@ -15,7 +15,8 @@ export const connectPairing = createRuntimeCommand(connectionAtomRuntime, {
   scheduler: onboardingScheduler,
   concurrency: {
     mode: "singleFlight",
-    key: (input: ConnectionOnboarding.PairingConnectionInput) => JSON.stringify(input),
+    key: (input: ConnectionOnboarding.PairingConnectionInput) =>
+      input.accountSession ? input.accountSession.environmentId : JSON.stringify(input),
   },
   execute: (input: ConnectionOnboarding.PairingConnectionInput) =>
     ConnectionOnboarding.ConnectionOnboarding.pipe(

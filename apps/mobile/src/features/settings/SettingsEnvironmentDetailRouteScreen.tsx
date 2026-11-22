@@ -42,6 +42,7 @@ import {
   supportsEnvironmentUpdate,
 } from "./environment-maintenance";
 import { environmentReleaseCheckAtom, releaseCheckValue } from "./environmentUpdateCheck";
+import { useSettingsPageBack } from "./useSettingsPageBack";
 
 export function SettingsEnvironmentDetailRouteScreen({
   route,
@@ -61,6 +62,7 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
   const messages = useMessages();
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
+  const back = useSettingsPageBack();
   const connections = useRemoteConnections();
   const environment = connections.connectedEnvironments.find(
     (entry) => entry.environmentId === environmentId,
@@ -209,10 +211,21 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                 expanded={connectionExpanded}
                 onToggle={() => setConnectionExpanded((value) => !value)}
                 onReconnect={connections.onReconnectEnvironment}
-                onRemove={connections.onRemoveEnvironmentPress}
                 onSetEnabled={connections.onSetEnvironmentEnabled}
                 onUpdate={connections.onUpdateEnvironment}
               />
+              <View className="border-t border-border">
+                <SettingsActionRow
+                  icon="trash"
+                  label={gt("Remove environment")}
+                  tone="danger"
+                  onPress={() =>
+                    connections.onRemoveEnvironmentPress(environmentId, () => {
+                      if (navigation.isFocused()) back?.();
+                    })
+                  }
+                />
+              </View>
             </SettingsSection>
             <EnvironmentRoutesSection
               environmentId={environmentId}

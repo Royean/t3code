@@ -1,8 +1,11 @@
 import type {
+  SelfHostedDevice,
   SelfHostedEnvironment,
+  SelfHostedEnvironmentSession,
   SelfHostedSession,
 } from "@t3tools/contracts/self-hosted-connect";
 import { msg } from "gt-i18n";
+import type { RelayDeviceRegistrationRequest } from "@t3tools/contracts/relay";
 
 import { translatableError } from "./errors/translatable.ts";
 import {
@@ -17,6 +20,7 @@ export interface SelfHostedStoredProfile {
   readonly username: string;
   readonly refreshToken: string | null;
   readonly environmentIds: ReadonlyArray<string>;
+  readonly excludedEnvironmentIds?: ReadonlyArray<string>;
 }
 
 export interface SelfHostedSessionStorage {
@@ -28,18 +32,22 @@ export interface SelfHostedSessionStorage {
 export interface SelfHostedSessionState {
   readonly serverUrl: string;
   readonly username: string;
+  readonly accountId: string | null;
   readonly signedIn: boolean;
   readonly busy: boolean;
   readonly environments: ReadonlyArray<SelfHostedEnvironment>;
+  readonly devices: ReadonlyArray<SelfHostedDevice> | null;
   readonly error: unknown;
 }
 
 const EMPTY_STATE: SelfHostedSessionState = {
   serverUrl: "",
   username: "",
+  accountId: null,
   signedIn: false,
   busy: false,
   environments: [],
+  devices: null,
   error: null,
 };
 const superseded = Symbol("self-hosted-session-superseded");
@@ -49,9 +57,12 @@ const unauthorized = (error: unknown) =>
 export function createSelfHostedSessionController(options: {
   readonly storage: SelfHostedSessionStorage;
   readonly pair: (pairingUrl: string, environmentId: string) => Promise<void>;
-  readonly isRegistered: (environmentId: string) => boolean;
+  readonly registerAccountSession?: (session: SelfHostedEnvironmentSession) => Promise<void>;
+  readonly isRegistered: (environmentId: string, origin: string, owned: boolean) => boolean;
   readonly removeEnvironment: (environmentId: string) => Promise<void>;
   readonly createClient?: (serverUrl: string) => SelfHostedConnectClient;
+  readonly deviceLabel?: () => string;
+  readonly autoConnect?: boolean;
   readonly now?: () => number;
 }) {
   let state = EMPTY_STATE;
@@ -96,7 +107,13 @@ export function createSelfHostedSessionController(options: {
     const previousClient = client;
     const previousSession = session;
     const retainedProfile =
-      keepEnvironments && previous ? { ...previous, refreshToken: null } : null;
+      previous && (keepEnvironments || previous.excludedEnvironmentIds?.length)
+        ? {
+            ...previous,
+            refreshToken: null,
+            environmentIds: keepEnvironments ? previous.environmentIds : [],
+          }
+        : null;
     const version = ++generation;
     profile = retainedProfile;
     session = null;
@@ -156,7 +173,7 @@ export function createSelfHostedSessionController(options: {
       profile = { ...profile, refreshToken: next.refreshToken };
       await persist(version);
       current(version);
-      update({ signedIn: true });
+      update({ signedIn: true, accountId: next.accountId });
       return next;
     })();
     refreshing = pending;
@@ -199,6 +216,13 @@ export function createSelfHostedSessionController(options: {
     current(version);
     update({ environments: result.environments });
   };
+  const listDevices = async (version: number) => {
+    const api = client;
+    if (!api) throw superseded;
+    const result = await authorized(version, api.listDevices);
+    current(version);
+    update({ devices: result.devices });
+  };
   const run = async (version: number, action: () => Promise<void>) => {
     if (version !== generation) return false;
     running += 1;
@@ -233,6 +257,93 @@ export function createSelfHostedSessionController(options: {
     }
   };
 
+  const connectEnvironment = async (
+    version: number,
+    environment: SelfHostedEnvironment,
+    automatic: boolean,
+  ) => {
+    const { environmentId, httpBaseUrl } = environment;
+    const api = client;
+    if (!api) throw translatableError(msg("Sign in to your connection server."));
+    const saved = () =>
+      options.isRegistered(
+        environmentId,
+        httpBaseUrl,
+        profile?.environmentIds.includes(environmentId) ?? false,
+      );
+    if (saved()) return;
+    const pending = pairing
+      .catch(() => {})
+      .then(async () => {
+        current(version);
+        if (automatic && profile?.excludedEnvironmentIds?.includes(environmentId)) return;
+        if (saved()) return;
+        if (options.registerAccountSession) {
+          const connection = await authorized(version, (token) =>
+            api.connectAccount(token, environmentId),
+          );
+          current(version);
+          if (
+            connection.environmentId !== environmentId ||
+            connection.httpBaseUrl !== httpBaseUrl
+          ) {
+            throw translatableError(msg("The connection server returned a different environment."));
+          }
+          await options.registerAccountSession(connection);
+        } else {
+          const connection = await authorized(version, (token) =>
+            api.connect(token, environmentId),
+          );
+          current(version);
+          if (connection.environmentId !== environmentId) {
+            throw translatableError(msg("The connection server returned a different environment."));
+          }
+          if (!(Date.parse(connection.expiresAt) > now())) {
+            throw translatableError(msg("The pairing link expired. Try connecting again."));
+          }
+          await options.pair(connection.pairingUrl, environmentId);
+        }
+        if (version !== generation) {
+          await options.removeEnvironment(environmentId);
+          throw superseded;
+        }
+        if (automatic && profile?.excludedEnvironmentIds?.includes(environmentId)) {
+          await options.removeEnvironment(environmentId);
+          return;
+        }
+        if (profile) {
+          profile = {
+            ...profile,
+            environmentIds: [...new Set([...profile.environmentIds, environmentId])],
+            ...(profile.excludedEnvironmentIds
+              ? {
+                  excludedEnvironmentIds: profile.excludedEnvironmentIds.filter(
+                    (id) => id !== environmentId,
+                  ),
+                }
+              : {}),
+          };
+        }
+        await persist(version);
+      });
+    pairing = pending;
+    await pending;
+  };
+
+  const sync = async (version: number) => {
+    await list(version);
+    if (!options.autoConnect) return;
+    for (const environment of state.environments) {
+      current(version);
+      if (
+        !environment.available ||
+        profile?.excludedEnvironmentIds?.includes(environment.environmentId)
+      )
+        continue;
+      await connectEnvironment(version, environment, true);
+    }
+  };
+
   return {
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
@@ -248,7 +359,7 @@ export function createSelfHostedSessionController(options: {
       const pending = run(version, async () => {
         if (restored) {
           await refresh(version);
-          await list(version);
+          await sync(version);
           return;
         }
         const saved = await options.storage.load();
@@ -265,7 +376,7 @@ export function createSelfHostedSessionController(options: {
           return;
         }
         await refresh(version);
-        await list(version);
+        await sync(version);
         restored = true;
       });
       restoring = pending;
@@ -287,10 +398,11 @@ export function createSelfHostedSessionController(options: {
         return false;
       }
       let version: number;
-      const retainedIds =
+      const previous =
         profile?.serverUrl === serverUrl && profile.username === input.username.trim()
-          ? profile.environmentIds
-          : [];
+          ? profile
+          : null;
+      const retainedIds = previous?.environmentIds ?? [];
       try {
         version = await forget(retainedIds.length > 0);
       } catch (error) {
@@ -301,7 +413,11 @@ export function createSelfHostedSessionController(options: {
         const api = makeClient(serverUrl);
         client = api;
         update({ serverUrl, username: input.username.trim() });
-        const next = await api.login(input.username.trim(), input.password);
+        const next = await api.login(
+          input.username.trim(),
+          input.password,
+          options.deviceLabel?.(),
+        );
         if (version !== generation) {
           await revoke(api, next.refreshToken).catch(() => {});
           throw superseded;
@@ -312,14 +428,37 @@ export function createSelfHostedSessionController(options: {
           username: input.username.trim(),
           refreshToken: next.refreshToken,
           environmentIds: retainedIds,
+          ...(previous?.excludedEnvironmentIds
+            ? { excludedEnvironmentIds: previous.excludedEnvironmentIds }
+            : {}),
         };
         await persist(version);
         current(version);
-        update({ signedIn: true });
-        await list(version);
+        update({ signedIn: true, accountId: next.accountId });
+        await sync(version);
       });
     },
-    refreshEnvironments: () => run(generation, () => list(generation)),
+    refreshEnvironments: () => run(generation, () => sync(generation)),
+    refreshDevices: () => run(generation, () => listDevices(generation)),
+    registerAndroidDevice: (input: RelayDeviceRegistrationRequest, deliveryTokenHash: string) => {
+      const version = generation;
+      return run(version, async () => {
+        const api = client;
+        if (!api) throw superseded;
+        await authorized(version, (token) =>
+          api.registerAndroidDevice(token, input, deliveryTokenHash),
+        );
+      });
+    },
+    revokeDevice: (id: string) => {
+      const version = generation;
+      return run(version, async () => {
+        const api = client;
+        if (!api) throw superseded;
+        await authorized(version, (token) => api.revokeDevice(token, id));
+        await listDevices(version);
+      });
+    },
     connect: (environmentId: string) => {
       const version = generation;
       return run(version, async () => {
@@ -328,35 +467,27 @@ export function createSelfHostedSessionController(options: {
         );
         if (!environment?.available)
           throw translatableError(msg("Choose an available environment."));
-        if (options.isRegistered(environmentId)) return;
-        const api = client;
-        if (!api) throw translatableError(msg("Sign in to your connection server."));
-        const connection = await authorized(version, (token) => api.connect(token, environmentId));
-        current(version);
-        if (connection.environmentId !== environmentId) {
-          throw translatableError(msg("The connection server returned a different environment."));
-        }
-        if (!(Date.parse(connection.expiresAt) > now())) {
-          throw translatableError(msg("The pairing link expired. Try connecting again."));
-        }
-        const pending = pairing
-          .catch(() => {})
-          .then(async () => {
-            current(version);
-            await options.pair(connection.pairingUrl, environmentId);
-            if (version !== generation) {
-              await options.removeEnvironment(environmentId);
-              throw superseded;
-            }
-            if (profile)
-              profile = {
-                ...profile,
-                environmentIds: [...new Set([...profile.environmentIds, environmentId])],
-              };
-            await persist(version);
-          });
-        pairing = pending;
-        await pending;
+        await connectEnvironment(version, environment, false);
+      });
+    },
+    excludeEnvironment: (environmentId: string) => {
+      const version = generation;
+      return run(version, async () => {
+        if (
+          !profile ||
+          !(
+            state.environments.some((entry) => entry.environmentId === environmentId) ||
+            profile.environmentIds.includes(environmentId)
+          )
+        )
+          return;
+        profile = {
+          ...profile,
+          excludedEnvironmentIds: [
+            ...new Set([...(profile.excludedEnvironmentIds ?? []), environmentId]),
+          ],
+        };
+        await persist(version);
       });
     },
     signOut: async () => {

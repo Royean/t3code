@@ -11,6 +11,9 @@ Object.assign(process.env, repoEnv);
 process.env.EXPO_NO_TYPESCRIPT_SETUP = "1";
 
 const APP_VARIANT = resolveAppVariant(repoEnv.APP_VARIANT);
+const selfHostedOnly = ["1", "true"].includes(
+  repoEnv.T3CODE_SELF_HOSTED_ONLY?.trim().toLowerCase() ?? "",
+);
 const isIosPersonalTeamBuild = repoEnv.T3CODE_IOS_PERSONAL_TEAM === "1";
 const runtimeVersionPolicy =
   process.env.MOBILE_VERSION_POLICY ??
@@ -297,7 +300,7 @@ const config: ExpoConfig = {
   android: {
     icon: variant.assets.appIcon,
     package: variant.androidPackage,
-    ...(repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE
+    ...(!selfHostedOnly && repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE
       ? { googleServicesFile: repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE }
       : {}),
     adaptiveIcon: {
@@ -452,6 +455,7 @@ const config: ExpoConfig = {
     // Mods run in reverse order; expo-widgets must create and wipe the target before assets are added.
     ...(!isIosPersonalTeamBuild ? ["./plugins/withWidgetLogoAsset.cjs", widgetsPlugin] : []),
     "./plugins/withAndroidNetworkSecurityConfig.cjs",
+    ...(selfHostedOnly ? ["./plugins/withSelfHostedAndroidNotifications.cjs"] : []),
     "./plugins/withAndroidGradleHeap.cjs",
     "./plugins/withAndroidInputBackground.cjs",
     "./plugins/withAndroidModernPopupMenu.cjs",
@@ -468,6 +472,8 @@ const config: ExpoConfig = {
       process.env.T3CODE_FEATURE_SECRETS?.trim().toLowerCase() ?? "",
     ),
     iosPersonalTeamBuild: isIosPersonalTeamBuild,
+    selfHostedAccountOrigin: repoEnv.VITE_T3CODE_SELF_HOSTED_CONNECT_URL ?? null,
+    selfHostedOnly,
     relay: {
       url: repoEnv.T3CODE_RELAY_URL ?? null,
     },
@@ -476,10 +482,14 @@ const config: ExpoConfig = {
       jwtTemplate: repoEnv.EXPO_PUBLIC_CLERK_JWT_TEMPLATE ?? null,
     },
     // Clerk reads these exact names at prebuild. Omit unset values: manifest null becomes truthy {}.
-    EXPO_PUBLIC_CLERK_GOOGLE_WEB_CLIENT_ID: repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_WEB_CLIENT_ID,
-    EXPO_PUBLIC_CLERK_GOOGLE_IOS_CLIENT_ID: repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_IOS_CLIENT_ID,
-    EXPO_PUBLIC_CLERK_GOOGLE_ANDROID_CLIENT_ID: repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_ANDROID_CLIENT_ID,
-    EXPO_PUBLIC_CLERK_GOOGLE_IOS_URL_SCHEME: repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_IOS_URL_SCHEME,
+    EXPO_PUBLIC_CLERK_GOOGLE_WEB_CLIENT_ID:
+      repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_WEB_CLIENT_ID || undefined,
+    EXPO_PUBLIC_CLERK_GOOGLE_IOS_CLIENT_ID:
+      repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_IOS_CLIENT_ID || undefined,
+    EXPO_PUBLIC_CLERK_GOOGLE_ANDROID_CLIENT_ID:
+      repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_ANDROID_CLIENT_ID || undefined,
+    EXPO_PUBLIC_CLERK_GOOGLE_IOS_URL_SCHEME:
+      repoEnv.EXPO_PUBLIC_CLERK_GOOGLE_IOS_URL_SCHEME || undefined,
     observability: {
       tracesUrl: repoEnv.EXPO_PUBLIC_OTLP_TRACES_URL ?? "https://api.axiom.co/v1/traces",
       tracesDataset: repoEnv.EXPO_PUBLIC_OTLP_TRACES_DATASET ?? null,

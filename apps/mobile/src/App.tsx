@@ -109,7 +109,8 @@ import {
 import { pruneNewTaskFlowStates } from "./features/threads/new-task-flow-state";
 import { pruneNewTaskBranchCheckouts } from "./features/threads/NewTaskDraftRouteScreen";
 import { installAppUpdateChecks } from "./features/updates/app-updates";
-import { selfHostedSession } from "./features/connection/selfHostedConnection";
+import { selfHostedOnly, selfHostedSession } from "./features/connection/selfHostedConnection";
+import { setAgentAwarenessRelayTokenProvider } from "./features/agent-awareness/remoteRegistration";
 
 import "../global.css";
 
@@ -274,6 +275,26 @@ function QuickActionsLanguage() {
 }
 
 export default function App() {
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- binds the account lifetime to the native Android notification connection
+  useEffect(() => {
+    if (!selfHostedOnly || Platform.OS !== "android") return;
+    let accountId: string | null = null;
+    const updateAccount = () => {
+      const account = selfHostedSession.getSnapshot();
+      if (account.accountId === accountId) return;
+      accountId = account.accountId;
+      setAgentAwarenessRelayTokenProvider(
+        null,
+        accountId ?? undefined,
+        accountId
+          ? { url: account.serverUrl, register: selfHostedSession.registerAndroidDevice }
+          : null,
+      );
+    };
+    const unsubscribe = selfHostedSession.subscribe(updateAccount);
+    updateAccount();
+    return unsubscribe;
+  }, []);
   return (
     <RegistryContext.Provider value={appAtomRegistry}>
       <CloudAuthProvider>

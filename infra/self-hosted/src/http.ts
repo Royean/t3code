@@ -1,14 +1,19 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- These are the native HTTP adapter's callback types.
 import type * as NodeHttp from "node:http";
 import {
+  SelfHostedAndroidRead,
+  SelfHostedAndroidRegisterInput,
   SelfHostedLoginInput,
   SelfHostedRefreshInput,
+  SelfHostedRevokeDeviceInput,
   type SelfHostedErrorResponse,
 } from "@t3tools/contracts/self-hosted-connect";
+import { RelayAgentActivityPublishRequest } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { SelfHostedConfig } from "./config.ts";
 import * as SelfHostedConnect from "./SelfHostedConnect.ts";
+import type * as WebhookQueue from "./WebhookQueue.ts";
 
 // @effect-diagnostics-next-line extendsNativeError:off -- Parse exceptions remain inside the Promise HTTP adapter and never enter an Effect failure channel.
 class RequestError extends Error {
@@ -25,11 +30,8 @@ const errorReply = (status: number, code: ErrorCode, message: string): Reply => 
   body: { error: { code, message } },
 });
 
-function readJson(request: NodeHttp.IncomingMessage): Promise<unknown> {
-  if (!/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
-    return Promise.reject(new RequestError(415));
-  }
-  if (Number(request.headers["content-length"] ?? 0) > 16_384) {
+function readBody(request: NodeHttp.IncomingMessage, limit: number): Promise<Buffer> {
+  if (Number(request.headers["content-length"] ?? 0) > limit) {
     request.resume();
     return Promise.reject(new RequestError(413));
   }
@@ -45,7 +47,7 @@ function readJson(request: NodeHttp.IncomingMessage): Promise<unknown> {
     timer.unref();
     request.on("data", (chunk: Buffer) => {
       length += chunk.length;
-      if (length > 16_384) {
+      if (length > limit) {
         failed = true;
         clearTimeout(timer);
         reject(new RequestError(413));
@@ -54,11 +56,7 @@ function readJson(request: NodeHttp.IncomingMessage): Promise<unknown> {
     request.on("end", () => {
       clearTimeout(timer);
       if (failed) return;
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch {
-        reject(new RequestError(400));
-      }
+      resolve(Buffer.concat(chunks));
     });
     request.on("error", () => {
       clearTimeout(timer);
@@ -66,6 +64,37 @@ function readJson(request: NodeHttp.IncomingMessage): Promise<unknown> {
     });
   });
 }
+
+async function readJson(request: NodeHttp.IncomingMessage): Promise<unknown> {
+  if (!/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
+    throw new RequestError(415);
+  }
+  const body = await readBody(request, 16_384);
+  try {
+    return JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new RequestError(400);
+  }
+}
+
+const strippedWebhookHeaders = new Set([
+  "connection",
+  "host",
+  "content-length",
+  "transfer-encoding",
+  "upgrade",
+  "expect",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "authorization",
+  "cookie",
+  "forwarded",
+  "traceparent",
+  "tracestate",
+]);
 
 function decode<S extends Schema.Top & { readonly DecodingServices: never }>(
   schema: S,
@@ -94,11 +123,12 @@ export function createHttpHandler(
     | SelfHostedConnect.EnvironmentUnavailable
     | SelfHostedConnect.UpstreamTimeout
     | SelfHostedConnect.StorageError
-    | SelfHostedConnect.PasswordError;
-  const run = <A>(effect: Effect.Effect<A, ServiceFailure>) =>
+    | SelfHostedConnect.PasswordError
+    | WebhookQueue.WebhookQueueFull;
+  const run = <A>(effect: Effect.Effect<A, ServiceFailure>, status = 200, signal?: AbortSignal) =>
     Effect.runPromise(
       effect.pipe(
-        Effect.map((body): Reply => ({ status: 200, body })),
+        Effect.map((body): Reply => ({ status, body })),
         Effect.catchTags({
           Unauthorized: () =>
             Effect.succeed(
@@ -137,10 +167,19 @@ export function createHttpHandler(
             Effect.succeed(
               errorReply(500, "internal_error", "The connection service is unavailable."),
             ),
+          WebhookQueueFull: () =>
+            Effect.succeed({
+              ...errorReply(429, "rate_limited", "The webhook queue is full. Try again later."),
+              retryAfter: 30,
+            }),
         }),
       ),
+      signal ? { signal } : undefined,
     );
-  const route = async (request: NodeHttp.IncomingMessage): Promise<Reply> => {
+  const route = async (
+    request: NodeHttp.IncomingMessage,
+    response: NodeHttp.ServerResponse,
+  ): Promise<Reply> => {
     const path = request.url ?? "";
     if (request.method === "GET" && path === "/health") return { status: 200, body: { ok: true } };
     if (request.method === "POST" && path === "/v1/auth/login") {
@@ -158,7 +197,88 @@ export function createHttpHandler(
     if (request.method === "GET" && path === "/v1/environments") {
       return run(service.listEnvironments(bearer(request)));
     }
-    const match = /^\/v1\/environments\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/connect$/.exec(path);
+    if (request.method === "GET" && path === "/v1/devices") {
+      return run(service.listDevices(bearer(request)));
+    }
+    if (request.method === "POST" && path === "/v1/devices/revoke") {
+      const { id } = decode(SelfHostedRevokeDeviceInput, await readJson(request));
+      return run(service.revokeDevice(bearer(request), id).pipe(Effect.as({ ok: true })));
+    }
+    if (request.method === "POST" && path === "/v1/mobile/devices") {
+      const { deliveryTokenHash, registration } = decode(
+        SelfHostedAndroidRegisterInput,
+        await readJson(request),
+      );
+      return run(
+        service
+          .registerAndroid(bearer(request), registration, deliveryTokenHash)
+          .pipe(Effect.as({ ok: true })),
+      );
+    }
+    if (request.method === "POST" && path === "/v1/mobile/notifications") {
+      const { after, replay } = decode(SelfHostedAndroidRead, await readJson(request));
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      response.once("close", abort);
+      try {
+        return await run(
+          service.readAndroid(bearer(request), after, replay),
+          200,
+          controller.signal,
+        );
+      } finally {
+        response.off("close", abort);
+      }
+    }
+    const hook =
+      /^\/v1\/hooks\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/([A-Za-z0-9._-]{1,128})\/([A-Za-z0-9_-]{32,128})\/([A-Za-z0-9_-]{43})(?:\?([^#]{0,8192}))?$/.exec(
+        path,
+      );
+    if (hook && request.method && ["POST", "PUT", "PATCH", "GET"].includes(request.method)) {
+      const headers = Object.fromEntries(
+        Object.entries(request.headers).flatMap(([name, value]) =>
+          typeof value === "string" &&
+          !strippedWebhookHeaders.has(name) &&
+          !name.startsWith("x-t3-") &&
+          !name.startsWith("x-forwarded-")
+            ? [[name, value]]
+            : [],
+        ),
+      );
+      return run(
+        service.queueWebhook({
+          environmentId: hook[1]!,
+          hookId: hook[2]!,
+          token: hook[3]!,
+          signature: hook[4]!,
+          query: hook[5] ?? "",
+          method: request.method,
+          headers,
+          body: await readBody(request, 1_048_576),
+        }),
+        202,
+      );
+    }
+    const publish =
+      /^\/v1\/environments\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/threads\/([^/?#]{1,512})\/agent-activity$/.exec(
+        path,
+      );
+    if (request.method === "POST" && publish) {
+      const input = decode(RelayAgentActivityPublishRequest, await readJson(request));
+      let threadId: string;
+      try {
+        threadId = decodeURIComponent(publish[2]!);
+      } catch {
+        throw new RequestError(400);
+      }
+      return run(
+        service
+          .publishActivity(bearer(request), publish[1]!, threadId, input.state)
+          .pipe(Effect.as({ ok: true, deliveries: [] })),
+      );
+    }
+    const match =
+      /^\/v1\/environments\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/(connect|session)$/.exec(path);
     if (request.method === "POST" && match) {
       const body = await readJson(request);
       if (
@@ -169,7 +289,9 @@ export function createHttpHandler(
       ) {
         throw new RequestError(400);
       }
-      return run(service.connect(bearer(request), match[1]!));
+      if (match[2] === "session") return run(service.connectAccount(bearer(request), match[1]!));
+      if (config.allowLegacyPairing !== false)
+        return run(service.connect(bearer(request), match[1]!));
     }
     return errorReply(404, "not_found", "The endpoint does not exist.");
   };
@@ -192,13 +314,14 @@ export function createHttpHandler(
         response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
         reply = { status: 204, body: undefined };
-      } else reply = await route(request);
+      } else reply = await route(request, response);
     } catch (cause) {
       reply =
         cause instanceof RequestError
           ? errorReply(cause.status, "invalid_request", cause.message)
           : errorReply(500, "internal_error", "The connection service is unavailable.");
     }
+    if (response.destroyed) return;
     if (reply.retryAfter !== undefined) response.setHeader("Retry-After", reply.retryAfter);
     if (reply.status === 413 || reply.status === 408) response.setHeader("Connection", "close");
     response.writeHead(reply.status);

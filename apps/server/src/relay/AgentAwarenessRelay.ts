@@ -44,6 +44,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import {
   isAgentActivityPublishingEnabledValue,
   PUBLISH_AGENT_ACTIVITY_SECRET,
+  readSelfHostedConnectConfig,
   RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
   RELAY_ISSUER_SECRET,
   RELAY_URL_SECRET,
@@ -446,7 +447,17 @@ export const make = Effect.gen(function* () {
         ),
       );
 
+  const selfHosted = yield* readSelfHostedConnectConfig();
+  const selfHostedActivity = selfHosted
+    ? {
+        url: selfHosted.origin,
+        issuer: selfHosted.origin,
+        environmentCredential: selfHosted.key,
+      }
+    : null;
+
   const readRelayConfig = Effect.gen(function* () {
+    if (selfHostedActivity) return selfHostedActivity;
     const [url, issuer, environmentCredential] = yield* Effect.all([
       readSecretString(RELAY_URL_SECRET),
       readSecretString(RELAY_ISSUER_SECRET),
@@ -457,9 +468,11 @@ export const make = Effect.gen(function* () {
       : null;
   });
 
-  const readPublishAgentActivityEnabled = readSecretString(PUBLISH_AGENT_ACTIVITY_SECRET).pipe(
-    Effect.map(isAgentActivityPublishingEnabledValue),
-  );
+  const readPublishAgentActivityEnabled = selfHostedActivity
+    ? Effect.succeed(true)
+    : readSecretString(PUBLISH_AGENT_ACTIVITY_SECRET).pipe(
+        Effect.map(isAgentActivityPublishingEnabledValue),
+      );
 
   const makeRelayClient = (relayConfig: {
     readonly url: string;
@@ -849,9 +862,9 @@ export const make = Effect.gen(function* () {
   });
 
   const publishActiveThreadsUnsafe = Effect.gen(function* () {
-    const relayUrl = yield* readSecretString(RELAY_URL_SECRET).pipe(
-      Effect.orElseSucceed(() => null),
-    );
+    const relayUrl =
+      selfHostedActivity?.url ??
+      (yield* readSecretString(RELAY_URL_SECRET).pipe(Effect.orElseSucceed(() => null)));
     if (!relayUrl) {
       yield* Effect.logDebug("agent activity snapshot skipped; relay link credentials unavailable");
       return "unlinked" as const;

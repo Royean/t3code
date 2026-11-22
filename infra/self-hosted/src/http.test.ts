@@ -1,15 +1,21 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The integration fixture owns an ephemeral native HTTP listener.
 import * as NodeHttp from "node:http";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Signs a synthetic notification credential for the HTTP fixture.
+import * as NodeCrypto from "node:crypto";
 import { expect, it } from "@effect/vitest";
 import {
   createSelfHostedConnectClient,
   normalizeSelfHostedServerUrl,
   SelfHostedConnectClientError,
 } from "@t3tools/client-runtime/self-hosted-connect";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type { SelfHostedConfig } from "./config.ts";
 import { createHttpHandler } from "./http.ts";
 import * as SelfHostedConnect from "./SelfHostedConnect.ts";
+
+const activityKey = "a".repeat(43);
 
 const config: SelfHostedConfig = {
   databasePath: ":memory:",
@@ -26,6 +32,7 @@ const config: SelfHostedConfig = {
       origin: "https://office.example.com",
       pairingOrigin: "http://127.0.0.1:3773",
       credential: "private-environment-credential",
+      activityKey,
     },
   ],
   allowedOrigins: ["https://app.example.com", "t3code://app", "t3code-dev://app"],
@@ -60,6 +67,7 @@ it.live(
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Missing test listener.");
       const origin = `http://127.0.0.1:${address.port}`;
+      const updatedAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
       yield* Effect.promise(async () => {
         for (const [path, init] of [
           ["/v1/environments", {}],
@@ -124,7 +132,74 @@ it.live(
           body: "x".repeat(16_385),
         });
         expect(oversized.status).toBe(413);
+        const deliveryToken = "t".repeat(43);
+        const deliveryTokenHash = NodeCrypto.createHash("sha256")
+          .update(deliveryToken)
+          .digest("hex");
+        await client.registerAndroidDevice(
+          session.accessToken,
+          {
+            deviceId: "android-installation",
+            label: "Android",
+            platform: "android",
+            androidApiLevel: 34,
+            bundleId: "com.royean.t3code",
+            preferences: {
+              liveActivitiesEnabled: true,
+              notificationsEnabled: true,
+              notifyOnApproval: true,
+              notifyOnCompletion: true,
+              notifyOnInput: true,
+              notifyOnFailure: true,
+            },
+          },
+          deliveryTokenHash,
+        );
+        const post = (path: string, token: string, body: unknown) =>
+          // @effect-diagnostics-next-line globalFetch:off -- Exercise the same wire endpoints as the native Android listener and remote environment.
+          fetch(new URL(path, origin), {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+        const published = await post(
+          "/v1/environments/office/threads/demo/agent-activity",
+          activityKey,
+          {
+            proof: "fixture-environment-proof",
+            state: {
+              environmentId: "office",
+              threadId: "demo",
+              projectTitle: "Project",
+              threadTitle: "Example task",
+              phase: "completed",
+              headline: "Done",
+              modelTitle: "Replay",
+              updatedAt,
+              deepLink: "/",
+            },
+          },
+        );
+        expect(published.status).toBe(200);
+        const inbox = await post("/v1/mobile/notifications", deliveryToken, {
+          after: 0,
+          replay: true,
+        });
+        expect(inbox.status).toBe(200);
+        expect(await inbox.json()).toMatchObject({
+          messages: expect.arrayContaining([
+            expect.objectContaining({
+              data: expect.objectContaining({
+                alert_title: "Example task",
+                alert_path: "/threads/office/demo",
+              }),
+            }),
+          ]),
+        });
         await client.logout(session.refreshToken);
+        expect((await post("/v1/mobile/notifications", deliveryToken, { after: 0 })).status).toBe(
+          401,
+        );
         await expect(client.listEnvironments(session.accessToken)).rejects.toMatchObject({
           status: 401,
           code: "unauthorized",

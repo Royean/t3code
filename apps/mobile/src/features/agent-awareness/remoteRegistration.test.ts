@@ -43,12 +43,19 @@ import {
 } from "./remoteRegistration";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
-import { configureAndroidAgentNotifications } from "./androidNotifications";
+import {
+  clearAndroidAgentNotifications,
+  configureAndroidAgentNotifications,
+  connectSelfHostedAndroidNotifications,
+} from "./androidNotifications";
 
 vi.mock("./androidNotifications", () => ({
   supportsAndroidAgentNotifications: vi.fn(() => true),
   configureAndroidAgentNotifications: vi.fn(),
   clearAndroidAgentNotifications: vi.fn(),
+  connectSelfHostedAndroidNotifications: vi.fn(() => true),
+  disconnectSelfHostedAndroidNotifications: vi.fn(),
+  isSelfHostedAndroidNotificationServiceListening: vi.fn(() => true),
 }));
 
 const secureStore = vi.hoisted(() => new Map<string, string>());
@@ -130,6 +137,8 @@ vi.mock("expo-crypto", () => ({
     SHA384: "SHA-384",
     SHA512: "SHA-512",
   },
+  digestStringAsync: (algorithm: string, text: string) =>
+    Promise.resolve(NodeCrypto.createHash(algorithm).update(text).digest("hex")),
   getRandomBytes: (byteCount: number) => new Uint8Array(NodeCrypto.randomBytes(byteCount)),
   getRandomBytesAsync: (byteCount: number) =>
     Promise.resolve(new Uint8Array(NodeCrypto.randomBytes(byteCount))),
@@ -644,6 +653,43 @@ describe("makeRelayDeviceRegistrationRequest", () => {
 
       expect(backgroundRuntime.pending).toHaveLength(0);
       expect(tokenProvider).toHaveBeenCalledTimes(3);
+    }).pipe(Effect.provide(layerRelayTest));
+  });
+
+  it.effect("registers self-hosted Android delivery without requesting a Firebase token", () => {
+    vi.spyOn(Platform, "OS", "get").mockReturnValue("android");
+    vi.spyOn(Platform, "Version", "get").mockReturnValue(36);
+    vi.mocked(loadPreferences).mockResolvedValue({ liveActivitiesEnabled: true });
+    vi.mocked(Notifications.getDevicePushTokenAsync).mockClear();
+    vi.mocked(Notifications.addPushTokenListener).mockClear();
+    vi.mocked(clearAndroidAgentNotifications).mockClear();
+    const url = "https://account.example.test";
+    const register = vi.fn(async (_body: unknown, _hash: string) => true);
+    setAgentAwarenessRelayTokenProvider(null, "owner", { url, register });
+    return Effect.gen(function* () {
+      yield* runBackgroundOperations();
+      expect(Notifications.getDevicePushTokenAsync).not.toHaveBeenCalled();
+      expect(Notifications.addPushTokenListener).not.toHaveBeenCalled();
+      const nativeCall = vi.mocked(connectSelfHostedAndroidNotifications).mock.calls.at(-1)!;
+      const [origin, deliveryToken] = nativeCall;
+      expect(origin).toBe(url);
+      expect(deliveryToken).toMatch(/^[a-zA-Z0-9_-]{43}$/);
+      const hash = NodeCrypto.createHash("sha256").update(deliveryToken).digest("hex");
+      expect(register).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platform: "android",
+          preferences: expect.objectContaining({
+            notificationsEnabled: true,
+            liveActivitiesEnabled: true,
+          }),
+        }),
+        hash,
+      );
+      yield* updateAgentAwarenessRegistrationPreferences({ liveActivitiesEnabled: false });
+      expect(register.mock.calls.at(-1)?.[1]).toBe(hash);
+      expect(agentAwarenessNotificationsReady()).toBe(true);
+      setAgentAwarenessRelayTokenProvider(null);
+      expect(clearAndroidAgentNotifications).toHaveBeenCalled();
     }).pipe(Effect.provide(layerRelayTest));
   });
 

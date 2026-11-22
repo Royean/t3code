@@ -13,6 +13,7 @@ import { hasCloudPublicConfig } from "../features/cloud/publicConfig";
 import { m } from "../i18n/messages";
 import { useConnectionController } from "../features/connection/useConnectionController";
 import { useRetryEnvironment } from "../features/connection/useRetryEnvironment";
+import { selfHostedSession } from "../features/connection/selfHostedConnection";
 import { environmentPresentations } from "./presentation";
 import { useWorkspaceConnectionState, useWorkspaceEnvironments } from "./workspace";
 import type { SavedRemoteConnection } from "../lib/connection";
@@ -182,7 +183,7 @@ export function useRemoteConnections() {
     updates: { readonly label: string; readonly displayUrl: string },
   ) => controller.updateEnvironment(environmentId, updates);
 
-  const onRemoveEnvironmentPress = (environmentId: EnvironmentId) => {
+  const onRemoveEnvironmentPress = (environmentId: EnvironmentId, onRemoved?: () => void) => {
     const environment = connectedEnvironments.find(
       (candidate) => candidate.environmentId === environmentId,
     );
@@ -193,7 +194,11 @@ export function useRemoteConnections() {
       text: m(msg("Remove")),
       style: "destructive",
       onPress: () => {
-        void controller.removeEnvironment(environmentId);
+        void (async () => {
+          await selfHostedSession.excludeEnvironment(environmentId);
+          const result = await controller.removeEnvironment(environmentId);
+          if (AsyncResult.isSuccess(result)) onRemoved?.();
+        })();
       },
     } as const;
     if (environment.isRelayManaged) {
@@ -203,7 +208,7 @@ export function useRemoteConnections() {
       );
       const openAccount = {
         text: m(msg("Open {account}", { account: "T3 Account" })),
-        onPress: () => navigation.navigate("SettingsAuth"),
+        onPress: () => navigation.navigate("SettingsAuth", { method: "official" }),
       };
       const cancel = { text: m(msg("Cancel")), style: "cancel" } as const;
       Dialog.alert(

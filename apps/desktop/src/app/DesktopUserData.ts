@@ -1,3 +1,4 @@
+import { DESKTOP_PRO_IDENTITY } from "@t3tools/shared/desktopProIdentity";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -35,10 +36,12 @@ export const resolveUserDataPath = Effect.fn("desktop.userData.resolveUserDataPa
   function* (input: {
     readonly appDataDirectory: string;
     readonly isDevelopment: boolean;
+    readonly isT3Pro?: boolean;
     readonly platform: NodeJS.Platform;
   }) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    if (input.isT3Pro) return path.join(input.appDataDirectory, DESKTOP_PRO_IDENTITY.packageName);
     const names = input.isDevelopment
       ? { current: "t3code-dev", legacy: "T3 Code (Dev)" }
       : { current: "t3code-v2", legacy: "T3 Code (Alpha)" };

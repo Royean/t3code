@@ -11,9 +11,11 @@ import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQ
 // Effect wraps this raw Node HTTP server after its startup and write-error guards attach.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Public webhook URLs are signed synchronously when their rows are presented.
+import * as NodeCrypto from "node:crypto";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -174,6 +176,7 @@ import {
 import {
   CLOUD_ENDPOINT_RUNTIME_CONFIG,
   decodeRuntimeConfig,
+  readSelfHostedConnectConfig,
   RELAY_URL_SECRET,
 } from "./cloud/config.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -403,7 +406,7 @@ const layerHttpServer = Layer.unwrap(
 
 const layerPlatformServices = DocumentText.layer.pipe(
   Layer.provideMerge(NonBlockingSpawner.layer),
-  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer, layerSpawner)),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer, layerSpawner)),
 );
 
 const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
@@ -591,7 +594,19 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
   ScheduledTaskWebhookOrigin,
   Effect.gen(function* () {
     const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
     return Effect.gen(function* () {
+      const selfHosted = yield* readSelfHostedConnectConfig();
+      if (selfHosted) {
+        const environmentId = yield* environment.getEnvironmentId;
+        return {
+          relayHookBaseUrl: `${selfHosted.origin}/v1/hooks/${encodeURIComponent(environmentId)}`,
+          sign: (hookId: string, token: string) =>
+            NodeCrypto.createHmac("sha256", selfHosted.key)
+              .update(JSON.stringify(["ingress", environmentId, hookId, token]))
+              .digest("base64url"),
+        };
+      }
       const [relayUrl, tunnelConfig] = yield* Effect.all([
         secrets.get(RELAY_URL_SECRET),
         secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG),
@@ -608,7 +623,7 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
       };
     });
   }),
-);
+).pipe(Layer.provide(layerServerEnvironment));
 
 const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
   Layer.provide(UsageLimitSources.layerResetFallback),
