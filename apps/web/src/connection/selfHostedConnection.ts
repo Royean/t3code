@@ -31,7 +31,7 @@ export const selfHostedOnly = import.meta.env.VITE_T3CODE_SELF_HOSTED_ONLY === "
 
 export const selfHostedSession = createSelfHostedSessionController({
   autoConnect: selfHostedOnly,
-  deviceLabel: () => (window.desktopBridge ? "T3 Pro" : "Web browser"),
+  deviceLabel: () => (window.desktopBridge ? "t4code" : "Web browser"),
   storage: {
     load: async () => {
       if (memoryProfile) return memoryProfile;
