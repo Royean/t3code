@@ -12,6 +12,7 @@ test("fork Android prebuild uses its own identity, embedded runtime version and 
   const source = "const config = {};\nexport default config;";
   const patched = patchExpoConfig(source, { version: "0.1.0-rc.1", versionCode: 3 });
   const config = new Function(patched.replace("export default config;", "return config;"))();
+  assert.equal(config.name, "t4code");
   assert.equal(config.android.package, "com.royean.t3code");
   assert.equal(config.android.versionCode, 3);
   assert.equal(config.version, "0.1.0-rc.1");

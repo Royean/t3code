@@ -554,7 +554,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
-  it.effect("packages T3 Pro with its own Mac identity and URL scheme", () =>
+  it.effect("packages t4code with its own Mac identity and URL scheme", () =>
     Effect.gen(function* () {
       const pro = yield* createBuildConfig(
         "mac",
@@ -570,8 +570,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       );
 
       assert.equal(pro.appId, "com.royean.t3code.pro");
-      assert.equal(pro.productName, "T3 Pro");
-      assert.equal(pro.artifactName, "T3-Pro-${version}-${arch}.${ext}");
+      assert.equal(pro.productName, "t4code");
+      assert.equal(pro.artifactName, "t4code-${version}-${arch}.${ext}");
       assert.nestedPropertyVal(pro, "mac.protocols[0].schemes[0]", "t3code-pro");
       assert.nestedPropertyVal(pro, "mac.protocols[0].schemes.length", 1);
     }),

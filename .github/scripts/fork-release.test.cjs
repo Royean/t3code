@@ -14,7 +14,7 @@ const {
 } = require("./fork-release.cjs");
 
 const source = {
-  repository: "Royean/t3code",
+  repository: "Royean/t4code",
   eventName: "push",
   ref: "refs/tags/v1.2.3-rc.1",
   runId: "42",
@@ -69,7 +69,7 @@ function distribution(t) {
     "t3-1.2.3-darwin-arm64.tar.gz",
     "t3-1.2.3-linux-x64.tar.gz",
     "t3-1.2.3-win32-x64.zip",
-    "t3-1.2.3-android-arm64.apk",
+    "t4code-1.2.3-android-arm64.apk",
     "ANDROID-SIGNING.json",
     "BUILD-INFO.json",
     "T3-Code.dmg",
@@ -88,7 +88,7 @@ test("distribution requires every platform and hashes both ZIP archives and ever
   for (const name of [
     "t3-1.2.3-linux-x64.tar.gz",
     "t3-1.2.3-win32-x64.zip",
-    "t3-1.2.3-android-arm64.apk",
+    "t4code-1.2.3-android-arm64.apk",
   ]) {
     const required = path.join(directory, name);
     fs.unlinkSync(required);
@@ -178,7 +178,7 @@ test("publication refuses existing versions and moved tags, leaving failed uploa
   const directory = distribution(t);
   writeChecksums(directory, "1.2.3");
   const input = {
-    repository: "Royean/t3code",
+    repository: "Royean/t4code",
     tag: "v1.2.3",
     sha: "checked",
     prerelease: false,
@@ -222,7 +222,7 @@ test("release lookup finds old drafts with pagination and fails closed on API er
       },
     },
   };
-  const input = { github, repository: "Royean/t3code", tag: "v1.2.3" };
+  const input = { github, repository: "Royean/t4code", tag: "v1.2.3" };
   assert.equal((await findReleaseByTag(input)).draft, true);
   assert.deepEqual(pages, [1, 2]);
   github.rest.repos.listReleases = async () => {
@@ -245,7 +245,7 @@ test("source ancestry uses captured remote commits and rejects ahead or divergen
       },
     },
   };
-  const input = { github, repository: "Royean/t3code", sha: "candidate", branchCommits };
+  const input = { github, repository: "Royean/t4code", sha: "candidate", branchCommits };
   assert.equal(await assertAllowedCommit(input), "feat/event-orchestration");
   assert.deepEqual(calls, [
     `candidate...${branchCommits.main}`,
@@ -274,7 +274,7 @@ test("source resolution peels annotated tags and refuses tag movement before bui
   };
   const input = {
     github,
-    repository: "Royean/t3code",
+    repository: "Royean/t4code",
     eventName: "push",
     ref: "refs/tags/v1.2.3",
     sha: "annotation",

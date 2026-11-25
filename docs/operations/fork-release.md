@@ -1,6 +1,6 @@
 # Personal fork builds
 
-`Royean/t3code` uses standard GitHub-hosted runners. The upstream release and
+`Royean/t4code` uses standard GitHub-hosted runners. The upstream release and
 deployment workflows retain their repository guards and credentials.
 
 - `CI` runs the existing full checks and desktop/web build on pushes to `main`
@@ -15,7 +15,7 @@ deployment workflows retain their repository guards and credentials.
 
 The workflow builds macOS Apple Silicon DMG/ZIP and Linux x64 AppImage/DEB desktop
 packages, plus standalone CLI archives for both platforms. On macOS, install
-**T3 Pro.app** alongside the official desktop app. T3 Pro uses its own
+**t4code.app** alongside the official desktop app. t4code uses its own
 `~/.t3-pro` data directory and starts with a fresh profile. Build it locally with
 `T3CODE_DESKTOP_MAC_PRO=true T3CODE_SELF_HOSTED_ONLY=1 vp run dist:desktop:dmg:arm64`.
 Fork packages use the self-hosted T3 Account at `https://t3.vivid-dream.online`. Each CLI archive
@@ -30,8 +30,7 @@ runner before the assets are accepted.
 
 Android builds run Expo production prebuild and Gradle `assembleRelease`, producing
 an arm64 APK with its JavaScript/Hermes bundle embedded. The APK is not a Metro
-development client. Its package is `com.royean.t3code`, display name is `T3 Code
-Fork`, and upstream EAS over-the-air updates are disabled. It can coexist with the
+development client. Its package is `com.royean.t3code`, display name is `t4code`, and upstream EAS over-the-air updates are disabled. It can coexist with the
 official app. APK validation rejects debug builds, missing embedded JavaScript,
 incorrect package/version and missing arm64 native libraries. The release's
 `ANDROID-SIGNING.json` records those checks and the public certificate fingerprint.

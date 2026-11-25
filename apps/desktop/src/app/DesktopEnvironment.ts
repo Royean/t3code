@@ -28,6 +28,7 @@ export interface MakeDesktopEnvironmentInput {
   readonly appPath: string;
   readonly isPackaged: boolean;
   readonly isT3Pro?: boolean;
+  readonly isForkBrand?: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
 }
@@ -176,13 +177,14 @@ const make = Effect.fn("desktop.environment.make")(function* (
     isDevelopment,
     appVersion: input.appVersion,
   });
-  const branding = isT3Pro
-    ? {
-        ...defaultBranding,
-        baseName: DESKTOP_PRO_IDENTITY.productName,
-        displayName: DESKTOP_PRO_IDENTITY.productName,
-      }
-    : defaultBranding;
+  const branding =
+    isT3Pro || input.isForkBrand
+      ? {
+          ...defaultBranding,
+          baseName: DESKTOP_PRO_IDENTITY.productName,
+          displayName: DESKTOP_PRO_IDENTITY.productName,
+        }
+      : defaultBranding;
   const displayName = branding.displayName;
   const stateDir = resolveDesktopStateDir({
     baseDir,

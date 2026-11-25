@@ -1,8 +1,8 @@
 # Self-hosted connection
 
-The optional [account service](../../infra/self-hosted/README.md) lists a fixed set of environments for one account. On mobile, open **Settings → T3 Account → Self-hosted connection**. On web and desktop, open **T3 Account** from the account button at the bottom of the settings sidebar. T3 Pro and mobile use the configured server. Other builds accept a server URL. On web and desktop, use **Import environments** to choose a computer.
+The optional [account service](../../infra/self-hosted/README.md) lists a fixed set of environments for one account. On mobile, open **Settings → T3 Account → Self-hosted connection**. On web and desktop, open **T3 Account** from the account button at the bottom of the settings sidebar. t4code and mobile use the configured server. Other builds accept a server URL. On web and desktop, use **Import environments** to choose a computer.
 
-## T3 Pro preview
+## t4code preview
 
 Build with `T3CODE_SELF_HOSTED_ONLY=1` to use only the self-hosted **T3 Account → T3 Connect**. The default account origin is `https://t3.vivid-dream.online`. Set `T3CODE_SELF_HOSTED_CONNECT_URL` for a separate preview service. Upgrade the account service and the host environment before testing this client.
 

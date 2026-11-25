@@ -120,7 +120,27 @@ function resolveAppVariant(value: string | undefined): AppVariant {
   }
 }
 
-const variant = VARIANT_CONFIG[APP_VARIANT];
+const baseVariant = VARIANT_CONFIG[APP_VARIANT];
+const variant = selfHostedOnly
+  ? {
+      ...baseVariant,
+      appName: "t4code",
+      assets: {
+        ...baseVariant.assets,
+        appIcon: "../../assets/t4code/opaque.png",
+        iosIcon: "../../assets/t4code/app-icon.icon",
+        splashIcon: "../../assets/t4code/icon.png",
+        androidAdaptiveForeground: "../../assets/t4code/foreground.png",
+        androidAdaptiveBackgroundColor: "#000000",
+        androidAdaptiveBackgroundImage: undefined,
+        androidSplashIcon: "../../assets/t4code/splash.png",
+        androidMonochromeIcon: "../../assets/t4code/mono.png",
+        androidNotificationIcon: "../../assets/t4code/notification.png",
+        androidNotificationColor: "#FFFFFF",
+      },
+    }
+  : baseVariant;
+const productName = selfHostedOnly ? "t4code" : "T3 Code";
 // Copied thread links open the app. app.t3.codes/.well-known lists every variant's identifiers.
 const HOSTED_APP_HOST = "app.t3.codes";
 const iosBundleIdentifier = isIosPersonalTeamBuild
@@ -146,7 +166,7 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
       {
         name: "SubscriptionUsage",
         displayName: "Subscription usage",
-        description: "Subscription quotas from your connected T3 Code environments.",
+        description: `Subscription quotas from your connected ${productName} environments.`,
         ios: {
           configuration: {
             title: "Subscription usage",
@@ -196,7 +216,7 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
       {
         name: "AgentActivity",
         displayName: "Agent Activity",
-        description: "Shows the current state of active T3 Code agents.",
+        description: `Shows the current state of active ${productName} agents.`,
         android: null,
         ios: {
           supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
@@ -278,9 +298,8 @@ const config: ExpoConfig = {
       NSAppTransportSecurity: {
         NSAllowsArbitraryLoads: true,
       },
-      NSLocalNetworkUsageDescription:
-        "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
-      NSPhotoLibraryAddUsageDescription: "Allow T3 Code to save images to your photo library.",
+      NSLocalNetworkUsageDescription: `Allow ${productName} to connect to ${productName} servers on your local network or tailnet.`,
+      NSPhotoLibraryAddUsageDescription: `Allow ${productName} to save images to your photo library.`,
       // System picture in picture needs background audio to start and survive outside the app.
       UIBackgroundModes: ["audio"],
       ITSAppUsesNonExemptEncryption: false,
@@ -386,7 +405,7 @@ const config: ExpoConfig = {
     [
       "expo-audio",
       {
-        microphonePermission: "Allow T3 Code to use your microphone for voice input.",
+        microphonePermission: `Allow ${productName} to use your microphone for voice input.`,
         recordAudioAndroid: true,
         enableBackgroundPlayback: false,
         enableBackgroundRecording: false,
@@ -395,7 +414,7 @@ const config: ExpoConfig = {
     [
       "expo-camera",
       {
-        cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        cameraPermission: `Allow ${productName} to access your camera so you can scan pairing QR codes.`,
         microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
@@ -406,7 +425,7 @@ const config: ExpoConfig = {
       {
         photosPermission: false,
         // `false` makes this plugin add RECORD_AUDIO to blockedPermissions, breaking Android dictation.
-        microphonePermission: "Allow T3 Code to use your microphone for voice input.",
+        microphonePermission: `Allow ${productName} to use your microphone for voice input.`,
       },
     ],
     [

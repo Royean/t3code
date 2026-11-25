@@ -2,7 +2,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const FORK_REPOSITORY = "Royean/t3code";
+const FORK_REPOSITORY = "Royean/t4code";
 const ALLOWED_BRANCHES = ["main", "feat/event-orchestration"];
 const SEMVER_TAG =
   /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
@@ -90,7 +90,7 @@ function writeChecksums(directory, version) {
     `t3-${version}-darwin-arm64.tar.gz`,
     `t3-${version}-linux-x64.tar.gz`,
     `t3-${version}-win32-x64.zip`,
-    `t3-${version}-android-arm64.apk`,
+    `t4code-${version}-android-arm64.apk`,
     "ANDROID-SIGNING.json",
     "BUILD-INFO.json",
   ];

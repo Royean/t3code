@@ -31,7 +31,9 @@ function withAssetFiles(config) {
   return withDangerousMod(config, [
     "ios",
     (cfg) => {
-      const source = path.join(cfg.modRequest.projectRoot, "assets", "widget", SVG_NAME);
+      const source = cfg.extra?.selfHostedOnly
+        ? path.resolve(cfg.modRequest.projectRoot, "../../assets/t4code/mark.svg")
+        : path.join(cfg.modRequest.projectRoot, "assets", "widget", SVG_NAME);
       const catalogDir = path.join(cfg.modRequest.platformProjectRoot, TARGET_NAME, CATALOG_NAME);
       const imageSetDir = path.join(catalogDir, IMAGE_SET);
       fs.mkdirSync(imageSetDir, { recursive: true });

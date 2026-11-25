@@ -17,7 +17,7 @@ function patchExpoConfig(source, { version, versionCode }) {
   return source.replace(
     marker,
     [
-      'config.name = "T3 Code Fork";',
+      'config.name = "t4code";',
       'config.scheme = "t3code-fork";',
       `config.version = ${JSON.stringify(version)};`,
       `config.runtimeVersion = ${JSON.stringify(version)};`,

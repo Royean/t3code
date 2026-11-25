@@ -97,9 +97,8 @@ const decodePackagedAppIdentity = Schema.decodeEffect(
 
 const layerDesktopEnvironment = Layer.unwrap(
   Effect.gen(function* () {
-    const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(
-      Effect.flatMap((app) => app.metadata),
-    );
+    const app = yield* ElectronApp.ElectronApp;
+    const metadata = yield* app.metadata;
     const platform = yield* HostProcess.Platform;
     const processArch = yield* HostProcess.Architecture;
     // Read the staged package identity synchronously before Clerk registers its scheme.
@@ -114,6 +113,7 @@ const layerDesktopEnvironment = Layer.unwrap(
       homeDirectory: NodeOS.homedir(),
       platform,
       processArch,
+      isForkBrand: (yield* app.name) === DESKTOP_PRO_IDENTITY.productName,
       isT3Pro: packagedApp?.name === DESKTOP_PRO_IDENTITY.packageName,
       ...metadata,
     });

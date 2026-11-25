@@ -283,6 +283,20 @@ function bootstrapTitlePlugin(): Plugin {
         hostedAppChannel: configuredHostedAppChannel,
         development,
       });
+      if (repoEnv.VITE_T3CODE_SELF_HOSTED_ONLY === "1") {
+        return html
+          .replaceAll("T3 Code", "t4code")
+          .replace(
+            'href="/favicon.ico" sizes="48x48"',
+            'href="/t4code/favicon.ico" sizes="48x48"',
+          )
+          .replaceAll("/apple-touch-icon.png", "/t4code/180.png")
+          .replace("/manifest.webmanifest", "/t4code/manifest.webmanifest")
+          .replace(
+            "<title>t4code</title>",
+            `<title>${formatAppDisplayName({ baseName: "t4code", stageLabel })}</title>`,
+          );
+      }
       const title = formatAppDisplayName({ baseName: "T3 Code", stageLabel });
       return html.replace(/<title>[^<]*<\/title>/, `<title>${title}</title>`);
     },

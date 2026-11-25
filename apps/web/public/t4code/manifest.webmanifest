@@ -1,0 +1,22 @@
+{
+  "id": "/",
+  "name": "t4code",
+  "short_name": "t4code",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#161616",
+  "theme_color": "#161616",
+  "icons": [
+    {
+      "src": "/t4code/192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/t4code/512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

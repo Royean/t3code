@@ -79,7 +79,7 @@ describe("DesktopEnvironment", () => {
       const pro = yield* makeEnvironment({ isPackaged: true, isT3Pro: true });
       const official = yield* makeEnvironment({ isPackaged: true });
 
-      assert.equal(pro.displayName, "T3 Pro");
+      assert.equal(pro.displayName, "t4code");
       assert.equal(pro.stateDir, "/Users/alice/.t3-pro/userdata");
       assert.equal(official.stateDir, "/Users/alice/.t3/userdata");
       assert.equal(

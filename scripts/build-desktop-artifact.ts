@@ -2736,7 +2736,17 @@ export function resolveDesktopWebAssetBrand(version: string): WebAssetBrand {
   return resolveWebAssetBrandForChannel(resolveDesktopUpdateChannel(version));
 }
 
-export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIconAssets {
+export function resolveDesktopBuildIconAssets(
+  version: string,
+  fork = false,
+): DesktopBuildIconAssets {
+  if (fork) {
+    return {
+      macIconPng: "assets/t4code/mac.png",
+      linuxIconPng: "assets/t4code/icon.png",
+      windowsIconIco: "assets/t4code/icon.ico",
+    };
+  }
   if (resolveDesktopUpdateChannel(version) === "nightly") {
     return {
       macIconPng: BRAND_ASSET_PATHS.nightlyMacIconPng,
@@ -2767,7 +2777,8 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
   return `${trimmed.slice(0, versionSeparator)}/${trimmed.slice(versionSeparator + 1)}`;
 }
 
-export function resolveDesktopProductName(version: string): string {
+export function resolveDesktopProductName(version: string, fork = false): string {
+  if (fork) return DESKTOP_PRO_IDENTITY.productName;
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2789,16 +2800,15 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
   macPro = false,
+  fork = macPro,
 ) {
   const isT3Pro = platform === "mac" && macPro;
-  const productName = isT3Pro
-    ? DESKTOP_PRO_IDENTITY.productName
-    : resolveDesktopProductName(version);
+  const productName = resolveDesktopProductName(version, fork);
   const buildConfig: Record<string, unknown> = {
     afterPack: (yield* Path.Path).join(yield* RepoRoot, "scripts/prepare-server-compile-cache.cjs"),
     appId: isT3Pro ? DESKTOP_PRO_IDENTITY.appId : DESKTOP_APP_ID,
     productName,
-    artifactName: `${isT3Pro ? DESKTOP_PRO_IDENTITY.artifactPrefix : "T3-Code"}-\${version}-\${arch}.\${ext}`,
+    artifactName: `${fork ? DESKTOP_PRO_IDENTITY.artifactPrefix : "T3-Code"}-\${version}-\${arch}.\${ext}`,
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
     files: [
       ...DESKTOP_FILE_EXCLUSIONS,
@@ -2944,8 +2954,11 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // electron-updater replaces an installed AppImage in place only when its name has no x.y.z version.
     if (buildConfig.publish) {
       buildConfig.appImage = {
-        artifactName:
-          updateChannel === "nightly" ? "T3-Code-Nightly-${arch}.${ext}" : "T3-Code-${arch}.${ext}",
+        artifactName: fork
+          ? "t4code-${arch}.${ext}"
+          : updateChannel === "nightly"
+            ? "T3-Code-Nightly-${arch}.${ext}"
+            : "T3-Code-${arch}.${ext}",
       };
     }
     buildConfig.deb = {
@@ -3706,7 +3719,9 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
   const macPro =
     options.platform === "mac" &&
     (yield* Config.Boolean("T3CODE_DESKTOP_MAC_PRO").pipe(Config.withDefault(false)));
-  const iconAssets = resolveDesktopBuildIconAssets(appVersion);
+  const fork =
+    macPro || (yield* Config.Boolean("T3CODE_SELF_HOSTED_ONLY").pipe(Config.withDefault(false)));
+  const iconAssets = resolveDesktopBuildIconAssets(appVersion, fork);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
   const stageRoot = yield* mkdir({
@@ -3958,6 +3973,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       bundlesWslRuntime({ platform: options.platform, runtimeArchivePath: options.wslRuntime }),
       options.arch,
       macPro,
+      fork,
     ),
     dependencies: stageDependencies,
     devDependencies: {
@@ -4119,7 +4135,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
   if (options.platform === "win") {
     yield* validateWindowsPackagedPayload({
       stageDistDir,
-      appExecutableName: `${resolveDesktopProductName(appVersion)}.exe`,
+      appExecutableName: `${resolveDesktopProductName(appVersion, fork)}.exe`,
       targetArch: options.arch,
       appVersion,
       expectWslRuntime: bundlesWslRuntime({
