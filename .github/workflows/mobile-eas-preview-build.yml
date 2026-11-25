@@ -64,6 +64,17 @@ jobs:
           hdiutil verify "$dmg"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
           trap 'hdiutil detach "$mount" >/dev/null || true' EXIT
+          if ! codesign --verify --deep --strict "$mount/t4code.app"; then
+            staged="$(mktemp -d "$RUNNER_TEMP/t4code-reseal.XXXXXX")"
+            ditto "$mount" "$staged"
+            hdiutil detach "$mount"
+            xattr -cr "$staged/t4code.app"
+            codesign --force --deep --sign - --timestamp=none "$staged/t4code.app"
+            dmg="$RUNNER_TEMP/t4code-ad-hoc.dmg"
+            hdiutil create -volname "t4code $APP_VERSION Installer" -srcfolder "$staged" -format UDZO "$dmg"
+            hdiutil verify "$dmg"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          fi
           app="$mount/t4code.app"
           info="$app/Contents/Info.plist"
           test -f "$info"
