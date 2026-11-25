@@ -27,7 +27,7 @@ jobs:
         run: |
           git init .
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=4 origin "$CHECKOUT_SHA"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=8 origin "$CHECKOUT_SHA"
           git sparse-checkout set --no-cone '/*' '!/.repos/' '!/apps/mobile/modules/t3-terminal/Vendor/**/*.a'
           git -c submodule.recurse=false checkout --detach FETCH_HEAD
           git merge-base --is-ancestor "$BASE_SHA" HEAD
@@ -47,7 +47,17 @@ jobs:
           cache-read-only: true
       - name: Install Android SDK and NDK
         run: |
-          sdkmanager --install 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+          sdk="$RUNNER_TEMP/android-sdk"
+          archive="$RUNNER_TEMP/android-commandlinetools.zip"
+          mkdir -p "$sdk/cmdline-tools"
+          curl --fail --silent --show-error --location --retry 3             'https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip' -o "$archive"
+          printf '%s  %s\n' 48833c34b761c10cb20bcd16582129395d121b27 "$archive" | sha1sum -c -
+          unzip -q "$archive" -d "$sdk/cmdline-tools"
+          mv "$sdk/cmdline-tools/cmdline-tools" "$sdk/cmdline-tools/latest"
+          manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          (set +o pipefail; yes | "$manager" --sdk_root="$sdk" --licenses >/dev/null)
+          "$manager" --sdk_root="$sdk" --install 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$sdk" "$sdk" >> "$GITHUB_ENV"
       - name: Configure fork application
         run: |
           mkdir -p node_modules/@t3tools
