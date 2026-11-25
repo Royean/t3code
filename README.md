@@ -1,20 +1,18 @@
 <p align="center">
-  <a href="https://t3.codes">
-    <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
+  <a href="https://github.com/Royean/t4code">
+    <img src="./apps/web/public/t4code/192.png" width="80" height="80" alt="t4code logo" />
   </a>
 </p>
 
-<h1 align="center">T3 Code</h1>
+<h1 align="center">t4code</h1>
 
-<p align="center">The open-source control plane for coding agents.</p>
+<p align="center">A personal fork of <a href="https://github.com/pingdotgg/t3code">T3 Code</a> with self-hosted connections and event routing.</p>
 
 <p align="center">
-  <a href="https://t3.codes/download"><strong>Download</strong></a> ·
-  <a href="https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824">iOS</a> ·
-  <a href="https://play.google.com/store/apps/details?id=com.t3tools.t3code">Android</a> ·
-  <a href="https://app.t3.codes">Web</a> ·
+  <a href="https://github.com/Royean/t4code/releases"><strong>Fork releases</strong></a> ·
+  <a href="./docs/operations/fork-release.md">Build the fork</a> ·
   <a href="./docs/README.md">Docs</a> ·
-  <a href="https://discord.gg/jn4EGJjrvv">Discord</a>
+  <a href="https://t3.codes">Upstream project</a>
 </p>
 
 <p align="center">

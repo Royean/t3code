@@ -151,8 +151,8 @@ export function SelfHostedConnectSettings() {
       {state.devices ? (
         <SettingsSection id="self-hosted-devices" title={gt("Devices")}>
           {state.devices.map((device) => {
-            const label = ["T3 Pro", "T4 code", "t4code"].includes(device.label ?? "")
-              ? gt("Desktop session")
+            const label = ["T3 Pro", "T4 code"].includes(device.label ?? "")
+              ? "t4code"
               : (device.label ?? gt("Device"));
             return (
               <SettingsRow

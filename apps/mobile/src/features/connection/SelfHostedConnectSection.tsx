@@ -155,8 +155,8 @@ export function SelfHostedConnectSection({ onConnected }: { readonly onConnected
       {state.devices ? (
         <ListSection title={gt("Devices")}>
           {state.devices.map((device) => {
-            const label = ["T3 Pro", "T4 code", "t4code"].includes(device.label ?? "")
-              ? gt("Desktop session")
+            const label = ["T3 Pro", "T4 code"].includes(device.label ?? "")
+              ? "t4code"
               : (device.label ?? gt("Device"));
             return device.current ? (
               <ListRowLayout key={device.id} label={label} detail={gt("This device")} />
