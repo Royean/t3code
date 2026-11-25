@@ -1,0 +1,111 @@
+name: Build t4code Android 0.1.13
+
+on:
+  push:
+    branches: ["build/android-0.1.13-20261125"]
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BASE_SHA: 149efea67ab34b9d26ddaa790a1c4ac5b29545f6
+      CI: "1"
+      APP_VARIANT: production
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      T3CODE_SELF_HOSTED_ONLY: "1"
+      EXPO_NO_DOTENV: "1"
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - name: Check out t4code source
+        env:
+          CHECKOUT_SHA: ${{ github.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=2 origin "$CHECKOUT_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/' '!/apps/mobile/modules/t3-terminal/Vendor/**/*.a'
+          git -c submodule.recurse=false checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git diff --name-only "$BASE_SHA" HEAD)" = '.github/workflows/android-build-only-20261125.yml'
+      - name: Reclaim runner SDK space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter @t3tools/mobile...
+          save-pnpm-store: "false"
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
+        with:
+          cache-read-only: true
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager --install 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Configure fork application
+        run: |
+          mkdir -p node_modules/@t3tools
+          test -e node_modules/@t3tools/shared || ln -s ../../packages/shared node_modules/@t3tools/shared
+          node --test .github/scripts/fork-android.test.cjs
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { patchExpoConfig } = require('./.github/scripts/fork-android.cjs');
+          const file = 'apps/mobile/app.config.ts';
+          fs.writeFileSync(file, patchExpoConfig(fs.readFileSync(file, 'utf8'), {
+            version: '0.1.13', versionCode: 9,
+          }));
+          NODE
+      - name: Verify Markdown highlighter native assets
+        run: |
+          dependency="apps/mobile/node_modules/react-native-enriched-markdown"
+          vendor="$dependency/cpp/highlight/vendor"
+          if [ ! -s "$vendor/grammars/.stamp" ]; then
+            for attempt in 1 2 3; do
+              node "$dependency/vendor-grammars.mjs" --from-npm --vendor-dir "$vendor" \
+                --manifest "$dependency/cpp/highlight/grammar-versions.json" && break
+            done
+          fi
+          test -s "$vendor/grammars/.stamp"
+      - name: Generate Android native project
+        working-directory: apps/mobile
+        run: vp exec expo prebuild --clean --platform android --no-install
+      - name: Prepare unsigned release
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { disableDebugSigning } = require('./.github/scripts/fork-android.cjs');
+          const file = 'apps/mobile/android/app/build.gradle';
+          fs.writeFileSync(file, disableDebugSigning(fs.readFileSync(file, 'utf8')));
+          NODE
+      - name: Assemble Android ARM64 release
+        working-directory: apps/mobile/android
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --max-workers=2 --console=plain \
+            -PreactNativeArchitectures=arm64-v8a \
+            '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m'
+      - name: Verify and collect build outputs
+        run: |
+          native=apps/mobile/android
+          apk="$native/app/build/outputs/apk/release/app-release-unsigned.apk"
+          mkdir apk-output
+          cp "$apk" apk-output/app-release-unsigned.apk
+          "$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$apk" > apk-output/badging.txt
+          grep -q "^package: name='com.royean.t3code' versionCode='9' versionName='0.1.13'" apk-output/badging.txt
+          grep -q "^application-label:'t4code'$" apk-output/badging.txt
+          tar -C "$native/app/src/main/res" -czf "$GITHUB_WORKSPACE/apk-output/launcher-resources.tar.gz" \
+            mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi mipmap-anydpi-v26
+          printf '%s\n' "$BASE_SHA" > apk-output/source-sha.txt
+          (cd apk-output && sha256sum app-release-unsigned.apk launcher-resources.tar.gz source-sha.txt > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: t4code-0.1.13-unsigned-android-arm64
+          path: apk-output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
