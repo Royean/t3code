@@ -70,10 +70,22 @@ The most common defect in this repo is a change that works on the path you teste
 See [00_development.md](docs/operations/00_development.md) for setup, ports, seeding (`vp run migrate-dev-db`), and [reusable dev auth](docs/operations/00_development.md#reusable-dev-credential). Agent-specific rules:
 
 - **Worktree setup:** Wait while `.t3/setup-running` names a live PID; do not run `vp i` concurrently. If no `.t3/setup-*` marker exists, run `vp i` yourself.
-- **Process lifecycle:** Start dev servers, Metro, and builds from your own shell so they exit with your session—never detach with `systemd-run`, `nohup`, `setsid`, or `tmux` unless asked. Stop background tasks with your harness's own stop (`vp` does not forward SIGTERM to child Vite/server processes).
+- **Process lifecycle:** Start dev servers, Metro, and builds from your own shell—never detach with `systemd-run`, `nohup`, `setsid`, or `tmux` unless asked. Follow [Task resources](#task-resources) for ownership, retention, and stopping the complete process tree.
 - **Sharing (`vp run dev --share`):** Wait for `pairingUrl:` and hand the full URL to the user. Never wire `tailscale serve` by hand, open the URL yourself, or consume the user's one-time pairing link. Mint another with `node apps/server/src/bin.ts pair` if needed.
 - **Test data:** Always copy in (never symlink) and refresh `statev2.sqlite`, not `state.sqlite`. Bring `secrets` / `settings.json` only if the flow under test needs them.
-- **Extra checkouts:** Put `git worktree add` next to this worktree, not in `/tmp`, and remove it when done.
+- **Extra checkouts:** Put `git worktree add` next to this worktree, not in `/tmp`; reclaim it under [Task resources](#task-resources).
+
+## Task resources
+
+- At task start, record the owner, exact paths, terminal sessions or captured PIDs, ports, and cleanup method for temporary directories, test servers, browser contexts/profiles, worktrees, and generated outputs. Update this inventory as you create resources; distinguish borrowed resources from your own.
+- Before removing anything, preserve unique unpublished work, final deliverables, and necessary sanitized evidence outside every directory or repository being removed. Use a retained repository, patch, or bundle for unpublished work, separately save required untracked and ignored files, and verify restoration first. A commit or branch inside a checkout being deleted does not preserve it. Full repository snapshots, complete browser profiles, and every build iteration are not lasting evidence.
+- Before closing anything, identify resources required by user or runtime instructions or by current continuation, including dependencies such as a preview's server, state, and browser context. For each retained resource and dependency, record the owner, reason, and cleanup trigger; keep the dependency chain available.
+- Before reporting success, failure or cancellation, handing off, or waiting for further direction, reclaim disposable task resources. For task-owned resources outside the retained set, close browser contexts/profiles normally and stop complete process trees you started, using captured terminal sessions or PIDs. `vp` does not pass SIGTERM on: signalling only the `vp run dev` PID leaves Vite and the server running. Use your harness's stop for the background task to end the whole tree.
+- Keep only task-created worktrees that the retained needs above actually require. Reclaim extra base, post-merge, and retry checkouts as soon as their step ends.
+- Clean only resources confirmed to belong to this task and no longer in use. Leave borrowed resources, the user's current Chrome, live T3 data, committed assets, and release/rollback versions intact. Follow [the process ownership and live-install rules](#the-three-ways-to-hurt-yourself); never use `git clean -fdx` or forced worktree removal as a cleanup fallback.
+- Report cleanup or task completion only after verifying that disposable processes exited, ports were released, and temporary paths were removed. Check retained resources against the recorded requirements and dependencies.
+- If I/O or permissions block cleanup, record the exact path/PID, attempted actions, owner, and next recovery action. Mark the overall task incomplete until cleanup is verified; recording an owner or handoff does not count as reclamation. Do not launch concurrent deletion retries.
+- End the final report with one line listing resources reclaimed, explicitly retained, or not reclaimed.
 
 ## Verifying
 

@@ -47,15 +47,16 @@ Navigate to the complete startup pairing URL once with
 If the token was consumed or expired, run `node apps/server/src/bin.ts pair`
 for a fresh one. Keep using the same tab.
 
-## Verify and retain
+## Verify and close out
 
 Exercise the affected flow and capture the state that proves it works. Actually
 look at the rendered result and think as a user using the feature—check layout,
 visual hierarchy, alignment, and end-to-end flow—and iterate on anything that
-feels awkward or unfinished until you are satisfied before handing back. Keep
-the server, state, and panel available while the user inspects or iterates.
-An assistant turn ending is not teardown. Stop only processes you started,
-using retained terminal sessions or captured PIDs.
+feels awkward or unfinished until you are satisfied before handing back.
+
+Before closing the server, state, browser context, or panel, apply
+[Task resources](../../../AGENTS.md#task-resources) to identify required retention
+and dependencies, then close out disposable resources under the same rules.
 
 When sharing is requested, start with `vp run dev --share` and give the user
 a fresh complete pairing URL that you have not consumed. Keep other credentials
