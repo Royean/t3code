@@ -44,6 +44,7 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -228,6 +229,7 @@ function acceptanceLayer(
   );
   const external = Layer.mergeAll(
     WorktreeSetupTracker.layer,
+    Layer.mock(TaskFolders.TaskFolders)({ plan: () => Effect.succeed(null) }),
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: () => Effect.void }),
     Layer.mock(CheckpointStore.CheckpointStore)({ isGitRepository: () => Effect.succeed(false) }),

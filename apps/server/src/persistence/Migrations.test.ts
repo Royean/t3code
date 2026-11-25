@@ -78,7 +78,7 @@ describe("runMigrations", () => {
   it.effect("adds fork tables to an upstream database without changing its migration ledger", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 98 });
+      yield* runMigrations({ toMigrationInclusive: newerMigrationId - 1 });
       assert.deepStrictEqual(yield* history, migrationManifest);
       assert.isTrue(yield* hasPendingForkMigrations);
       assert.deepStrictEqual(yield* runMigrations(), []);

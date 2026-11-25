@@ -1589,20 +1589,22 @@ const layerToolExposure = Layer.effect(
           fiber && Context.getOrUndefined(fiber.context, McpInvocationContext.McpInvocationContext);
         const managed =
           caller?.thread !== undefined && events?.ownsThread(caller.thread.threadId) === true;
-        return server.tools
-          .filter(
-            ({ tool }) =>
-              !Object.hasOwn(AlwaysOnPeer.AlwaysOnPeerToolkit.tools, tool.name) &&
-              (managed || !Object.hasOwn(EventOrchestrationToolkit.tools, tool.name)),
-          )
-          // Search finds only what this caller could list; these predicates read the request's scope.
-          .filter(({ annotations }) => {
-            const enabledWhen = Context.getOrUndefined(annotations, McpSchema.EnabledWhen);
-            return (
-              enabledWhen === undefined || enabledWhen({ protocolVersion: "", capabilities: {} })
-            );
-          })
-          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" }));
+        return (
+          server.tools
+            .filter(
+              ({ tool }) =>
+                !Object.hasOwn(AlwaysOnPeer.AlwaysOnPeerToolkit.tools, tool.name) &&
+                (managed || !Object.hasOwn(EventOrchestrationToolkit.tools, tool.name)),
+            )
+            // Search finds only what this caller could list; these predicates read the request's scope.
+            .filter(({ annotations }) => {
+              const enabledWhen = Context.getOrUndefined(annotations, McpSchema.EnabledWhen);
+              return (
+                enabledWhen === undefined || enabledWhen({ protocolVersion: "", capabilities: {} })
+              );
+            })
+            .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" }))
+        );
       },
       () => server.notifications["notifications/tools/list_changed"]({}),
     );

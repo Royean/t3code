@@ -1141,7 +1141,8 @@ function ThreadSettingsMainContent(props: {
   const catalogItems = buildThreadSettingsCatalogItems(session, m, locale);
   const hasActiveCatalogFilter =
     session.favoritesOnly ||
-    session.providerFilter !== null || session.searchQuery.trim().length > 0;
+    session.providerFilter !== null ||
+    session.searchQuery.trim().length > 0;
   const modelItems: ReadonlyArray<ThreadSettingsCatalogItem> =
     catalogItems.length === 0 ? [{ kind: "empty", key: "empty" }] : catalogItems;
   const optionsItem = { kind: "options", key: "options" } as const;

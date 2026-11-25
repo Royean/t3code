@@ -293,10 +293,7 @@ function bootstrapTitlePlugin(): Plugin {
       if (repoEnv.VITE_T3CODE_SELF_HOSTED_ONLY === "1") {
         return html
           .replaceAll("T3 Code", "t4code")
-          .replace(
-            'href="/favicon.ico" sizes="48x48"',
-            'href="/t4code/favicon.ico" sizes="48x48"',
-          )
+          .replace('href="/favicon.ico" sizes="48x48"', 'href="/t4code/favicon.ico" sizes="48x48"')
           .replaceAll("/apple-touch-icon.png", "/t4code/180.png")
           .replace("/manifest.webmanifest", "/t4code/manifest.webmanifest")
           .replace(

@@ -2489,7 +2489,6 @@ export const layerWsRpc = (
           alwaysOn.confirmUnknown(input).pipe(Effect.mapError(alwaysOnStorageError)),
         [WS_METHODS.alwaysOnCancel]: (input) =>
           alwaysOn.cancel(input).pipe(Effect.mapError(alwaysOnStorageError)),
-        [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverProbe]: (_input) =>
           Effect.map(DateTime.now, (now) => ({ serverTime: DateTime.formatIso(now) })),
         [WS_METHODS.serverGetConfig]: (_input) =>
