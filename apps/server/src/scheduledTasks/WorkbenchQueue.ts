@@ -40,6 +40,13 @@ type EntryRow = WorkItems.WorkItemRow & {
   queue_updated_at: string;
 };
 
+// Keep diagnostic causes private; the public schema deliberately contains only a safe reason.
+class WorkbenchQueueFailure extends WorkbenchQueueError {
+  static fromCause(reason: WorkbenchQueueError["reason"], cause: unknown) {
+    return Object.defineProperty(new WorkbenchQueueFailure({ reason }), "cause", { value: cause });
+  }
+}
+
 export class WorkbenchQueue extends Context.Service<
   WorkbenchQueue,
   {
@@ -87,7 +94,7 @@ const make = Effect.gen(function* () {
         return yield* new WorkbenchQueueError({ reason: "invalid_binding" });
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const authorize = Effect.fn("WorkbenchQueue.authorize")(
@@ -97,7 +104,7 @@ const make = Effect.gen(function* () {
       if (!queue) return yield* new WorkbenchQueueError({ reason: "not_found" });
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const entries = Effect.fn("WorkbenchQueue.entries")(function* (
@@ -163,7 +170,7 @@ const make = Effect.gen(function* () {
       } satisfies WorkbenchQueueSnapshot;
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const synchronize = Effect.fn("WorkbenchQueue.synchronize")(function* (queueId: string) {
@@ -179,7 +186,7 @@ const make = Effect.gen(function* () {
   ) {
     const task = yield* items
       .binding(input.taskId)
-      .pipe(Effect.mapError(() => new WorkbenchQueueError({ reason: "invalid_binding" })));
+      .pipe(Effect.mapError((cause) => WorkbenchQueueFailure.fromCause("invalid_binding", cause)));
     if (task.projectId !== input.projectId || task.threadId !== input.dispatcherThreadId)
       return yield* new WorkbenchQueueError({ reason: "invalid_binding" });
     yield* sql
@@ -214,7 +221,7 @@ const make = Effect.gen(function* () {
       )
       .pipe(
         Effect.catchTags({
-          SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+          SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
         }),
       );
     return yield* snapshot(queueId, input);
@@ -233,7 +240,7 @@ const make = Effect.gen(function* () {
       return yield* snapshot(queueId, input);
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const observeEntry = Effect.fn("WorkbenchQueue.observeEntry")(
@@ -372,7 +379,7 @@ const make = Effect.gen(function* () {
     Effect.mapError((error) =>
       error._tag === "WorkbenchQueueError"
         ? error
-        : new WorkbenchQueueError({ reason: "unavailable" }),
+        : WorkbenchQueueFailure.fromCause("unavailable", error),
     ),
   );
   const reconcile = Effect.fn("WorkbenchQueue.reconcile")(
@@ -461,7 +468,7 @@ const make = Effect.gen(function* () {
       );
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const access = Effect.fn("WorkbenchQueue.access")(
@@ -472,7 +479,9 @@ const make = Effect.gen(function* () {
       if (!binding) return yield* new WorkbenchQueueError({ reason: "invalid_binding" });
       const task = yield* items
         .binding(taskId)
-        .pipe(Effect.mapError(() => new WorkbenchQueueError({ reason: "invalid_binding" })));
+        .pipe(
+          Effect.mapError((cause) => WorkbenchQueueFailure.fromCause("invalid_binding", cause)),
+        );
       if (
         task.createdAt !== binding.task_created_at ||
         task.projectId !== binding.project_id ||
@@ -495,7 +504,7 @@ const make = Effect.gen(function* () {
         : { workItemId: selected.work_item_id, claimId: selected.claim_id };
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const dispatched = Effect.fn("WorkbenchQueue.dispatched")(
@@ -503,7 +512,7 @@ const make = Effect.gen(function* () {
       yield* sql`UPDATE workbench_queue_entries SET needs_dispatch=0,blocked_reason=NULL WHERE work_item_id=${workItemId} AND state='occupied'`;
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const remaining = Effect.fn("WorkbenchQueue.remaining")(
@@ -516,7 +525,7 @@ const make = Effect.gen(function* () {
       return count?.remaining ?? 0;
     },
     Effect.catchTags({
-      SqlError: () => Effect.fail(new WorkbenchQueueError({ reason: "unavailable" })),
+      SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   return { bind, get: snapshot, priority, reconcile, access, dispatched, remaining };

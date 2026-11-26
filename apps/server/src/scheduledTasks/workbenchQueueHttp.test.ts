@@ -7,6 +7,7 @@ import {
   EnvironmentAuthenticatedPrincipal,
   EnvironmentHttpApi,
   EnvironmentId,
+  WorkbenchQueueError,
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -27,6 +28,7 @@ class TestApi extends HttpApi.make("environment").add(EnvironmentHttpApi.groups.
 it.effect("requires both scopes before queue reads or control mutations", () =>
   Effect.gen(function* () {
     let calls = 0;
+    let failure: WorkbenchQueueError | undefined;
     const snapshot = {
       trackingId: "epoch",
       queueId: "queue",
@@ -38,8 +40,9 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       items: [],
     };
     const result = () =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         calls++;
+        if (failure !== undefined) return yield* failure;
         return snapshot;
       });
     const web = HttpRouter.toWebHandler(
@@ -131,5 +134,22 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       });
     }
     expect(calls).toBe(4);
+    failure = Object.defineProperty(new WorkbenchQueueError({ reason: "unavailable" }), "cause", {
+      value: new Error("private SQL connection credential"),
+    });
+    for (const request of requests) {
+      const allowed = new Request(request.clone(), {
+        headers: {
+          ...Object.fromEntries(request.headers),
+          "test-scopes": "orchestration:read,orchestration:operate",
+        },
+      });
+      const response = yield* Effect.promise(() => web.handler(allowed));
+      expect(response.status).toBe(409);
+      expect(yield* Effect.promise(() => response.json())).toEqual({
+        _tag: "WorkbenchQueueError",
+        reason: "unavailable",
+      });
+    }
   }),
 );

@@ -44,6 +44,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderTurnId,
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
   type ServerProvider,
@@ -4103,6 +4104,54 @@ it.effect("atomically reserves two workbench slots by project priority across di
       beforePreparation.id,
     );
     assert.equal(harness.createWorktree.mock.calls.length, 1);
+    const acceptedWake = (yield* managedThreads.getThreadRecords(parentB, ["runs"], {
+      runStatuses: ["starting", "running"],
+    })).runs[0]!;
+    const wakeProviderThread = (yield* managedThreads.getThreadRecords(parentB, [
+      "providerThreads",
+    ])).providerThreads.find((thread) => thread.id === acceptedWake.providerThreadId)!;
+    const acceptedAt = yield* DateTime.now;
+    const acceptedTurnId = ProviderTurnId.make("turn:queue-wake-accepted");
+    yield* preparationSink.write({
+      commandId: CommandId.make("seed:queue-wake-provider-accepted"),
+      events: [
+        {
+          id: EventId.make("event:queue-wake-running"),
+          type: "run.updated",
+          threadId: parentB,
+          runId: acceptedWake.id,
+          occurredAt: acceptedAt,
+          payload: { ...acceptedWake, status: "running", startedAt: acceptedAt },
+        },
+        {
+          id: EventId.make("event:queue-wake-provider-active"),
+          type: "provider-thread.updated",
+          threadId: parentB,
+          runId: acceptedWake.id,
+          occurredAt: acceptedAt,
+          payload: { ...wakeProviderThread, status: "active", updatedAt: acceptedAt },
+        },
+        {
+          id: EventId.make("event:queue-wake-provider-accepted"),
+          type: "provider-turn.updated",
+          threadId: parentB,
+          runId: acceptedWake.id,
+          occurredAt: acceptedAt,
+          payload: {
+            id: acceptedTurnId,
+            providerThreadId: acceptedWake.providerThreadId!,
+            nodeId: acceptedWake.rootNodeId!,
+            runAttemptId: acceptedWake.activeAttemptId,
+            nativeTurnRef: null,
+            ordinal: 1,
+            status: "running",
+            startedAt: acceptedAt,
+            completedAt: null,
+          },
+        },
+      ],
+    });
+    assert.isNotNull(acceptedWake.activeAttemptId);
     yield* TestClock.adjust("1 second");
     yield* Effect.gen(function* () {
       const recovery = yield* RuntimeRecovery.ProviderRuntimeRecoveryService;
@@ -4122,6 +4171,17 @@ it.effect("atomically reserves two workbench slots by project priority across di
         runIds: [beforePreparation.id],
       })).runs[0]?.status,
       "starting",
+    );
+    assert.equal(
+      (yield* managedThreads.getThreadRecords(parentB, ["runs"], { runIds: [acceptedWake.id] }))
+        .runs[0]?.status,
+      "cancelled",
+    );
+    assert.equal(
+      (yield* managedThreads.getThreadRecords(parentB, ["providerTurns"])).providerTurns.find(
+        (turn) => turn.id === acceptedTurnId,
+      )?.status,
+      "cancelled",
     );
     yield* queue.reconcile("queue:one", scope);
     assert.deepEqual(

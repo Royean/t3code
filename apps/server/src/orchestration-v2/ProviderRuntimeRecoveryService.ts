@@ -431,7 +431,7 @@ export const make = Effect.gen(function* () {
         const stops = yield* projections.getThreadRecords(projection.thread.id, ["turnItems"], {
           turnItemTypes: ["run_interrupt_request"],
         });
-        for (const run of [...unstartedRuns, ...queuedRuns]) {
+        for (const run of [...runs, ...queuedRuns]) {
           if (
             stops.turnItems.some(
               (item) =>

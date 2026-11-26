@@ -60,7 +60,7 @@ const make = Effect.gen(function* () {
         });
     },
     Effect.catchTags({
-      SqlError: () => Effect.die("Workbench queue authorization is unavailable."),
+      SqlError: (cause) => Effect.die(cause),
     }),
   );
   const preservePreparation = Effect.fn("WorkbenchQueueGuard.preservePreparation")(function* (
