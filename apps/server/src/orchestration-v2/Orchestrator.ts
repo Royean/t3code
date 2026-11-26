@@ -1533,6 +1533,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
+  const sql = yield* SqlClient.SqlClient;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -15654,6 +15655,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // A settle that ended nothing still records its receipt: a replayed Stop
       // effect then finds it instead of settling work that appeared since.
       const { resultSequence, inserted } = yield* Effect.gen(function* () {
+        if (
+          command.type === "thread.stop" &&
+          Option.isNone(yield* commandReceipts.getByCommandId(command.commandId))
+        ) {
+          yield* WorkbenchAttentionGuard.assertAutomaticPauseStop(command).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+        }
         const sequence = yield* eventSink.latestSequence({ threadId: commandThreadId(command) });
         const inserted = yield* commandReceipts.insertIfAbsent({
           commandId: command.commandId,
@@ -15666,6 +15675,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         return { resultSequence: sequence, inserted };
       }).pipe(
+        sql.withTransaction,
         Effect.mapError(
           (cause) =>
             new OrchestratorDispatchError({

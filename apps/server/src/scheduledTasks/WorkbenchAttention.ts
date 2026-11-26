@@ -132,6 +132,23 @@ class Blocked extends Schema.TaggedError<Blocked>()("WorkbenchAttentionBlocked",
 }) {}
 const isBlocked = Schema.is(Blocked);
 const isQueueError = Schema.is(WorkbenchQueueError);
+const isAttentionGuardError = Schema.is(AttentionGuard.WorkbenchAttentionGuardError);
+const pendingRuntimeRequest = (cause: unknown) => {
+  const seen = new Set<object>();
+  let current = cause;
+  for (let depth = 0; depth < 16 && typeof current === "object" && current !== null; depth++) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (
+      isAttentionGuardError(current) &&
+      current.reason === "runtime-request-pending" &&
+      current.runtimeRequestId !== undefined
+    )
+      return current;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+};
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const encodeReason = Schema.encodeEffect(
@@ -298,6 +315,70 @@ const make = Effect.gen(function* () {
     const stamp = yield* now;
     yield* sql`UPDATE workbench_attention_items SET phase='blocked',blocked_reason=${reason},version=version+1,updated_at=${stamp},checkpoint_status=CASE WHEN ${reason}='checkpoint_failed' THEN 'error' ELSE checkpoint_status END WHERE id=${a.id} AND epoch=${a.epoch} AND phase!='resolved'`;
     yield* sql`UPDATE workbench_attention_operations SET state='blocked',updated_at=${stamp} WHERE attention_id=${a.id} AND state='pending'`;
+  });
+  const preservePendingRequest = Effect.fn("WorkbenchAttention.preservePendingRequest")(function* (
+    id: string,
+    rejected: AttentionGuard.WorkbenchAttentionGuardError,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [a] =
+          yield* sql<AttentionRow>`SELECT * FROM workbench_attention_items WHERE id=${id}`;
+        if (
+          !a ||
+          a.observation_only !== 0 ||
+          !["pausing", "blocked"].includes(a.phase) ||
+          a.resume_point_id !== null
+        )
+          return false;
+        const accepted =
+          yield* sql`SELECT 1 FROM orchestration_command_receipts WHERE command_id=${a.pause_command_id} AND status='accepted'`;
+        // A replayed accepted Stop cannot be reinterpreted as a pause that never stopped execution.
+        if (accepted.length) return false;
+        const [request] = yield* sql<{
+          kind: string;
+          status: string;
+          run_id: string | null;
+          payload_json: string;
+        }>`SELECT r.kind,r.status,n.run_id,r.payload_json FROM orchestration_v2_projection_runtime_requests r
+          LEFT JOIN orchestration_v2_projection_nodes n ON n.node_id=r.node_id AND n.thread_id=r.thread_id
+          WHERE r.thread_id=${rejected.threadId} AND r.runtime_request_id=${rejected.runtimeRequestId!}`;
+        if (!request || !["pending", "resolved"].includes(request.status)) return false;
+        const [retained] =
+          yield* sql`UPDATE workbench_work_items SET attention_hold=0,version=version+1,
+          recovery_ref=CASE WHEN recovery_ref=${a.id} THEN NULL ELSE recovery_ref END
+          WHERE id=${a.work_item_id} AND work_thread_id=${rejected.threadId} AND attention_epoch=${a.epoch} AND attention_hold=1
+          AND EXISTS(SELECT 1 FROM workbench_queue_entries e WHERE e.work_item_id=${a.work_item_id} AND e.queue_id=${a.queue_id}
+            AND e.state='occupied' AND e.claim_id=${a.pause_claim_id}) RETURNING id`;
+        if (!retained) return false;
+        const stamp = yield* now;
+        const reason = {
+          code: request.kind === "user_input" ? ("user_input" as const) : ("approval" as const),
+          summary:
+            request.kind === "user_input"
+              ? "The original worker requires user input."
+              : "The original worker requires approval.",
+          requiredAction:
+            "Open the original thread to handle this pending request. The pause was not applied and no ready recovery point was saved.",
+        };
+        yield* sql`UPDATE workbench_attention_items SET observation_only=1,runtime_request_id=${rejected.runtimeRequestId!},
+          phase='blocked',reason_json=${yield* encodeReason(reason)},blocked_reason='pending_runtime_request',checkpoint_status='pending',
+          source_run_id=${request.run_id},version=version+1,updated_at=${stamp} WHERE id=${a.id}`;
+        const operations =
+          yield* sql<Operation>`SELECT * FROM workbench_attention_operations WHERE attention_id=${a.id} AND kind='pause'`;
+        for (const op of operations) {
+          const evidence = yield* encodeJson({
+            pause: yield* decodeJson(op.payload_json),
+            pauseReason: yield* decodeReason(a.reason_json),
+            runtimeRequestId: rejected.runtimeRequestId!,
+            runtimeRequest: yield* decodeJson(request.payload_json),
+          });
+          yield* sql`UPDATE workbench_attention_operations SET state='blocked',payload_json=${evidence},updated_at=${stamp}
+            WHERE queue_id=${a.queue_id} AND client_request_id=${op.client_request_id}`;
+        }
+        return true;
+      }),
+    );
   });
   const discover = Effect.fn("WorkbenchAttention.discover")(function* (
     queueId: string,
@@ -799,6 +880,8 @@ const make = Effect.gen(function* () {
       }).pipe(
         Effect.catch((cause) =>
           Effect.gen(function* () {
+            const request = pendingRuntimeRequest(cause);
+            if (request && (yield* preservePendingRequest(id, request))) return;
             const [a] =
               yield* sql<AttentionRow>`SELECT * FROM workbench_attention_items WHERE id=${id}`;
             if (a) yield* block(a, isBlocked(cause) ? cause.reason : "state_unknown");

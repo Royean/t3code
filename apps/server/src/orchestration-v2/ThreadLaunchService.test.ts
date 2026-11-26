@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
+import * as AttentionGuard from "./WorkbenchAttentionGuard.ts";
 import * as RuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as RunExecution from "./RunExecutionService.ts";
@@ -4817,8 +4818,16 @@ it.live("retains dirty workbench context before releasing a paused reservation",
       Layer.provide(ServerConfig.layerTest(root, { prefix: "attention-git-" })),
     );
     const execution = yield* Effect.provide(RunExecution.RunExecutionServiceV2, dependencies);
+    const attentionGuard = yield* Effect.provide(
+      AttentionGuard.WorkbenchAttentionGuard,
+      dependencies,
+    );
     const reachedQuiescence = yield* Deferred.make<void>(),
       allowCheckpoint = yield* Deferred.make<void>();
+    const reachedStop = yield* Deferred.make<void>(),
+      allowStop = yield* Deferred.make<void>();
+    let gateNextStop = true,
+      gateCheckpoint = false;
     const attentionLayer = WorkbenchAttention.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
@@ -4826,15 +4835,32 @@ it.live("retains dirty workbench context before releasing a paused reservation",
           itemsLayer,
           dependencies,
           checkpointLayer,
+          Layer.succeed(AttentionGuard.WorkbenchAttentionGuard, {
+            ...attentionGuard,
+            awaitAdmissions: (threadId) =>
+              attentionGuard.awaitAdmissions(threadId).pipe(
+                Effect.andThen(
+                  Effect.gen(function* () {
+                    if (!gateNextStop) return;
+                    gateNextStop = false;
+                    yield* Deferred.succeed(reachedStop, undefined);
+                    yield* Deferred.await(allowStop);
+                  }),
+                ),
+              ),
+          }),
           Layer.succeed(RunExecution.RunExecutionServiceV2, {
             ...execution,
             awaitThreadQuiescent: (threadId) =>
-              execution
-                .awaitThreadQuiescent(threadId)
-                .pipe(
-                  Effect.andThen(Deferred.succeed(reachedQuiescence, undefined)),
-                  Effect.andThen(Deferred.await(allowCheckpoint)),
+              execution.awaitThreadQuiescent(threadId).pipe(
+                Effect.andThen(
+                  Effect.gen(function* () {
+                    if (!gateCheckpoint) return;
+                    yield* Deferred.succeed(reachedQuiescence, undefined);
+                    yield* Deferred.await(allowCheckpoint);
+                  }),
                 ),
+              ),
           }),
         ),
       ),
@@ -5060,6 +5086,106 @@ it.live("retains dirty workbench context before releasing a paused reservation",
         )?.phase,
         "resolved",
       );
+      const beforeRace = (yield* queue.get("queue:matter", scope)).items[0]!;
+      const latePauseRequest = {
+        ...scope,
+        clientRequestId: "pause:late-request",
+        expectedWorkItemVersion: beforeRace.workItemVersion,
+        expectedLatestEventSequence: beforeRace.latestEventSequence,
+        reason: {
+          code: "manual" as const,
+          summary: "Pause before a late question arrives",
+          requiredAction: "Keep the original callback answerable",
+        },
+      };
+      const latePause = yield* attention.pause("queue:matter", beforeRace.id, latePauseRequest);
+      yield* Deferred.await(reachedStop);
+      const lateRequest = {
+        ...nativeRequest,
+        id: RuntimeRequestId.make("attention:late-question"),
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:late-question-opened"),
+            type: "runtime-request.updated",
+            threadId: ThreadId.make(started.workThreadId!),
+            runId: activeRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: lateRequest,
+          },
+        ],
+      });
+      yield* Deferred.succeed(allowStop, undefined);
+      yield* attention.reconcile("queue:matter", scope);
+      const lateBlocked = yield* attention.pause("queue:matter", beforeRace.id, latePauseRequest);
+      const afterLate = yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), [
+        "runtimeRequests",
+        "runs",
+        "turnItems",
+      ]);
+      assert.equal(
+        afterLate.runtimeRequests.find((request) => request.id === lateRequest.id)?.status,
+        "pending",
+        "a question arriving after pause admission retains its original live callback",
+      );
+      assert.equal(
+        afterLate.runtimeRequests.find((request) => request.id === lateRequest.id)
+          ?.responseCapability.type,
+        "live",
+      );
+      assert.equal(afterLate.runs.find((run) => run.id === activeRun.id)?.status, "starting");
+      assert.equal(
+        afterLate.turnItems.filter((item) => item.type === "run_interrupt_request").length,
+        0,
+      );
+      assert.equal(lateBlocked.attention.id, latePause.attention.id);
+      assert.equal(lateBlocked.operation.state, "blocked");
+      assert.equal(lateBlocked.attention.phase, "blocked");
+      assert.equal(lateBlocked.attention.blockedReason, "pending_runtime_request");
+      assert.equal(lateBlocked.attention.reason.code, "user_input");
+      assert.equal(lateBlocked.attention.checkpoint.status, "pending");
+      assert.equal(lateBlocked.attention.canRequeue, false);
+      assert.equal(lateBlocked.queue.occupied, 1);
+      const [lateState] = yield* sql<{
+        attention_hold: number;
+        attention_epoch: number;
+        claim_id: string | null;
+        pause_claim_id: string | null;
+      }>`SELECT w.attention_hold,w.attention_epoch,e.claim_id,a.pause_claim_id FROM workbench_work_items w JOIN workbench_queue_entries e ON e.work_item_id=w.id JOIN workbench_attention_items a ON a.work_item_id=w.id WHERE a.id=${lateBlocked.attention.id}`;
+      assert.equal(lateState?.attention_hold, 0);
+      assert.isAbove(lateState!.attention_epoch, 0);
+      assert.equal(lateState?.claim_id, lateState?.pause_claim_id);
+      assert.equal(
+        (yield* sql`SELECT 1 FROM orchestration_command_receipts c JOIN workbench_attention_items a ON a.pause_command_id=c.command_id WHERE a.id=${lateBlocked.attention.id} AND c.status='accepted'`)
+          .length,
+        0,
+      );
+      const reconstructedLate = yield* Effect.gen(function* () {
+        const service = yield* WorkbenchAttention.WorkbenchAttention;
+        return yield* service.pause("queue:matter", beforeRace.id, latePauseRequest);
+      }).pipe(Effect.provide(Layer.fresh(attentionLayer)));
+      assert.equal(reconstructedLate.attention.id, lateBlocked.attention.id);
+      assert.equal(reconstructedLate.operation.state, "blocked");
+      assert.equal(reconstructedLate.queue.occupied, 1);
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:late-question-resolved"),
+            type: "runtime-request.updated",
+            threadId: ThreadId.make(started.workThreadId!),
+            runId: activeRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...lateRequest, status: "resolved", resolvedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      assert.equal(
+        (yield* attention.get("queue:matter", scope)).attentions.find(
+          (a) => a.id === lateBlocked.attention.id,
+        )?.phase,
+        "resolved",
+      );
       const item = (yield* queue.get("queue:matter", scope)).items[0]!;
       const request = {
         ...scope,
@@ -5072,6 +5198,7 @@ it.live("retains dirty workbench context before releasing a paused reservation",
           requiredAction: "Fix the environment and continue",
         },
       };
+      gateCheckpoint = true;
       const pending = yield* attention.pause("queue:matter", item.id, request);
       assert.equal(pending.attention.phase, "pausing");
       assert.equal(pending.queue.occupied, 1);

@@ -103,6 +103,7 @@ import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as DelegatedTaskQuestionReactor from "./DelegatedTaskQuestionReactor.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 const layerPlatformTest = Layer.merge(
   Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
@@ -382,6 +383,175 @@ const layerLegacyImportTest = Layer.mergeAll(
 );
 
 it.layer(layerLegacyImportTest)("Attention admission", (it) => {
+  it.effect(
+    "refuses an automatic Stop when a live request arrives after planning and before commit",
+    () =>
+      Effect.gen(function* () {
+        const engine = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const guard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("attention-atomic-stop");
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("atomic:create"),
+          threadId,
+          projectId: ProjectId.make("atomic-project"),
+          title: "Atomic pause",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* engine.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("atomic:message"),
+          threadId,
+          messageId: MessageId.make("atomic:message"),
+          text: "Work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const projection = yield* engine.getThreadProjection(threadId);
+        const run = projection.runs[0]!;
+        const provider = projection.providerThreads.find((row) => row.id === run.providerThreadId)!;
+        const stop = {
+          type: "thread.stop" as const,
+          commandId: CommandId.make("atomic:private-pause"),
+          threadId,
+        };
+        yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,work_thread_id,attention_hold,attention_epoch,created_at,updated_at)
+      VALUES('atomic-item','atomic-task','2026-11-26','atomic-project','atomic-event','dispatcher','{}',${threadId},1,1,'2026-11-26','2026-11-26')`;
+        yield* sql`INSERT INTO workbench_attention_items(id,queue_id,work_item_id,phase,reason_json,priority,pause_command_id,pause_wake_generation,epoch,created_at,updated_at)
+      VALUES('atomic-attention','queue','atomic-item','pausing','{}',0,${stop.commandId},0,1,'2026-11-26','2026-11-26')`;
+        yield* guard.assertCommand(stop);
+        const now = yield* DateTime.now;
+        const request = {
+          id: RuntimeRequestId.make("atomic-live-request"),
+          nodeId: run.rootNodeId!,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "command" as const,
+          status: "pending" as const,
+          responseCapability: {
+            type: "live" as const,
+            providerSessionId: provider.providerSessionId!,
+          },
+          createdAt: now,
+          resolvedAt: null,
+        };
+        const plannedStop = {
+          commandId: stop.commandId,
+          threadId,
+          commandType: stop.type,
+          acceptedAt: now,
+          events: [
+            {
+              id: EventId.make("atomic:planned-cancel"),
+              type: "runtime-request.updated" as const,
+              threadId,
+              nodeId: request.nodeId,
+              occurredAt: now,
+              payload: { ...request, status: "cancelled" as const, resolvedAt: now },
+            },
+          ],
+          effects: [
+            {
+              id: "atomic:stop-effect",
+              commandId: stop.commandId,
+              threadId,
+              request: {
+                type: "provider-turn.interrupt" as const,
+                providerSessionId: provider.providerSessionId!,
+                providerThreadId: provider.id,
+                providerTurnId: ProviderTurnId.make("atomic-native-turn"),
+              },
+            },
+          ],
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("atomic:late-request"),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId: request.nodeId,
+              occurredAt: now,
+              payload: request,
+            },
+          ],
+        });
+        const failure = yield* sink.commitCommand(plannedStop).pipe(Effect.flip);
+        assert.equal(failure._tag, "EventSinkWriteError");
+        assert.instanceOf(failure.cause, WorkbenchAttentionGuard.WorkbenchAttentionGuardError);
+        assert.equal(
+          (failure.cause as WorkbenchAttentionGuard.WorkbenchAttentionGuardError).reason,
+          "runtime-request-pending",
+        );
+        const [receipt] =
+          yield* sql`SELECT 1 FROM orchestration_v2_command_receipts WHERE command_id=${stop.commandId}`;
+        assert.isUndefined(receipt);
+        const effects =
+          yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox WHERE command_id=${stop.commandId}`;
+        assert.equal(effects.length, 0);
+        assert.equal(
+          (yield* engine.getThreadProjection(threadId)).runtimeRequests.find(
+            (row) => row.id === request.id,
+          )?.status,
+          "pending",
+        );
+        const userStop = yield* engine.dispatch({
+          ...stop,
+          commandId: CommandId.make("atomic:user-stop"),
+        });
+        assert.isFalse(userStop.replayed ?? false);
+        assert.equal(
+          (yield* engine.getThreadProjection(threadId)).runs.find((row) => row.id === run.id)
+            ?.status,
+          "interrupted",
+        );
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("atomic:runtime-withdrawn"),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId: request.nodeId,
+              occurredAt: now,
+              payload: { ...request, status: "cancelled", resolvedAt: now },
+            },
+          ],
+        });
+        yield* engine.dispatch(stop);
+        const second = { ...request, id: RuntimeRequestId.make("atomic-new-request") };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("atomic:after-stop"),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId: second.nodeId,
+              occurredAt: now,
+              payload: second,
+            },
+          ],
+        });
+        const replay = yield* engine.dispatch(stop);
+        assert.isTrue(replay.replayed);
+        assert.isFalse((yield* sink.commitCommand(plannedStop)).committed);
+        assert.equal(
+          (yield* engine.getThreadProjection(threadId)).runtimeRequests.find(
+            (row) => row.id === second.id,
+          )?.status,
+          "pending",
+        );
+      }),
+  );
   it.effect("keeps queued work fenced when an accepted old resume receipt is replayed", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

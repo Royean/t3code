@@ -4,6 +4,7 @@ import {
   OrchestrationV2Command,
   type OrchestrationV2ServerCommand,
   type RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -17,7 +18,14 @@ export class WorkbenchAttentionGuardError extends Schema.TaggedError<WorkbenchAt
   "WorkbenchAttentionGuardError",
   {
     threadId: ThreadId,
-    reason: Schema.Literals(["held", "stale", "resume-mismatch", "unavailable"]),
+    reason: Schema.Literals([
+      "held",
+      "stale",
+      "resume-mismatch",
+      "unavailable",
+      "runtime-request-pending",
+    ]),
+    runtimeRequestId: Schema.optional(RuntimeRequestId),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -95,6 +103,64 @@ type ResumeRow = {
 };
 
 const encodeCommand = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2Command));
+
+/** SQL-only: command commit repeats this check in its write transaction before accepting Stop. */
+export const assertAutomaticPauseStop = Effect.fn(
+  "WorkbenchAttentionGuard.assertAutomaticPauseStop",
+)(
+  function* (command: { readonly commandId: CommandId; readonly threadId: ThreadId }) {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      phase: string;
+      observation_only: number;
+      resume_point_id: string | null;
+      epoch: number;
+      work_thread_id: string | null;
+      attention_hold: number | null;
+      attention_epoch: number | null;
+    }>`SELECT a.phase,a.observation_only,a.resume_point_id,a.epoch,w.work_thread_id,w.attention_hold,w.attention_epoch
+      FROM workbench_attention_items a LEFT JOIN workbench_work_items w ON w.id=a.work_item_id
+      WHERE a.pause_command_id=${command.commandId} LIMIT 2`;
+    if (rows.length === 0) return;
+    const row = rows[0]!;
+    if (
+      rows.length !== 1 ||
+      row.work_thread_id !== command.threadId ||
+      row.observation_only !== 0 ||
+      row.attention_hold !== 1 ||
+      row.attention_epoch !== row.epoch ||
+      row.resume_point_id !== null ||
+      !["pausing", "blocked"].includes(row.phase)
+    ) {
+      return yield* new WorkbenchAttentionGuardError({
+        threadId: command.threadId,
+        reason: "stale",
+      });
+    }
+    const [pending] = yield* sql<{ runtime_request_id: string }>`SELECT runtime_request_id
+      FROM orchestration_v2_projection_runtime_requests WHERE thread_id=${command.threadId} AND status='pending'
+      ORDER BY created_at,runtime_request_id LIMIT 1`;
+    if (pending !== undefined)
+      return yield* new WorkbenchAttentionGuardError({
+        threadId: command.threadId,
+        reason: "runtime-request-pending",
+        runtimeRequestId: RuntimeRequestId.make(pending.runtime_request_id),
+      });
+  },
+  (effect, command) =>
+    effect.pipe(
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new WorkbenchAttentionGuardError({
+              threadId: command.threadId,
+              reason: "unavailable",
+              cause,
+            }),
+          ),
+      }),
+    ),
+);
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -201,6 +267,10 @@ const make = Effect.gen(function* () {
   const assertCommand = Effect.fn("WorkbenchAttentionGuard.assertCommand")(function* (
     command: OrchestrationV2ServerCommand,
   ) {
+    if (command.type === "thread.stop")
+      return yield* assertAutomaticPauseStop(command).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
     const threadId =
       "threadId" in command
         ? command.threadId

@@ -38,6 +38,34 @@ const layer = Layer.mergeAll(Guard.layer, Outbox.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
 
+it.effect.each(["user_input", "command"] as const)(
+  "protects a pending %s request from the private automatic Stop while preserving explicit user Stop",
+  (kind) =>
+    Effect.gen(function* () {
+      yield* seed();
+      const sql = yield* SqlClient.SqlClient;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const stop = {
+        type: "thread.stop" as const,
+        threadId,
+        commandId: CommandId.make("private-pause-command"),
+      };
+      yield* sql`UPDATE workbench_work_items SET attention_hold=1,attention_epoch=1 WHERE id='item'`;
+      yield* sql`INSERT INTO workbench_attention_items(id,queue_id,work_item_id,phase,reason_json,priority,pause_command_id,pause_wake_generation,epoch,created_at,updated_at)
+      VALUES('attention','queue','item','pausing','{}',0,${stop.commandId},0,1,'2026-11-26','2026-11-26')`;
+      yield* guard.assertCommand(stop);
+      yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests(runtime_request_id,thread_id,node_id,kind,status,created_at,payload_json)
+      VALUES('late-pending',${threadId},'node',${kind},'pending','2026-11-26','{}')`;
+      const refusal = yield* guard.assertCommand(stop).pipe(Effect.flip);
+      expect(refusal.reason).toBe("runtime-request-pending");
+      expect(refusal.runtimeRequestId).toBe("late-pending");
+      yield* guard.assertCommand({ ...stop, commandId: CommandId.make("explicit-user-stop") });
+      yield* sql`UPDATE workbench_attention_items SET observation_only=1,phase='blocked' WHERE id='attention'`;
+      yield* sql`UPDATE workbench_work_items SET attention_hold=0 WHERE id='item'`;
+      expect((yield* guard.assertCommand(stop).pipe(Effect.flip)).reason).toBe("stale");
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect(
   "holds ordinary commands and rejects old durable effects after the hold is released",
   () =>

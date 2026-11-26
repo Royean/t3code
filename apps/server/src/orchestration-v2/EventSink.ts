@@ -38,6 +38,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -765,6 +766,14 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          if (
+            input.commandType === "thread.stop" &&
+            Option.isNone(yield* commandReceipts.getByCommandId(input.commandId))
+          ) {
+            yield* WorkbenchAttentionGuard.assertAutomaticPauseStop(input).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+          }
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,
