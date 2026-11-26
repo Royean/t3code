@@ -418,3 +418,58 @@ export class ScheduledTaskError extends Schema.TaggedError<ScheduledTaskError>()
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+
+export const ScheduledTaskExecutionsQuery = Schema.Struct({
+  businessDeliveryId: Schema.optional(Schema.String.check(Schema.isMaxLength(200))),
+  deliveryId: Schema.optional(Schema.String.check(Schema.isMaxLength(500))),
+}).check(
+  Schema.makeFilter(
+    (query) =>
+      (query.businessDeliveryId !== undefined) !== (query.deliveryId !== undefined) ||
+      "Specify exactly one delivery identifier.",
+  ),
+);
+export const ScheduledTaskGetExecutionsInput = Schema.Struct({
+  id: ScheduledTaskId,
+  businessDeliveryId: Schema.optional(Schema.String),
+  deliveryId: Schema.optional(Schema.String),
+});
+export type ScheduledTaskGetExecutionsInput = typeof ScheduledTaskGetExecutionsInput.Type;
+
+export const ScheduledTaskExecutionsResult = Schema.Struct({
+  trackingId: Schema.String,
+  taskId: Schema.String,
+  taskCreatedAt: IsoDateTime,
+  projectId: Schema.String,
+  aliases: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      deliveryId: Schema.String,
+      businessDeliveryId: Schema.NullOr(Schema.String),
+      outcome: Schema.String,
+      executionId: Schema.NullOr(Schema.String),
+      receivedAt: IsoDateTime,
+    }),
+  ),
+  effectiveExecutions: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      ownerDeliveryId: Schema.String,
+      projectId: Schema.NullOr(Schema.String),
+      threadId: Schema.NullOr(Schema.String),
+      messageId: Schema.NullOr(Schema.String),
+      acceptedRunId: Schema.NullOr(Schema.String),
+      runId: Schema.NullOr(Schema.String),
+      state: Schema.Literals([
+        "pending",
+        "dispatching",
+        "dispatched",
+        "failed_to_start",
+        "unknown",
+      ]),
+      updatedAt: IsoDateTime,
+      error: Schema.NullOr(Schema.String),
+    }),
+  ),
+});
+export type ScheduledTaskExecutionsResult = typeof ScheduledTaskExecutionsResult.Type;

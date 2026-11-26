@@ -21,25 +21,31 @@ export const releaseWebhookReplay = Effect.fn("ScheduledTaskService.releaseWebho
   },
 );
 
-const hasReplayKey = Effect.fn(function* (taskId: string, replayKey: string, now: number) {
+const findReplayKey = Effect.fn("ScheduledTaskService.findReplayKey")(function* (
+  taskId: string,
+  replayKey: string,
+  now: number,
+) {
   const sql = yield* SqlClient.SqlClient;
-  return (
-    replayKey !== "" &&
-    (yield* sql`SELECT 1 FROM scheduled_task_webhook_replay_keys
-    WHERE task_id = ${taskId} AND replay_key = ${replayKey} AND expires_at > ${now}`).length > 0
-  );
+  if (replayKey === "") return undefined;
+  return (yield* sql<{
+    delivery_id: string;
+    execution_id: string | null;
+  }>`SELECT delivery_id, execution_id FROM scheduled_task_webhook_replay_keys
+    WHERE task_id = ${taskId} AND replay_key = ${replayKey} AND expires_at > ${now}`)[0];
 });
-const claimReplayKey = Effect.fn(function* (
+const claimReplayKey = Effect.fn("ScheduledTaskService.claimReplayKey")(function* (
   taskId: string,
   replayKey: string,
   deliveryId: string,
   now: number,
+  executionId: string | null,
 ) {
   if (replayKey === "") return;
   const sql = yield* SqlClient.SqlClient;
   yield* sql`DELETE FROM scheduled_task_webhook_replay_keys WHERE expires_at <= ${now}`;
-  yield* sql`INSERT INTO scheduled_task_webhook_replay_keys (task_id, replay_key, delivery_id, expires_at)
-    VALUES (${taskId}, ${replayKey}, ${deliveryId}, ${now + 7 * 24 * 60 * 60 * 1000})`;
+  yield* sql`INSERT INTO scheduled_task_webhook_replay_keys (task_id, replay_key, delivery_id, expires_at, execution_id)
+    VALUES (${taskId}, ${replayKey}, ${deliveryId}, ${now + 7 * 24 * 60 * 60 * 1000}, ${executionId})`;
 });
 
 export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhookDedupe")(function* (
@@ -51,17 +57,28 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
   reserveCoalescedLog: Effect.Effect<boolean>,
   checkCapacity: Effect.Effect<void, "queue_full" | ScheduledTaskError>,
   replaceDeliveryRequest: (ownerId: string) => Effect.Effect<void, ScheduledTaskError>,
+  executionId: string,
+  track: (
+    outcome: string,
+    executionId: string | null,
+    create?: boolean,
+  ) => Effect.Effect<void, ScheduledTaskError>,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const dedupe = task.schedule.type === "webhook" ? task.schedule.dedupe : undefined;
   if (dedupe === undefined) return "run" as const;
   const replayKey = key(dedupe.replayKey, request);
-  if (yield* hasReplayKey(task.id, replayKey, now)) return "duplicate" as const;
+  const replay = yield* findReplayKey(task.id, replayKey, now);
+  if (replay !== undefined) {
+    yield* track("duplicate", replay.execution_id);
+    return "duplicate" as const;
+  }
   const coalesceKey = key(dedupe.coalesceKey, request);
   if (coalesceKey === "") return "run" as const;
   const pending = yield* sql<{
     delivery_id: string;
-  }>`SELECT delivery_id FROM scheduled_task_webhook_pending
+    execution_id: string | null;
+  }>`SELECT delivery_id, execution_id FROM scheduled_task_webhook_pending
     WHERE task_id = ${task.id} AND coalesce_key = ${coalesceKey} AND state = 'pending' AND due_at > ${now}`;
   const logCoalesced = pending.length > 0 ? yield* reserveCoalescedLog : true;
   if (pending.length === 0) {
@@ -69,7 +86,19 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
     yield* reserve;
   }
   // Coalesced requests retain their validation slot, bounding writes without dropping accepted payloads.
-  yield* claimReplayKey(task.id, replayKey, pending[0]?.delivery_id ?? deliveryId, now);
+  const ownerExecutionId = pending.length > 0 ? pending[0]!.execution_id : executionId;
+  yield* track(
+    pending.length > 0 ? "coalesced" : "accepted",
+    ownerExecutionId,
+    pending.length === 0,
+  );
+  yield* claimReplayKey(
+    task.id,
+    replayKey,
+    pending[0]?.delivery_id ?? deliveryId,
+    now,
+    ownerExecutionId,
+  );
   const requestJson = yield* encodePendingRequest({
     method: request.method,
     path: request.path,
@@ -86,8 +115,8 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
   // Expired windows are immutable, even if the scheduler has not dispatched them yet.
   yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'dispatching'
     WHERE task_id = ${task.id} AND coalesce_key = ${coalesceKey} AND state = 'pending' AND due_at <= ${now}`;
-  yield* sql`INSERT INTO scheduled_task_webhook_pending (delivery_id, task_id, coalesce_key, due_at, task_json, request_json, delivery_ids_json)
-    VALUES (${deliveryId}, ${task.id}, ${coalesceKey}, ${now + (dedupe.coalesceWindowSeconds ?? 120) * 1000}, ${yield* encodePendingTask(task)}, ${requestJson}, json_array(${deliveryId}))`;
+  yield* sql`INSERT INTO scheduled_task_webhook_pending (delivery_id, task_id, coalesce_key, due_at, task_json, request_json, delivery_ids_json, execution_id)
+    VALUES (${deliveryId}, ${task.id}, ${coalesceKey}, ${now + (dedupe.coalesceWindowSeconds ?? 120) * 1000}, ${yield* encodePendingTask(task)}, ${requestJson}, json_array(${deliveryId}), ${executionId})`;
   return "pending" as const;
 });
 
@@ -99,14 +128,25 @@ export const acceptImmediateWebhookDedupe = Effect.fn(
   deliveryId: string,
   now: number,
   reserve: Effect.Effect<void, "first_rejected" | "rejected" | "queue_full" | ScheduledTaskError>,
+  executionId: string,
+  track: (
+    outcome: string,
+    executionId: string | null,
+    create?: boolean,
+  ) => Effect.Effect<void, ScheduledTaskError>,
 ) {
   const replayKey = key(
     task.schedule.type === "webhook" ? task.schedule.dedupe?.replayKey : undefined,
     request,
   );
-  if (yield* hasReplayKey(task.id, replayKey, now)) return "duplicate" as const;
+  const replay = yield* findReplayKey(task.id, replayKey, now);
+  if (replay !== undefined) {
+    yield* track("duplicate", replay.execution_id);
+    return "duplicate" as const;
+  }
   yield* reserve;
-  yield* claimReplayKey(task.id, replayKey, deliveryId, now);
+  yield* track("accepted", executionId, true);
+  yield* claimReplayKey(task.id, replayKey, deliveryId, now, executionId);
   return "run" as const;
 });
 

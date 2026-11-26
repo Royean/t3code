@@ -57,6 +57,7 @@ describe("runMigrations", () => {
           { migration_id: 1, name: "EventOrchestration" },
           { migration_id: 2, name: "AlwaysOn" },
           { migration_id: 3, name: "AlwaysOnEventRouting" },
+          { migration_id: 4, name: "ScheduledTaskExecutions" },
         ]);
         const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
         assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
@@ -89,6 +90,7 @@ describe("runMigrations", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations();
+      const tracking = yield* sql`SELECT tracking_id FROM scheduled_task_execution_metadata`;
       yield* sql`UPDATE event_orchestration_registry SET snapshot_json = '{"kept":true}'
         WHERE id = 1`;
       yield* sql`INSERT INTO event_orchestration_registry (id, snapshot_json)
@@ -113,6 +115,10 @@ describe("runMigrations", () => {
       }
       assert.isTrue(yield* hasPendingForkMigrations);
       assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT tracking_id FROM scheduled_task_execution_metadata`,
+        tracking,
+      );
       assert.deepStrictEqual(yield* sql`SELECT snapshot_json FROM event_orchestration_registry`, [
         { snapshot_json: '{"kept":true}' },
       ]);
@@ -122,6 +128,7 @@ describe("runMigrations", () => {
           { migration_id: 1, name: "EventOrchestration" },
           { migration_id: 2, name: "AlwaysOn" },
           { migration_id: 3, name: "AlwaysOnEventRouting" },
+          { migration_id: 4, name: "ScheduledTaskExecutions" },
         ],
       );
       assert.deepStrictEqual(

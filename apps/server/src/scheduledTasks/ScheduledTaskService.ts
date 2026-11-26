@@ -1,4 +1,6 @@
 import {
+  type ScheduledTaskGetExecutionsInput,
+  type ScheduledTaskExecutionsResult,
   CommandId,
   MessageId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -49,6 +51,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as ExecutionLedger from "./executionLedger.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
@@ -82,6 +86,9 @@ import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerificatio
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
 const isOrchestratorDispatchError = Schema.is(OrchestratorDispatchError);
+const isProviderInstanceDisabled = Schema.is(
+  ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
+);
 const PROMPT_TOO_LONG = "The filled-in prompt is too long.";
 const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DEDUPE_DELIVERY_RETENTION = 20;
@@ -292,6 +299,9 @@ export class ScheduledTaskService extends Context.Service<
     readonly getWebhookDelivery: (
       input: ScheduledTaskGetWebhookDeliveryInput,
     ) => Effect.Effect<ScheduledTaskGetWebhookDeliveryResult, ScheduledTaskError>;
+    readonly getExecutions: (
+      input: ScheduledTaskGetExecutionsInput,
+    ) => Effect.Effect<ScheduledTaskExecutionsResult, ScheduledTaskError>;
     /** Verifies, logs and dispatches; returns after logging while the run continues in the background. */
     readonly triggerWebhook: (
       request: WebhookTriggerRequest,
@@ -479,6 +489,7 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const random = yield* SecureRandom.SecureRandom;
     const digest = yield* Digest.Digest;
     const mac = yield* Mac.Mac;
@@ -942,6 +953,47 @@ export const layer = Layer.effect(
       if (updated.length > 0) yield* notifyChanged;
     });
 
+    const executionForDelivery = Effect.fn("ScheduledTaskService.executionForDelivery")(
+      function* (task: ScheduledTask, deliveryId: string) {
+        return (yield* sql<ExecutionLedger.ExecutionRow>`SELECT * FROM scheduled_task_executions
+        WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND owner_delivery_id = ${deliveryId} ORDER BY rowid DESC LIMIT 1`)[0];
+      },
+      (effect) => effect.pipe(Effect.mapError(ExecutionLedger.ledgerError)),
+    );
+
+    const observeExecution = Effect.fn("ScheduledTaskService.observeExecution")(
+      function* (row: ExecutionLedger.ExecutionRow) {
+        if (row.state === "failed_to_start" || row.command_id === null || row.message_id === null)
+          return row.state;
+        const observed = yield* Effect.gen(function* () {
+          const receipt = yield* receipts.getByCommandId(CommandId.make(row.command_id!));
+          if (Option.isSome(receipt) && receipt.value.status === "rejected")
+            return "failed_to_start" as const;
+          const threadId =
+            row.thread_id ?? (Option.isSome(receipt) ? receipt.value.threadId : null);
+          if (threadId === null) return "unknown" as const;
+          const shell = yield* threadManagement.getThreadShell(ThreadId.make(threadId));
+          if (shell === null) return "unknown" as const;
+          const projection = yield* threadManagement.getProjectThreadRecords(
+            { projectId: shell.projectId, threadId: shell.id },
+            ["messages", "runs"],
+            { messageIds: [MessageId.make(row.message_id!)] },
+          );
+          return (yield* ExecutionLedger.captureProjection(
+            row,
+            projection,
+            iso(yield* localNow),
+          ).pipe(Effect.provideService(SqlClient.SqlClient, sql)))
+            ? ("dispatched" as const)
+            : ("unknown" as const);
+        }).pipe(Effect.catchCause(() => Effect.succeed("unknown" as const)));
+        if (observed !== "dispatched")
+          yield* sql`UPDATE scheduled_task_executions SET state = ${observed}, error = ${observed === "failed_to_start" ? "The command was rejected." : "Execution acceptance could not be verified."}, updated_at = ${iso(yield* localNow)} WHERE id = ${row.id}`;
+        return observed;
+      },
+      (effect) => effect.pipe(Effect.mapError(ExecutionLedger.ledgerError)),
+    );
+
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
       trigger: "scheduled" | "manual" | "webhook",
@@ -1039,10 +1091,36 @@ export const layer = Layer.effect(
           webhook === undefined
             ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
             : `${active.id}:webhook:${webhook.deliveryId}`;
-        const commandId = CommandId.make(`scheduled-task:${fireKey}`);
-        const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
+        const tracked =
+          webhook === undefined ? undefined : yield* executionForDelivery(task, webhook.deliveryId);
+        const commandId = CommandId.make(
+          tracked?.command_id ??
+            `scheduled-task:${fireKey}${tracked === undefined ? "" : `:${tracked.id}`}`,
+        );
+        const messageId = MessageId.make(
+          tracked?.message_id ??
+            `scheduled-task-message:${fireKey}${tracked === undefined ? "" : `:${tracked.id}`}`,
+        );
         const prompt = webhook?.prompt ?? active.prompt;
         const threadMode = scheduledTaskThreadMode(active);
+        if (tracked !== undefined)
+          yield* sql`UPDATE scheduled_task_executions SET command_id = ${commandId}, message_id = ${messageId},
+          thread_id = COALESCE(thread_id, ${active.threadId}), state = 'dispatching', updated_at = ${startedAtIso} WHERE id = ${tracked.id}`.pipe(
+            Effect.mapError(ExecutionLedger.ledgerError),
+          );
+        const capture = (
+          projection: Pick<
+            import("@t3tools/contracts").OrchestrationV2ThreadProjection,
+            "thread" | "messages" | "runs"
+          >,
+        ) =>
+          tracked === undefined
+            ? Effect.void
+            : ExecutionLedger.captureProjection(
+                { ...tracked, command_id: commandId, message_id: messageId },
+                projection,
+                startedAtIso,
+              ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
 
         // A bound thread can move to another project (No project to a project) while
         // this fires. Follow it; one move needs at most two retries. Same ids replay safely.
@@ -1104,6 +1182,11 @@ export const layer = Layer.effect(
                     creationSource: active.creationSource,
                   })
                   .pipe(
+                    Effect.tap((launched) =>
+                      launched.projection === undefined
+                        ? Effect.void
+                        : capture(launched.projection),
+                    ),
                     Effect.map((launched) => launched.threadId),
                     Effect.tap((threadId) =>
                       threadMode === "new_thread" ? Effect.void : bindThread(active, threadId),
@@ -1114,12 +1197,33 @@ export const layer = Layer.effect(
                 // The stored selection only seeds fresh threads. A bound run
                 // follows the thread's current provider, so it passes none.
                 sendBound(ThreadId.make(active.threadId), active.projectId, 2).pipe(
+                  Effect.tap((sent) => capture(sent.projection)),
                   Effect.as(ThreadId.make(active.threadId)),
                 ),
               );
 
         const runSucceeded = result._tag === "Success";
-        if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
+        if (webhook !== undefined) {
+          if (runSucceeded) yield* Ref.set(webhook.dispatched, true);
+          else if (tracked !== undefined) {
+            const failure = Cause.squash<unknown>(result.cause);
+            const refused = isProviderInstanceDisabled(failure);
+            const state = refused
+              ? "failed_to_start"
+              : yield* observeExecution({
+                  ...tracked,
+                  command_id: commandId,
+                  message_id: messageId,
+                  thread_id: active.threadId,
+                });
+            if (refused)
+              yield* sql`UPDATE scheduled_task_executions SET state = 'failed_to_start', error = 'The provider instance is disabled.', updated_at = ${startedAtIso} WHERE id = ${tracked.id}`.pipe(
+                Effect.mapError(ExecutionLedger.ledgerError),
+              );
+            // An uncertain command keeps its replay claim; recovery only observes its receipt.
+            if (state !== "failed_to_start") yield* Ref.set(webhook.dispatched, true);
+          }
+        }
         const completedAt = yield* localNow;
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
         const lastRunError = runSucceeded ? null : dispatchErrorMessage(result.cause);
@@ -1799,6 +1903,74 @@ export const layer = Layer.effect(
         ),
       );
 
+    const getExecutions: ScheduledTaskService["Service"]["getExecutions"] = Effect.fn(
+      "ScheduledTaskService.getExecutions",
+    )(
+      function* (input) {
+        if ((input.businessDeliveryId !== undefined) === (input.deliveryId !== undefined))
+          return yield* taskError("Specify exactly one delivery identifier.");
+        const task = yield* findTask(input.id);
+        if (task === null)
+          return yield* taskError("Schedule task not found.", { taskId: input.id });
+        const [metadata] = yield* sql<{
+          tracking_id: string;
+        }>`SELECT tracking_id FROM scheduled_task_execution_metadata`;
+        if (metadata === undefined) return yield* taskError("Execution tracking is unavailable.");
+        const aliases = yield* sql<{
+          attempt_id: string;
+          delivery_id: string;
+          business_delivery_id: string | null;
+          outcome: string;
+          execution_id: string | null;
+          received_at: string;
+        }>`SELECT * FROM scheduled_task_execution_aliases WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt}
+        AND ${input.businessDeliveryId !== undefined ? sql`business_delivery_id = ${input.businessDeliveryId}` : sql`delivery_id = ${input.deliveryId}`}
+        ORDER BY received_at, rowid`;
+        const selected = aliases.some((alias) => alias.execution_id !== null)
+          ? yield* sql<ExecutionLedger.ExecutionRow>`SELECT * FROM scheduled_task_executions
+          WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt}
+          AND id IN ${sql.in([...new Set(aliases.flatMap((alias) => (alias.execution_id === null ? [] : [alias.execution_id])))])}`
+          : [];
+        yield* Effect.forEach(selected, (row) => observeExecution(row));
+        const executions =
+          selected.length === 0
+            ? []
+            : yield* sql<ExecutionLedger.ExecutionRow>`SELECT * FROM scheduled_task_executions WHERE id IN ${sql.in(selected.map((row) => row.id))}`;
+        return {
+          trackingId: metadata.tracking_id,
+          taskId: task.id,
+          taskCreatedAt: task.createdAt,
+          projectId: task.projectId,
+          aliases: aliases.map((row) => ({
+            id: row.attempt_id,
+            deliveryId: row.delivery_id,
+            businessDeliveryId: row.business_delivery_id,
+            outcome: row.outcome,
+            executionId: row.execution_id,
+            receivedAt: row.received_at,
+          })),
+          effectiveExecutions: executions.map((row) => ({
+            id: row.id,
+            ownerDeliveryId: row.owner_delivery_id,
+            projectId: row.project_id,
+            threadId: row.thread_id,
+            messageId: row.message_id,
+            acceptedRunId: row.accepted_run_id,
+            runId: row.run_id,
+            state: row.state,
+            updatedAt: row.updated_at,
+            error: row.error,
+          })),
+        };
+      },
+      (effect) =>
+        effect.pipe(
+          Effect.mapError((cause) =>
+            isScheduledTaskError(cause) ? cause : ExecutionLedger.ledgerError(cause),
+          ),
+        ),
+    );
+
     const getWebhookDelivery: ScheduledTaskService["Service"]["getWebhookDelivery"] = Effect.fn(
       "ScheduledTaskService.getWebhookDelivery",
     )(function* (input) {
@@ -2020,6 +2192,14 @@ export const layer = Layer.effect(
 
     const releaseFailedDelivery = Effect.fn("ScheduledTaskService.releaseFailedDelivery")(
       function* (deliveryId: string) {
+        const [execution] =
+          yield* sql<ExecutionLedger.ExecutionRow>`SELECT * FROM scheduled_task_executions WHERE owner_delivery_id = ${deliveryId} ORDER BY rowid DESC LIMIT 1`;
+        if (
+          execution !== undefined &&
+          ["dispatching", "dispatched", "unknown"].includes(execution.state)
+        )
+          return;
+        yield* sql`UPDATE scheduled_task_executions SET state = 'failed_to_start', error = 'The delivery did not start.', updated_at = ${iso(yield* localNow)} WHERE id = ${execution?.id ?? null} AND state = 'pending'`;
         yield* releaseReplay(deliveryId);
         yield* sql`DELETE FROM scheduled_task_webhook_relay_deliveries WHERE relay_delivery_id IN (
           SELECT substr(value, ${"delivery:relay:".length + 1}) FROM scheduled_task_webhook_pending, json_each(delivery_ids_json)
@@ -2049,7 +2229,13 @@ export const layer = Layer.effect(
           dispatchFailed
             ? runOutcome("failed").pipe(
                 Effect.andThen(markDeliveryFailed(deliveryId, "The run failed to start.")),
-                Effect.andThen(releaseFailedDelivery(deliveryId)),
+                Effect.andThen(
+                  Ref.get(dispatched).pipe(
+                    Effect.flatMap((started) =>
+                      started ? Effect.void : releaseFailedDelivery(deliveryId),
+                    ),
+                  ),
+                ),
               )
             : runOutcome("started"),
         ),
@@ -2191,6 +2377,19 @@ export const layer = Layer.effect(
               )}`
           : `delivery:relay:${request.relayDeliveryId}`,
       );
+      const attemptId = yield* random.uuidV4().pipe(Effect.mapError(ExecutionLedger.ledgerError));
+      const executionId = `execution:${attemptId}`;
+      const track = (outcome: string, ownerExecutionId: string | null = null, create = false) =>
+        ExecutionLedger.recordAlias({
+          task,
+          attemptId,
+          deliveryId,
+          businessDeliveryId: ExecutionLedger.businessDeliveryId(task, request),
+          outcome,
+          executionId: ownerExecutionId,
+          receivedAt: iso(receivedAt),
+          create,
+        }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
       // Claimed in its own table, kept longer than the relay holds a request,
       // because the delivery log is trimmed. A rate-limited delivery stays
       // held on the relay, so it must give up its claim or the next pass
@@ -2222,6 +2421,13 @@ export const layer = Layer.effect(
               ),
             );
             if (claimed.length === 0) {
+              const [owner] = yield* sql<{
+                execution_id: string | null;
+              }>`SELECT execution_id FROM scheduled_task_execution_aliases
+                WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND delivery_id = ${deliveryId} ORDER BY rowid DESC LIMIT 1`.pipe(
+                Effect.mapError(ExecutionLedger.ledgerError),
+              );
+              yield* track("duplicate", owner?.execution_id ?? null);
               yield* observe("duplicate");
               return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
             }
@@ -2309,6 +2515,7 @@ export const layer = Layer.effect(
 
           const failedFilter = findFailedWebhookFilter(schedule.filters ?? [], request);
           if (failedFilter !== null) {
+            yield* track("filtered");
             if (yield* takeFilteredLogSlot(task.id, DateTime.toEpochMillis(now))) {
               yield* log("filtered", {
                 signatureVerified: signature !== null,
@@ -2380,6 +2587,8 @@ export const layer = Layer.effect(
                       takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)),
                       checkCapacity,
                       (ownerId) => replaceDeliveryRequest(ownerId, request),
+                      executionId,
+                      track,
                     ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
                     if (
                       outcome === "pending" ||
@@ -2429,6 +2638,7 @@ export const layer = Layer.effect(
               error: PROMPT_TOO_LONG,
             });
             yield* releaseReplay(deliveryId);
+            yield* track("prompt_too_long");
             yield* observe("prompt_too_long");
             return yield* releaseClaim({
               _tag: "accepted" as const,
@@ -2468,6 +2678,8 @@ export const layer = Layer.effect(
                 deliveryId,
                 DateTime.toEpochMillis(now),
                 reserveImmediate,
+                executionId,
+                track,
               ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
               if (outcome === "duplicate") {
                 if (yield* takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)))
@@ -2637,6 +2849,15 @@ export const layer = Layer.effect(
         { discard: true },
       );
     });
+    yield* Effect.gen(function* () {
+      const unresolved =
+        yield* sql<ExecutionLedger.ExecutionRow>`SELECT * FROM scheduled_task_executions WHERE state IN ('dispatching', 'unknown')`;
+      yield* Effect.forEach(unresolved, (row) => observeExecution(row), { discard: true });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not recover scheduled execution tracking", { cause }),
+      ),
+    );
     yield* scheduler.register("webhook-coalescing", dispatchPending());
 
     return ScheduledTaskService.of({
@@ -2651,7 +2872,8 @@ export const layer = Layer.effect(
       rotateWebhookToken,
       listWebhookDeliveries,
       getWebhookDelivery,
+      getExecutions,
       triggerWebhook,
     });
   }),
-);
+).pipe(Layer.provide(CommandReceiptStore.layer));

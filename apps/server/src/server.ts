@@ -161,6 +161,7 @@ import * as AuthHttp from "./auth/http.ts";
 import * as ReplayMarkers from "./auth/replayMarkers.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as CodexManagedTokenBroker from "./provider/CodexManagedTokenBroker.ts";
+import * as ScheduledTaskExecutionsHttp from "./scheduledTasks/executionsHttp.ts";
 import * as WebhookRoute from "./scheduledTasks/webhookRoute.ts";
 import * as AlwaysOnRouting from "./alwaysOn/AlwaysOnRouting.ts";
 import * as AlwaysOnRoutingHttp from "./alwaysOn/routingHttp.ts";
@@ -866,6 +867,7 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(WebhookRoute.layer.pipe(Layer.provide(RelayDeliveryProof.layer))),
       Layer.provide(AlwaysOnRoutingHttp.layer),
       Layer.provide(EventOrchestrationHttp.layer),
+      Layer.provide(ScheduledTaskExecutionsHttp.layer),
       Layer.provide(AuthHttp.layerAuthenticatedAuth),
     ),
     ServerHttp.layerOtlpTracesProxyRoute,

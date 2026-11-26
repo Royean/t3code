@@ -192,6 +192,7 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
     runNow: () => Effect.die("ScheduledTaskService.runNow is unused in this test"),
     rotateWebhookToken: () => Effect.die("unused in this test"),
     listWebhookDeliveries: () => Effect.die("unused in this test"),
+    getExecutions: () => Effect.die("unused"),
     getWebhookDelivery: () => Effect.die("unused in this test"),
     triggerWebhook: () => Effect.die("unused in this test"),
   }),

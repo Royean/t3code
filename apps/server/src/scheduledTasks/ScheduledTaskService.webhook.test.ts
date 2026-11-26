@@ -5,6 +5,8 @@ import * as NodePlatformCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import {
   type ManagedPolicyDocument,
+  ThreadId,
+  OrchestrationV2ThreadProjection,
   ScheduledTaskUpsertInput,
   ScheduledTaskWebhookDeliveryId,
   SecretRequestError,
@@ -23,6 +25,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 
+import { threadShellFromProjection } from "../orchestration-v2/ProjectionStore.ts";
+import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -34,6 +38,7 @@ import * as ScheduledTaskService from "./ScheduledTaskService.ts";
 import { renderWebhookPrompt } from "./webhookTemplate.ts";
 
 const decodeUpsertInput = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
+const decodeThreadProjection = Schema.decodeUnknownSync(OrchestrationV2ThreadProjection);
 
 it.effect(
   "preserves omitted dedupe settings, releases duplicate claims, and retains coalesced claims",
@@ -95,6 +100,376 @@ it.effect(
         );
       }),
     ),
+);
+
+it.effect("tracks filtered business deliveries independently of sampled logs", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: {
+            type: "webhook",
+            dedupe: { replayKey: "{{ body.deliveryId }}" },
+            filters: [{ path: "body.kind", op: "equals", value: "wanted" }],
+          },
+        }),
+      );
+      const bodyText = JSON.stringify({ deliveryId: "business-filtered", kind: "other" });
+      for (let i = 0; i < 12; i++) {
+        yield* service.triggerWebhook(
+          requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) }),
+        );
+      }
+      const result = yield* service.getExecutions({
+        id: task.id,
+        businessDeliveryId: "business-filtered",
+      });
+      assert.equal(result.aliases.length, 12);
+      assert.isTrue(
+        result.aliases.every((alias) => alias.outcome === "filtered" && alias.executionId === null),
+      );
+      assert.deepEqual(result.effectiveExecutions, []);
+      assert.isNotEmpty(result.trackingId);
+    }),
+  ),
+);
+
+it.effect("keeps every coalesced and replayed business alias independently of sampled logs", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: {
+            type: "webhook",
+            dedupe: {
+              replayKey: "{{body.deliveryId}}",
+              coalesceKey: "{{body.group}}",
+              coalesceWindowSeconds: 10,
+            },
+          },
+        }),
+      );
+      const trigger = (id: string, relayDeliveryId?: string) => {
+        const bodyText = JSON.stringify({ deliveryId: id, group: "one" });
+        return service.triggerWebhook(
+          requestFor(task, {
+            bodyText,
+            body: new TextEncoder().encode(bodyText),
+            ...(relayDeliveryId ? { relayDeliveryId } : {}),
+          }),
+        );
+      };
+      const first = yield* trigger("one");
+      const firstQuery = yield* service.getExecutions({ id: task.id, businessDeliveryId: "one" });
+      assert.equal(firstQuery.effectiveExecutions.length, 1);
+      assert.equal(firstQuery.effectiveExecutions[0]!.state, "pending");
+      const executionId = firstQuery.effectiveExecutions[0]!.id;
+      for (let i = 0; i < 25; i++) yield* trigger("one");
+      const other = yield* trigger("two", "same-ack");
+      yield* trigger("two", "same-ack");
+      const repeated = yield* service.getExecutions({ id: task.id, businessDeliveryId: "one" });
+      assert.equal(repeated.aliases.length, 26);
+      assert.isTrue(repeated.aliases.every((alias) => alias.executionId === executionId));
+      const coalesced = yield* service.getExecutions({ id: task.id, businessDeliveryId: "two" });
+      assert.equal(coalesced.aliases.length, 2);
+      assert.isTrue(coalesced.aliases.every((alias) => alias.executionId === executionId));
+      assert.equal(coalesced.effectiveExecutions[0]!.id, executionId);
+      assert.isTrue(first._tag === "accepted" && other._tag === "accepted");
+      if (first._tag === "accepted") {
+        const native = yield* service.getExecutions({ id: task.id, deliveryId: first.deliveryId });
+        assert.equal(native.aliases.length, 1);
+      }
+    }),
+  ),
+);
+
+it.effect("captures the formal message and run before task completion and replays to it", () =>
+  withService(
+    ({ service }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+          }),
+        );
+        const bodyText = '{"deliveryId":"formal"}';
+        const request = requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) });
+        yield* waitForSpan(
+          service.triggerWebhook(request),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        yield* service.triggerWebhook(request);
+        const result = yield* service.getExecutions({ id: task.id, businessDeliveryId: "formal" });
+        assert.equal(result.aliases.length, 2);
+        assert.equal(result.effectiveExecutions.length, 1);
+        assert.equal(result.effectiveExecutions[0]!.state, "dispatched");
+        assert.equal(result.effectiveExecutions[0]!.threadId, "thread-1");
+        assert.equal(result.effectiveExecutions[0]!.acceptedRunId, "run-formal");
+        assert.equal(result.effectiveExecutions[0]!.runId, "run-formal");
+        assert.isNotNull(result.effectiveExecutions[0]!.messageId);
+      }),
+    { formalLaunch: { runId: "run-formal" } },
+  ),
+);
+
+it.effect("updates the effective run after a queued message is promoted to steer", () => {
+  const formalLaunch = { runId: "run-queued" };
+  return withService(
+    ({ service }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(yield* webhookTaskInput());
+        const ack = yield* waitForSpan(
+          service.triggerWebhook(requestFor(task)),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        assert.equal(ack._tag, "accepted");
+        if (ack._tag !== "accepted") return;
+        const first = yield* service.getExecutions({ id: task.id, deliveryId: ack.deliveryId });
+        assert.equal(first.effectiveExecutions[0]!.acceptedRunId, "run-queued");
+        formalLaunch.runId = "run-active";
+        const promoted = yield* service.getExecutions({ id: task.id, deliveryId: ack.deliveryId });
+        assert.equal(promoted.effectiveExecutions[0]!.acceptedRunId, "run-queued");
+        assert.equal(promoted.effectiveExecutions[0]!.runId, "run-active");
+      }),
+    { formalLaunch },
+  );
+});
+
+it.effect("recovers a committed command when launch loses its projection response", () =>
+  withService(
+    ({ service, launches }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+          }),
+        );
+        const bodyText = '{"deliveryId":"committed"}';
+        const request = requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) });
+        yield* waitForSpan(
+          service.triggerWebhook(request),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        const retry = yield* service.triggerWebhook(request);
+        assert.equal(retry._tag === "accepted" && retry.outcome, "duplicate");
+        const result = yield* service.getExecutions({
+          id: task.id,
+          businessDeliveryId: "committed",
+        });
+        assert.equal(result.effectiveExecutions[0]!.state, "dispatched");
+        assert.equal(result.effectiveExecutions[0]!.runId, "run-committed");
+        assert.equal(yield* Queue.size(launches), 1);
+      }),
+    { formalLaunch: { runId: "run-committed", failAfterCommit: true } },
+  ),
+);
+
+it.effect("uses a matching descriptive business header across replay template changes", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: {
+            type: "webhook",
+            dedupe: { replayKey: "{{headers.other-id}}" },
+            filters: [{ path: "body.kind", op: "equals", value: "wanted" }],
+          },
+        }),
+      );
+      const bodyText = '{"deliveryId":"stable-header","kind":"other"}';
+      const trigger = (tag: string) =>
+        service.triggerWebhook(
+          requestFor(task, {
+            bodyText,
+            body: new TextEncoder().encode(bodyText),
+            headers: { "x-t3-business-delivery-id": tag },
+          }),
+        );
+      yield* trigger("stable-header");
+      yield* trigger("wrong-header");
+      yield* trigger("");
+      const tagged = yield* service.getExecutions({
+        id: task.id,
+        businessDeliveryId: "stable-header",
+      });
+      assert.equal(tagged.aliases.length, 1);
+      assert.deepEqual(tagged.effectiveExecutions, []);
+      const wrong = yield* service.getExecutions({
+        id: task.id,
+        businessDeliveryId: "wrong-header",
+      });
+      assert.deepEqual(wrong.aliases, []);
+    }),
+  ),
+);
+
+it.effect(
+  "retains uncertain acceptance through restart and resolves it without another dispatch",
+  () => {
+    const formalLaunch: {
+      runId: string;
+      failAfterCommit: boolean;
+      unavailable: boolean;
+      input?: LaunchInput;
+    } = { runId: "run-recovered", failAfterCommit: true, unavailable: true };
+    return withService(
+      ({ service, sql }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(
+            yield* webhookTaskInput({
+              schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+            }),
+          );
+          const bodyText = '{"deliveryId":"restart"}';
+          const request = requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) });
+          yield* waitForSpan(
+            service.triggerWebhook(request),
+            "ScheduledTaskService.runWebhookDelivery",
+          );
+          const before = yield* service.getExecutions({
+            id: task.id,
+            businessDeliveryId: "restart",
+          });
+          assert.equal(before.effectiveExecutions[0]!.state, "unknown");
+          const retry = yield* service.triggerWebhook(request);
+          assert.equal(retry._tag === "accepted" && retry.outcome, "duplicate");
+          formalLaunch.unavailable = false;
+          yield* withService(
+            ({ service: restarted, launches }) =>
+              Effect.gen(function* () {
+                const recovered = yield* restarted.getExecutions({
+                  id: task.id,
+                  businessDeliveryId: "restart",
+                });
+                assert.equal(recovered.trackingId, before.trackingId);
+                assert.equal(
+                  recovered.effectiveExecutions[0]!.id,
+                  before.effectiveExecutions[0]!.id,
+                );
+                assert.equal(recovered.effectiveExecutions[0]!.state, "dispatched");
+                assert.equal(recovered.effectiveExecutions[0]!.runId, "run-recovered");
+                assert.equal(yield* Queue.size(launches), 0);
+              }),
+            { sql, formalLaunch },
+          );
+        }),
+      { formalLaunch },
+    );
+  },
+);
+
+it.effect("does not reuse an execution after the seven day replay window", () =>
+  withService(
+    ({ service }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+          }),
+        );
+        const bodyText = '{"deliveryId":"expires"}';
+        const request = requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) });
+        yield* waitForSpan(
+          service.triggerWebhook(request),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        const first = yield* service.getExecutions({ id: task.id, businessDeliveryId: "expires" });
+        yield* TestClock.adjust("7 days");
+        yield* waitForSpan(
+          service.triggerWebhook(request),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        const next = yield* service.getExecutions({ id: task.id, businessDeliveryId: "expires" });
+        assert.equal(next.aliases.length, 2);
+        assert.equal(next.effectiveExecutions.length, 2);
+        assert.notEqual(next.aliases[0]!.executionId, next.aliases[1]!.executionId);
+        assert.equal(next.trackingId, first.trackingId);
+      }),
+    { workers: new Map() },
+  ),
+);
+
+it.effect("captures formal sends to a continuing scheduled thread", () =>
+  withService(
+    ({ service }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(yield* webhookTaskInput({ threadMode: "continue" }));
+        yield* waitForSpan(
+          service.triggerWebhook(requestFor(task)),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        const bound = (yield* service.list()).tasks[0]!;
+        assert.equal(bound.threadId, "thread-1");
+        const ack = yield* waitForSpan(
+          service.triggerWebhook(requestFor(bound)),
+          "ScheduledTaskService.runWebhookDelivery",
+        );
+        assert.equal(ack._tag, "accepted");
+        if (ack._tag !== "accepted") return;
+        const result = yield* service.getExecutions({ id: task.id, deliveryId: ack.deliveryId });
+        assert.equal(result.effectiveExecutions[0]!.state, "dispatched");
+        assert.equal(result.effectiveExecutions[0]!.runId, "run-bound");
+        assert.equal(result.effectiveExecutions[0]!.threadId, "thread-1");
+      }),
+    { formalLaunch: { runId: "run-bound" } },
+  ),
+);
+
+it.effect.each([
+  ["{{body.deliveryId}}", '{"deliveryId":17}'],
+  ["{{body.deliveryId}}", '{"deliveryId":"' + "x".repeat(201) + '"}'],
+  ["{{body.deliveryId}}", "not-json"],
+  ["prefix:{{body.deliveryId}}", '{"deliveryId":"untracked"}'],
+] as const)(
+  "keeps native ACK lookup when business ID cannot be extracted (%s, %s)",
+  ([replayKey, bodyText]) =>
+    withService(({ service }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            schedule: {
+              type: "webhook",
+              dedupe: { replayKey },
+              filters: [{ path: "body.kind", op: "equals", value: "wanted" }],
+            },
+          }),
+        );
+        const result = yield* service.triggerWebhook(
+          requestFor(task, { bodyText, body: new TextEncoder().encode(bodyText) }),
+        );
+        assert.equal(result._tag, "accepted");
+        if (result._tag !== "accepted") return;
+        const tracked = yield* service.getExecutions({
+          id: task.id,
+          deliveryId: result.deliveryId,
+        });
+        assert.equal(tracked.aliases.length, 1);
+        assert.equal(tracked.aliases[0]!.businessDeliveryId, null);
+      }),
+    ),
+);
+
+it.effect("does not attach a deleted task's executions to a replacement with the same id", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* webhookTaskInput());
+      const ack = yield* waitForSpan(
+        service.triggerWebhook(requestFor(task)),
+        "ScheduledTaskService.runWebhookDelivery",
+      );
+      assert.equal(ack._tag, "accepted");
+      if (ack._tag !== "accepted") return;
+      const before = yield* service.getExecutions({ id: task.id, deliveryId: ack.deliveryId });
+      yield* service.delete({ id: task.id });
+      yield* TestClock.adjust(1);
+      yield* service.upsert(yield* webhookTaskInput());
+      const replacement = yield* service.getExecutions({ id: task.id, deliveryId: ack.deliveryId });
+      assert.notEqual(replacement.taskCreatedAt, before.taskCreatedAt);
+      assert.equal(replacement.trackingId, before.trackingId);
+      assert.deepEqual(replacement.aliases, []);
+      assert.deepEqual(replacement.effectiveExecutions, []);
+    }),
+  ),
 );
 
 const waitForSpan = <A, E, R>(work: Effect.Effect<A, E, R>, name: string) =>
@@ -169,6 +544,12 @@ const withService = <A, E>(
       readonly release: Deferred.Deferred<void>;
     };
     readonly completedLaunches?: Set<string>;
+    readonly formalLaunch?: {
+      runId: string;
+      failAfterCommit?: boolean;
+      unavailable?: boolean;
+      input?: LaunchInput;
+    };
     readonly failLaunches?: { remaining: number };
     readonly gate?: Deferred.Deferred<void>;
     readonly gateForTask?: (input: LaunchInput) => Deferred.Deferred<void> | undefined;
@@ -179,7 +560,86 @@ const withService = <A, E>(
   } = {},
 ) =>
   Effect.gen(function* () {
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const launches = yield* Queue.unbounded<LaunchInput>();
+    let lastLaunch: LaunchInput | undefined = options.formalLaunch?.input;
+    const formalProjection = () => {
+      const input = lastLaunch!;
+      const at = DateTime.makeUnsafe("2026-11-26T00:00:00.000Z");
+      return decodeThreadProjection({
+        thread: {
+          id: "thread-1",
+          projectId: input.projectId,
+          title: input.title,
+          providerInstanceId: input.modelSelection.instanceId,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "thread-1" },
+          forkedFrom: null,
+          createdAt: at,
+          updatedAt: at,
+          archivedAt: null,
+          deletedAt: null,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        },
+        messages: [
+          {
+            id: input.initialMessage!.messageId,
+            threadId: "thread-1",
+            role: "user",
+            scheduledTaskId: input.initialMessage!.scheduledTaskId,
+            runId: options.formalLaunch!.runId,
+            nodeId: null,
+            text: input.initialMessage!.text,
+            attachments: [],
+            streaming: false,
+            createdAt: at,
+            updatedAt: at,
+            createdBy: input.createdBy,
+            creationSource: input.creationSource,
+          },
+        ],
+        runs: [
+          {
+            id: options.formalLaunch!.runId,
+            threadId: "thread-1",
+            userMessageId: input.initialMessage!.messageId,
+            ordinal: 1,
+            providerInstanceId: input.modelSelection.instanceId,
+            modelSelection: input.modelSelection,
+            providerThreadId: null,
+            rootNodeId: null,
+            activeAttemptId: null,
+            status: "queued",
+            requestedAt: at,
+            startedAt: null,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        ],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        plans: [],
+        turnItems: [],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [],
+        updatedAt: at,
+      });
+    };
     const secretsByRef = new Map<string, string>();
     const layerDependencies = Layer.mergeAll(
       NodePlatformCrypto.layerDigest,
@@ -220,6 +680,8 @@ const withService = <A, E>(
             if (options.completedLaunches?.has(input.commandId))
               return Effect.succeed({ threadId: "thread-1", resumed: false } as never);
             options.completedLaunches?.add(input.commandId);
+            lastLaunch = input;
+            if (options.formalLaunch) options.formalLaunch.input = input;
             return Queue.offer(launches, input).pipe(
               Effect.andThen(
                 (options.gateForTask?.(input) ?? options.gate)
@@ -227,12 +689,41 @@ const withService = <A, E>(
                   : Effect.void,
               ),
               Effect.andThen(
-                Effect.sync(() => {
-                  if (options.failLaunches && options.failLaunches.remaining-- > 0)
-                    throw new Error("injected start failure");
-                }),
+                Effect.suspend(() =>
+                  options.failLaunches && options.failLaunches.remaining-- > 0
+                    ? Effect.fail(
+                        new ThreadManagementService.ThreadManagementProviderInstanceDisabledError({
+                          projectId: input.projectId,
+                          instanceId: input.modelSelection.instanceId,
+                        }),
+                      )
+                    : Effect.void,
+                ),
               ),
-              Effect.as({ threadId: "thread-1", resumed: false } as never),
+              Effect.andThen(
+                options.formalLaunch
+                  ? Effect.gen(function* () {
+                      yield* receipts
+                        .insertIfAbsent({
+                          commandId: input.commandId,
+                          threadId: ThreadId.make("thread-1"),
+                          commandType: "thread.create",
+                          acceptedAt: yield* DateTime.now,
+                          resultSequence: 1,
+                          status: "accepted",
+                          error: null,
+                        })
+                        .pipe(Effect.orDie);
+                      if (options.formalLaunch!.failAfterCommit)
+                        return yield* Effect.die(new Error("projection unavailable after commit"));
+                    })
+                  : Effect.void,
+              ),
+              Effect.as({
+                threadId: "thread-1",
+                resumed: false,
+                ...(options.formalLaunch ? { projection: formalProjection() } : {}),
+              } as never),
             );
           }),
       }),
@@ -240,7 +731,52 @@ const withService = <A, E>(
         namedProjectsRoot: "/projects",
         isScratchProject: () => Effect.succeed(false),
       }),
-      Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+      Layer.mock(ThreadManagementService.ThreadManagementService)(
+        options.formalLaunch
+          ? {
+              sendToThread: (input: ThreadManagementService.ThreadManagementSendInput) =>
+                Effect.gen(function* () {
+                  lastLaunch = {
+                    ...lastLaunch!,
+                    commandId: input.commandId,
+                    initialMessage: {
+                      messageId: input.messageId,
+                      scheduledTaskId: input.scheduledTaskId!,
+                      text: input.text,
+                      attachments: input.attachments,
+                    },
+                  };
+                  options.formalLaunch!.input = lastLaunch;
+                  yield* receipts
+                    .insertIfAbsent({
+                      commandId: input.commandId,
+                      threadId: input.threadId,
+                      commandType: "message.dispatch",
+                      acceptedAt: yield* DateTime.now,
+                      resultSequence: 2,
+                      status: "accepted",
+                      error: null,
+                    })
+                    .pipe(Effect.orDie);
+                  const projection = formalProjection();
+                  return {
+                    projection,
+                    message: projection.messages[0]!,
+                    run: projection.runs[0]!,
+                    turnItem: null,
+                    delivery: "queued" as const,
+                    dispatch: { sequence: 2, storedEvents: [] },
+                  };
+                }),
+              getThreadShell: () =>
+                options.formalLaunch!.unavailable
+                  ? Effect.die("projection unavailable")
+                  : Effect.succeed(threadShellFromProjection(formalProjection())),
+              getProjectThreadRecords: () => Effect.succeed(formalProjection()),
+              getThreadRecords: () => Effect.succeed(formalProjection()),
+            }
+          : {},
+      ),
       Layer.mock(SecretRequests.SecretRequests)({
         consume: ({ ref }) => {
           const value = secretsByRef.get(ref);
@@ -267,9 +803,13 @@ const withService = <A, E>(
     );
   }).pipe(
     Effect.provide(
-      options.sql === undefined
-        ? SqlitePersistence.layerMemory
-        : Layer.succeed(SqlClient.SqlClient, options.sql),
+      CommandReceiptStore.layer.pipe(
+        Layer.provideMerge(
+          options.sql === undefined
+            ? SqlitePersistence.layerMemory
+            : Layer.succeed(SqlClient.SqlClient, options.sql),
+        ),
+      ),
     ),
   );
 
@@ -289,9 +829,10 @@ it.effect("dispatches exactly the rendered prompt and logs the delivery", () =>
         /^Review this PR: <(webhook-data-[0-9a-f]{12})>https:\/\/github\.com\/org\/repo\/pull\/45<\/\1>\n\nText between <\1> and <\/\1> was copied from the webhook request\./;
       const frame = framed.exec(launched.initialMessage?.text ?? "")?.[1];
       assert.isDefined(frame);
-      assert.equal(
-        launched.commandId,
-        `scheduled-task:${task.id}:webhook:${result._tag === "accepted" ? result.deliveryId : ""}`,
+      assert.isTrue(
+        launched.commandId.startsWith(
+          `scheduled-task:${task.id}:webhook:${result._tag === "accepted" ? result.deliveryId : ""}:execution:`,
+        ),
       );
 
       const { deliveries } = yield* service.listWebhookDeliveries({
@@ -774,6 +1315,11 @@ it.effect("a held request runs once even after the log has trimmed it", () =>
       const replay = yield* service.triggerWebhook(requestFor(task, { relayDeliveryId: "kept" }));
       assert.equal(replay._tag, "accepted");
       assert.equal(yield* Queue.size(launches), 0);
+      if (first._tag !== "accepted") return;
+      const retained = yield* service.getExecutions({ id: task.id, deliveryId: first.deliveryId });
+      assert.equal(retained.aliases.length, 2);
+      assert.equal(retained.effectiveExecutions.length, 1);
+      assert.equal(retained.effectiveExecutions[0]!.ownerDeliveryId, first.deliveryId);
     }),
   ),
 );
@@ -1335,9 +1881,10 @@ it.effect(
           yield* TestClock.adjust("10 seconds");
           yield* drainPendingDispatch(workers);
           const launch = yield* Queue.take(launches);
-          assert.equal(
-            launch.commandId,
-            `scheduled-task:${task.id}:webhook:${accepted._tag === "accepted" && accepted.deliveryId}`,
+          assert.isTrue(
+            launch.commandId.startsWith(
+              `scheduled-task:${task.id}:webhook:${accepted._tag === "accepted" && accepted.deliveryId}:execution:`,
+            ),
           );
           assert.equal((yield* service.list()).tasks[0]!.runCount, 1);
           assert.equal(
@@ -1401,7 +1948,15 @@ it.effect("start failures release both replay keys and relay claims for redelive
         yield* Queue.take(launches);
         assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_replay_keys`).length, 0);
         assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_relay_deliveries`).length, 0);
-        assert.equal((yield* service.list()).tasks[0]!.lastRunError, "injected start failure");
+        const failed = yield* service.getExecutions({
+          id: task.id,
+          deliveryId: "delivery:relay:failed-start",
+        });
+        assert.equal(failed.effectiveExecutions[0]!.state, "failed_to_start");
+        assert.equal(
+          (yield* service.list()).tasks[0]!.lastRunError,
+          'Provider instance "codex" is disabled for project project-webhook.',
+        );
         const retry = yield* waitForSpan(
           service.triggerWebhook(request),
           "ScheduledTaskService.runWebhookDelivery",
@@ -1409,8 +1964,26 @@ it.effect("start failures release both replay keys and relay claims for redelive
         assert.equal(retry._tag === "accepted" && retry.outcome, "accepted");
         yield* Queue.take(launches);
         assert.equal((yield* service.list()).tasks[0]!.lastRunStatus, "succeeded");
+        const retried = yield* service.getExecutions({
+          id: task.id,
+          deliveryId: "delivery:relay:failed-start",
+        });
+        const duplicate = yield* service.triggerWebhook(request);
+        assert.equal(duplicate._tag === "accepted" && duplicate.outcome, "duplicate");
+        const again = yield* service.getExecutions({
+          id: task.id,
+          deliveryId: "delivery:relay:failed-start",
+        });
+        assert.equal(again.aliases[2]!.executionId, retried.aliases[1]!.executionId);
+        assert.equal(retried.aliases.length, 2);
+        assert.equal(retried.effectiveExecutions.length, 2);
+        assert.equal(
+          retried.effectiveExecutions.filter((execution) => execution.state === "dispatched")
+            .length,
+          1,
+        );
       }),
-    { failLaunches: { remaining: 1 } },
+    { failLaunches: { remaining: 1 }, formalLaunch: { runId: "run-after-failure" } },
   ),
 );
 

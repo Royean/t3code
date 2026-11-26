@@ -70,6 +70,7 @@ import {
   EnvironmentSpeechStatus,
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
+import { ScheduledTaskExecutionsQuery, ScheduledTaskExecutionsResult } from "./scheduledTask.ts";
 import { SecretReference } from "./secretReference.ts";
 import {
   EventOrchestrationAdmission,
@@ -1177,6 +1178,29 @@ class EnvironmentEventOrchestrationHttpApi extends HttpApiGroup.make("eventOrche
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+export class EnvironmentScheduledTaskExecutionError extends Schema.TaggedError<EnvironmentScheduledTaskExecutionError>()(
+  "EnvironmentScheduledTaskExecutionError",
+  { reason: Schema.Literal("tracking_unavailable") },
+) {}
+
+class EnvironmentScheduledTaskExecutionsHttpApi extends HttpApiGroup.make(
+  "scheduledTaskExecutions",
+).add(
+  HttpApiEndpoint.get("get", "/api/scheduled-tasks/:taskId/executions", {
+    params: { taskId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: ScheduledTaskExecutionsQuery,
+    success: Schema.Struct({
+      ...ScheduledTaskExecutionsResult.fields,
+      environmentId: Schema.String,
+    }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      EnvironmentScheduledTaskExecutionError.pipe(HttpApiSchema.status(400)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
@@ -1188,4 +1212,5 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentConnectHttpApi)
   .add(EnvironmentAlwaysOnHttpApi)
   .add(EnvironmentEventOrchestrationHttpApi)
-  .add(EnvironmentWebhooksHttpApi) {}
+  .add(EnvironmentWebhooksHttpApi)
+  .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

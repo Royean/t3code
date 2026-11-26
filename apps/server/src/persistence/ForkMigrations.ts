@@ -6,6 +6,8 @@ import AlwaysOn from "./ForkMigrations/002_AlwaysOn.ts";
 import EventOrchestration from "./ForkMigrations/001_EventOrchestration.ts";
 import AlwaysOnEventRouting from "./ForkMigrations/003_AlwaysOnEventRouting.ts";
 
+import ScheduledTaskExecutions from "./ForkMigrations/004_ScheduledTaskExecutions.ts";
+
 const TABLE = "t3_fork_migrations";
 const run = Migrator.make({});
 
@@ -38,7 +40,8 @@ export const hasPendingForkMigrations = Effect.gen(function* () {
   return (
     !applied.has("1:EventOrchestration") ||
     !applied.has("2:AlwaysOn") ||
-    !applied.has("3:AlwaysOnEventRouting")
+    !applied.has("3:AlwaysOnEventRouting") ||
+    !applied.has("4:ScheduledTaskExecutions")
   );
 });
 
@@ -49,6 +52,7 @@ export const runForkMigrations = () =>
       "1_EventOrchestration": EventOrchestration,
       "2_AlwaysOn": AlwaysOn,
       "3_AlwaysOnEventRouting": AlwaysOnEventRouting,
+      "4_ScheduledTaskExecutions": ScheduledTaskExecutions,
     }),
   });
 
