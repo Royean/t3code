@@ -9,7 +9,10 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
+import * as SqlClient from "effect/sql/SqlClient";
 
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { requireManagedEventHandoff } from "./eventTaskAccess.ts";
@@ -60,6 +63,7 @@ it.effect("managed events cannot bypass role admission through ordinary handoff 
   }).pipe(
     Effect.provide(
       Layer.mergeAll(
+        WorkbenchGuard.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
         Layer.mock(EventOrchestrationService.EventOrchestrationService)({
           ownsThread: (caller) => caller === job.coordinatorThreadId,
         }),
@@ -89,6 +93,7 @@ it.effect.each([false, true])(
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
+          WorkbenchGuard.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
           Layer.mock(EventOrchestrationService.EventOrchestrationService)({
             ownsThread: () => managed,
             getForCaller: () =>
@@ -114,4 +119,45 @@ it.effect.each([false, true])(
         ),
       ),
     ),
+);
+
+it.effect("workbench admissions block unmanaged handoffs before queue binding", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,created_at,updated_at)
+    VALUES('work-item','task','2026-11-26T00:00:00.000Z','project','delivery',${threadId},'{}','2026-11-26T00:00:00.000Z','2026-11-26T00:00:00.000Z')`;
+    for (const tool of [
+      "delegate_task",
+      "create_threads",
+      "t3_thread_launch",
+      "t3_thread_send",
+      "t3_thread_transfer",
+      "schedule_task",
+    ]) {
+      const result = yield* requireManagedEventHandoff(tool).pipe(Effect.result);
+      expect(Result.isFailure(result) && result.failure.code).toBe("capability_denied");
+    }
+    expect(
+      yield* requireManagedEventHandoff("t3_workbench_dispatch").pipe(Effect.result),
+    ).toMatchObject({ _tag: "Success" });
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        WorkbenchGuard.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+        SqlitePersistence.layerMemory,
+        Layer.succeed(McpInvocationContext.McpInvocationContext, {
+          environmentId: EnvironmentId.make("environment:event-test"),
+          requestNamespace: "test",
+          issuedAt: 0,
+          capabilities: new Set<McpInvocationContext.McpCapability>(["orchestration"]),
+          client: undefined,
+          thread: {
+            threadId,
+            providerSessionId: "session",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+        }),
+      ),
+    ),
+  ),
 );

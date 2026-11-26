@@ -1,3 +1,5 @@
+import * as SqlClient from "effect/sql/SqlClient";
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -606,6 +608,7 @@ const FORCE_STOP_RELEASE_WAIT = "10 seconds";
 const isForceStopThreadError = Schema.is(OrchestrationV2ForceStopThreadError);
 
 const make = Effect.gen(function* () {
+  const workbenchGuard = yield* WorkbenchGuard.WorkbenchQueueGuard;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -810,10 +813,13 @@ const make = Effect.gen(function* () {
   };
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
-    ensureCommandTranscripts(command).pipe(
-      Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
-    );
+    workbenchGuard
+      .assertCommand(command)
+      .pipe(
+        Effect.andThen(ensureCommandTranscripts(command)),
+        Effect.andThen(assertDispatchTargetEnabled(command)),
+        Effect.andThen(orchestrator.dispatch(command)),
+      );
 
   const getProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
     input,
@@ -1814,10 +1820,12 @@ export const layer: Layer.Layer<
   ThreadManagementService,
   never,
   | Orchestrator.OrchestratorV2
+  | SqlClient.SqlClient
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
 > = Layer.effect(ThreadManagementService, make).pipe(
+  Layer.provide(WorkbenchGuard.layer),
   Layer.provide(layerLegacyV1ThreadImporterNoop),
   Layer.provide(layerThreadWorktreeRestoreNoop),
   Layer.provide(ThreadCommandExecutor.layer),
@@ -1829,7 +1837,11 @@ export const layerWithLegacyImporter: Layer.Layer<
   | LegacyV1ThreadImporter.LegacyV1ThreadImporter
   | ThreadWorktreeRestore
   | Orchestrator.OrchestratorV2
+  | SqlClient.SqlClient
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
-> = Layer.effect(ThreadManagementService, make).pipe(Layer.provide(ThreadCommandExecutor.layer));
+> = Layer.effect(ThreadManagementService, make).pipe(
+  Layer.provide(WorkbenchGuard.layer),
+  Layer.provide(ThreadCommandExecutor.layer),
+);

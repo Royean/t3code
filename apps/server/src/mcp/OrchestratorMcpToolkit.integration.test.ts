@@ -242,6 +242,7 @@ describe("orchestrator MCP toolkit", () => {
         ).pipe(
           Layer.provide(
             ThreadManagementService.layer.pipe(
+              Layer.provide(SqlitePersistence.layerMemory),
               Layer.provide(layerOrchestrator),
               Layer.provide(ServerSettings.layerTest()),
               Layer.provide(

@@ -71,6 +71,7 @@ export const makeBackgroundWait = Effect.fn("evaluateMcpToolUse.makeBackgroundWa
   } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
   const real = yield* Layer.build(
     ThreadManagementService.layer.pipe(
+      Layer.provide(SqlitePersistence.layerMemory),
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({

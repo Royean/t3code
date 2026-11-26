@@ -60,6 +60,7 @@ import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as AlwaysOnModel from "../alwaysOn/AlwaysOnModel.ts";
 import * as AlwaysOnService from "../alwaysOn/AlwaysOnService.ts";
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -366,6 +367,7 @@ const layerEffectWorkerProvided = EffectWorker.layer.pipe(
   Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
 );
 const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.layer.pipe(
+  Layer.provide(WorkbenchGuard.layer),
   Layer.provide(
     Layer.mergeAll(
       layerEffectWorkerProvided,

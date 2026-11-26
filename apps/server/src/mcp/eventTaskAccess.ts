@@ -2,6 +2,7 @@ import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as EventOrchestrationService from "../eventOrchestration/EventOrchestrationService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
@@ -26,8 +27,15 @@ export const requireManagedEventHandoff = Effect.fn("McpEventTasks.requireManage
     );
     const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
     const threadId = Option.getOrUndefined(scope)?.thread?.threadId;
-    if (Option.isNone(service) || threadId === undefined) return;
-    if (service.value.ownsThread(threadId)) {
+    if (threadId === undefined) return;
+    const workbenchGuard = yield* Effect.serviceOption(WorkbenchGuard.WorkbenchQueueGuard);
+    if (Option.isSome(workbenchGuard) && (yield* workbenchGuard.value.ownsThread(threadId)))
+      return yield* new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message:
+          "Workbench dispatchers must use t3_workbench_dispatch so persistent queue claims and execution limits stay enforced.",
+      });
+    if (Option.isSome(service) && service.value.ownsThread(threadId)) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
         message:

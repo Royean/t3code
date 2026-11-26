@@ -3063,6 +3063,7 @@ it.effect("reports a restart that stops the running turn as restarted", () =>
     }).pipe(
       Effect.provide(
         ThreadManagementService.layer.pipe(
+          Layer.provide(SqlitePersistence.layerMemory),
           Layer.provideMerge(layer),
           Layer.provide(ServerSettings.layerTest()),
           Layer.provide(

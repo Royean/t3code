@@ -71,6 +71,11 @@ import {
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
 import {
+  WorkbenchQueueScope,
+  WorkbenchQueueBindInput,
+  WorkbenchQueuePriorityInput,
+  WorkbenchQueueSnapshot,
+  WorkbenchQueueError,
   WorkbenchWorkItemsQuery,
   WorkbenchWorkItemsResult,
   ScheduledTaskExecutionsQuery,
@@ -1219,6 +1224,49 @@ class EnvironmentWorkbenchWorkItemsHttpApi extends HttpApiGroup.make("workbenchW
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchQueueHttpApi extends HttpApiGroup.make("workbenchQueue").add(
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchQueueScope,
+    success: Schema.Struct({ ...WorkbenchQueueSnapshot.fields, environmentId: Schema.String }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("bind", "/api/workbench/queues/:queueId/bind", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchQueueBindInput,
+    success: Schema.Struct({ ...WorkbenchQueueSnapshot.fields, environmentId: Schema.String }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("reconcile", "/api/workbench/queues/:queueId/reconcile", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchQueueScope,
+    success: Schema.Struct({ ...WorkbenchQueueSnapshot.fields, environmentId: Schema.String }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("priority", "/api/workbench/queues/:queueId/priority", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchQueuePriorityInput,
+    success: Schema.Struct({ ...WorkbenchQueueSnapshot.fields, environmentId: Schema.String }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
@@ -1231,5 +1279,6 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentAlwaysOnHttpApi)
   .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi)
+  .add(EnvironmentWorkbenchQueueHttpApi)
   .add(EnvironmentWorkbenchWorkItemsHttpApi)
   .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

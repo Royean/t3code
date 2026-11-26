@@ -21,6 +21,7 @@ import {
   PreviewAutomationError,
   PreviewAutomationUnavailableError,
   ProviderInstanceId,
+  WorkbenchDispatchInput,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -381,6 +382,7 @@ const ToolUse = Schema.Struct({
   input: Schema.Unknown,
 });
 const isToolUse = Schema.is(ToolUse);
+const isWorkbenchDispatchInput = Schema.is(WorkbenchDispatchInput);
 const isText = Schema.is(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1686,6 +1688,11 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
   }
   if (isPageTool(name) && typeof input.path === "string" && !input.path.startsWith("/")) {
     return failed(`${input.path} is not a readable HTML document. Pass an absolute path.`);
+  }
+  if (name === "t3_workbench_dispatch" && !isWorkbenchDispatchInput(input)) {
+    return failed(
+      "InputValidationError: taskId is required. Pass the fixed scheduled-task ID from your dispatcher instructions; businessDeliveryId is optional.",
+    );
   }
   const mock = nextMock(sample, name, testCase.setup.mocks?.[name]);
   if (isT3Name(call.name) && PREVIEW_TOOLS.has(name)) {

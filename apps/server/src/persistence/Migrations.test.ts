@@ -59,6 +59,7 @@ describe("runMigrations", () => {
           { migration_id: 3, name: "AlwaysOnEventRouting" },
           { migration_id: 4, name: "ScheduledTaskExecutions" },
           { migration_id: 5, name: "WorkbenchWorkItems" },
+          { migration_id: 6, name: "WorkbenchQueue" },
         ]);
         const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
         assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
@@ -131,6 +132,7 @@ describe("runMigrations", () => {
           { migration_id: 3, name: "AlwaysOnEventRouting" },
           { migration_id: 4, name: "ScheduledTaskExecutions" },
           { migration_id: 5, name: "WorkbenchWorkItems" },
+          { migration_id: 6, name: "WorkbenchQueue" },
         ],
       );
       assert.deepStrictEqual(

@@ -21,6 +21,8 @@ import * as Projects from "../project/ProjectService.ts";
 import * as Option from "effect/Option";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
+import { WorkbenchQueuePermit } from "./WorkbenchQueueGuard.ts";
+import * as WorkbenchQueue from "./WorkbenchQueue.ts";
 import * as WorkItems from "./WorkbenchWorkItems.ts";
 
 const decodeRequest = Schema.decodeEffect(Schema.fromJsonString(OrchestratorMcpDelegateTaskInput));
@@ -50,6 +52,7 @@ export class WorkbenchDispatch extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const queue = yield* WorkbenchQueue.WorkbenchQueue;
   const items = yield* WorkItems.WorkbenchWorkItems;
   const threads = yield* Threads.ThreadManagementService;
   const delegate = yield* McpOrchestrator.OrchestratorMcpService;
@@ -81,10 +84,15 @@ const make = Effect.gen(function* () {
           parent.thread.providerInstanceId !== caller.providerInstanceId
         )
           return yield* failure();
-        const [selected] = yield* sql<WorkItems.WorkItemRow>`SELECT * FROM workbench_work_items
-        WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND project_id = ${task.projectId} AND dispatcher_thread_id = ${caller.threadId}
-        AND ${input.businessDeliveryId === undefined ? sql`state IN ('pending', 'dispatching', 'unknown') AND work_thread_id IS NULL` : sql`business_delivery_id = ${input.businessDeliveryId}`}
-        ORDER BY rowid LIMIT 1`.pipe(Effect.mapError(unavailable));
+        const selectedPermit = yield* queue
+          .access(task.id, input.businessDeliveryId)
+          .pipe(Effect.mapError(failure));
+        const [selected] =
+          selectedPermit === null
+            ? []
+            : yield* sql<WorkItems.WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${selectedPermit.workItemId}`.pipe(
+                Effect.mapError(unavailable),
+              );
         let workItem =
           selected === undefined
             ? null
@@ -148,7 +156,10 @@ const make = Effect.gen(function* () {
             // A lost response is reconciled from the durable receipt, never retried under a new id.
             yield* delegate
               .delegateTask({ ...scope, requestNamespace: namespace }, request, base)
-              .pipe(Effect.catchCause(() => Effect.void));
+              .pipe(
+                Effect.provideService(WorkbenchQueuePermit, selectedPermit ?? undefined),
+                Effect.catchCause(() => Effect.void),
+              );
             const [current] =
               yield* sql<WorkItems.WorkItemRow>`SELECT * FROM workbench_work_items WHERE id = ${selected.id}`.pipe(
                 Effect.mapError(unavailable),
@@ -181,12 +192,9 @@ const make = Effect.gen(function* () {
             workItem = yield* items.observe(current!).pipe(Effect.mapError(unavailable));
           }
         }
-        const [count] = yield* sql<{
-          remaining: number;
-        }>`SELECT COUNT(*) AS remaining FROM workbench_work_items WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND project_id = ${task.projectId} AND dispatcher_thread_id = ${caller.threadId} AND work_thread_id IS NULL`.pipe(
-          Effect.mapError(unavailable),
-        );
-        const remaining = count?.remaining ?? 0;
+        if (workItem !== null && workItem.workThreadId !== null)
+          yield* queue.dispatched(workItem.id).pipe(Effect.mapError(unavailable));
+        const remaining = yield* queue.remaining(task.id).pipe(Effect.mapError(unavailable));
         return {
           workItem,
           remaining,

@@ -61,6 +61,8 @@ import * as ThemeHandlers from "./toolkits/theme/handlers.ts";
 import * as AlwaysOnPeer from "./toolkits/alwaysOnPeer.ts";
 import { WorkbenchToolkit } from "./toolkits/workbench/tools.ts";
 import * as WorkbenchHandlers from "./toolkits/workbench/handlers.ts";
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
+import * as WorkbenchQueue from "../scheduledTasks/WorkbenchQueue.ts";
 import * as WorkbenchDispatch from "../scheduledTasks/WorkbenchDispatch.ts";
 import * as WorkbenchWorkItems from "../scheduledTasks/WorkbenchWorkItems.ts";
 import { EventOrchestrationToolkit } from "./toolkits/eventOrchestration/tools.ts";
@@ -1146,6 +1148,7 @@ const withToolAnalytics =
 const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, R>(
   registration: Effect.Effect<A, E, R>,
 ) {
+  const workbenchGuard = yield* Effect.serviceOption(WorkbenchGuard.WorkbenchQueueGuard);
   const server = yield* McpServer.McpServer;
   const tracingServer = McpServer.McpServer.of({
     ...server,
@@ -1165,7 +1168,12 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
               },
             },
             () =>
-              requireManagedEventHandoff(name).pipe(
+              (Option.isSome(workbenchGuard)
+                ? requireManagedEventHandoff(name).pipe(
+                    Effect.provideService(WorkbenchGuard.WorkbenchQueueGuard, workbenchGuard.value),
+                  )
+                : requireManagedEventHandoff(name)
+              ).pipe(
                 Effect.matchEffect({
                   onFailure: (error) =>
                     Effect.succeed(
@@ -1473,8 +1481,10 @@ export const layerToolSearch = Layer.mergeAll(
 
 export const layer = layerMcpTransport(
   Layer.mergeAll(layerTools, layerToolSearch, layerAlwaysOnPeer).pipe(
+    Layer.provide(WorkbenchGuard.layer),
     Layer.provide(
       WorkbenchDispatch.layer.pipe(
+        Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkbenchWorkItems.layer))),
         Layer.provide(WorkbenchWorkItems.layer),
         Layer.provide(OrchestratorMcpService.layer),
       ),

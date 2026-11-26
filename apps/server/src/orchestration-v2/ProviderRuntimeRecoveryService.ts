@@ -20,6 +20,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -191,6 +192,7 @@ function latestStartedRun(
 }
 
 export const make = Effect.gen(function* () {
+  const workbenchGuard = yield* Effect.serviceOption(WorkbenchGuard.WorkbenchQueueGuard);
   const settings = yield* ServerSettings.ServerSettingsService;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const eventSink = yield* EventSink.EventSinkV2;
@@ -278,8 +280,30 @@ export const make = Effect.gen(function* () {
     ) {
       const now = yield* DateTime.now;
       const projection = yield* rewindUnacceptedRuns(stored);
+      const commandId = CommandId.make(
+        `command:runtime-reconcile:${trigger}:${projection.thread.id}:${DateTime.formatIso(now)}`,
+      );
       let runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
+        if (
+          run.status === "preparing" &&
+          Option.isSome(workbenchGuard) &&
+          (yield* workbenchGuard.value.preservePreparation(
+            projection.thread.id,
+            run.id,
+            projection.thread.projectId,
+          )) &&
+          !(yield* restartStopRequested(projections.getThreadRecords, projection.thread, run))
+        ) {
+          if (trigger === "startup")
+            yield* workbenchGuard.value.preservePreparation(
+              projection.thread.id,
+              run.id,
+              projection.thread.projectId,
+              commandId,
+            );
+          continue;
+        }
         if (run.status === "waiting") {
           const checkpointEffects = yield* outbox
             .listByCommandId(CommandId.make(`command:effect:checkpoint.capture:${run.id}`))
@@ -343,9 +367,7 @@ export const make = Effect.gen(function* () {
         ),
       ]);
       const detail = `Cancelled because the server ${trigger === "startup" ? "restarted" : "shut down"} before the provider work completed.`;
-      const commandId = CommandId.make(
-        `command:runtime-reconcile:${trigger}:${projection.thread.id}:${DateTime.formatIso(now)}`,
-      );
+
       const allocateEventId = () =>
         ids.allocate.event({ threadId: projection.thread.id, commandId }).pipe(
           Effect.mapError(
@@ -405,6 +427,26 @@ export const make = Effect.gen(function* () {
           ),
       );
       const queuedRuns = projection.runs.filter((run) => run.status === "queued");
+      if (Option.isSome(workbenchGuard)) {
+        const stops = yield* projections.getThreadRecords(projection.thread.id, ["turnItems"], {
+          turnItemTypes: ["run_interrupt_request"],
+        });
+        for (const run of [...unstartedRuns, ...queuedRuns]) {
+          if (
+            stops.turnItems.some(
+              (item) =>
+                DateTime.toEpochMillis(item.startedAt ?? item.updatedAt) >=
+                DateTime.toEpochMillis(run.requestedAt),
+            )
+          )
+            continue;
+          yield* workbenchGuard.value.markWakeRecovery(
+            projection.thread.id,
+            run.userMessageId,
+            commandId,
+          );
+        }
+      }
       const pendingRuns = [...unstartedRuns, ...queuedRuns];
       const queuedMessages =
         pendingRuns.length === 0
@@ -445,8 +487,22 @@ export const make = Effect.gen(function* () {
         retryableMessageIds.has(run.userMessageId),
       );
       // Nobody reviews a delegated, agent-sent or scheduled prompt, so it is sent again instead.
-      const unattendedRuns = continueAfterRestart
-        ? unstartedRuns.filter((run) =>
+      const reservedUnstarted = new Set<string>();
+      if (Option.isSome(workbenchGuard)) {
+        for (const run of unstartedRuns)
+          if (
+            yield* workbenchGuard.value.preservePreparation(
+              projection.thread.id,
+              run.id,
+              projection.thread.projectId,
+            )
+          )
+            reservedUnstarted.add(run.id);
+      }
+      const unattendedRuns = unstartedRuns.filter(
+        (run) =>
+          reservedUnstarted.has(run.id) ||
+          (continueAfterRestart &&
             queuedMessages.some(
               (message) =>
                 message.id === run.userMessageId &&
@@ -454,9 +510,8 @@ export const make = Effect.gen(function* () {
                 message.notification === undefined &&
                 message.delegatedCompletion === undefined &&
                 (message.scheduledTaskId !== undefined || message.creationSource === "mcp"),
-            ),
-          )
-        : [];
+            )),
+      );
       const resentRuns: Array<OrchestrationV2ThreadProjection["runs"][number]> = [];
       const resends: Array<EffectOutbox.PendingOrchestrationEffectV2> = [];
       for (const run of unattendedRuns) {

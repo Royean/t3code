@@ -195,6 +195,7 @@ const cancelBackgroundOnlyTask = (
         ).pipe(
           Layer.provide(
             ThreadManagementService.layer.pipe(
+              Layer.provide(databaseLayer),
               Layer.provide(layerOrchestrator),
               Layer.provide(ServerSettings.layerTest()),
               Layer.provide(

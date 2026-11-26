@@ -517,3 +517,87 @@ export const WorkbenchDispatchResult = Schema.Struct({
   next: Schema.String,
 });
 export type WorkbenchDispatchResult = typeof WorkbenchDispatchResult.Type;
+
+export const WorkbenchQueueScope = Schema.Struct({
+  expectedTrackingId: Schema.optional(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  ),
+  controllerId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  projectId: ProjectId,
+});
+export type WorkbenchQueueScope = typeof WorkbenchQueueScope.Type;
+export const WorkbenchQueueBindInput = Schema.Struct({
+  ...WorkbenchQueueScope.fields,
+  taskId: ScheduledTaskId,
+  dispatcherThreadId: ThreadId,
+});
+export type WorkbenchQueueBindInput = typeof WorkbenchQueueBindInput.Type;
+export const WorkbenchQueuePriorityInput = Schema.Struct({
+  ...WorkbenchQueueScope.fields,
+  workItemId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  priority: Schema.Int.check(
+    Schema.isGreaterThanOrEqualTo(-1000000),
+    Schema.isLessThanOrEqualTo(1000000),
+  ),
+});
+export type WorkbenchQueuePriorityInput = typeof WorkbenchQueuePriorityInput.Type;
+export const WorkbenchQueueSnapshot = Schema.Struct({
+  trackingId: Schema.String,
+  queueId: Schema.String,
+  controllerId: Schema.String,
+  projectId: ProjectId,
+  concurrency: Schema.Literal(2),
+  occupied: Schema.Int,
+  bindings: Schema.Array(
+    Schema.Struct({
+      taskId: ScheduledTaskId,
+      taskCreatedAt: IsoDateTime,
+      dispatcherThreadId: ThreadId,
+    }),
+  ),
+  items: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      taskId: ScheduledTaskId,
+      taskCreatedAt: IsoDateTime,
+      businessDeliveryId: Schema.String,
+      dispatcherThreadId: ThreadId,
+      priority: Schema.Int,
+      enqueueSequence: Schema.Int,
+      queueState: Schema.Literals(["queued", "occupied", "finished"]),
+      claimId: Schema.NullOr(Schema.String),
+      workThreadId: Schema.NullOr(Schema.String),
+      runId: Schema.NullOr(Schema.String),
+      workState: Schema.Literals([
+        "unknown",
+        "working",
+        "waiting_for_children",
+        "result_available",
+      ]),
+      blockedReason: Schema.NullOr(
+        Schema.Literals([
+          "queue_full",
+          "awaiting_dispatcher",
+          "approval",
+          "state_unknown",
+          "over_capacity",
+        ]),
+      ),
+      createdAt: IsoDateTime,
+      updatedAt: IsoDateTime,
+    }),
+  ),
+});
+export type WorkbenchQueueSnapshot = typeof WorkbenchQueueSnapshot.Type;
+export class WorkbenchQueueError extends Schema.TaggedError<WorkbenchQueueError>()(
+  "WorkbenchQueueError",
+  {
+    reason: Schema.Literals([
+      "invalid_binding",
+      "conflict",
+      "not_found",
+      "not_queued",
+      "unavailable",
+    ]),
+  },
+) {}

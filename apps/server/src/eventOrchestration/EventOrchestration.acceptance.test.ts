@@ -224,6 +224,7 @@ function acceptanceLayer(
   const settings = ServerSettings.layerTest();
   const receipts = CommandReceiptStore.layer.pipe(Layer.provide(database));
   const threads = ThreadManagement.layer.pipe(
+    Layer.provide(database),
     Layer.provide(Layer.mergeAll(replay, settings, receipts)),
   );
   const external = Layer.mergeAll(

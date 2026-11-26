@@ -161,6 +161,8 @@ import * as AuthHttp from "./auth/http.ts";
 import * as ReplayMarkers from "./auth/replayMarkers.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as CodexManagedTokenBroker from "./provider/CodexManagedTokenBroker.ts";
+import * as WorkbenchQueue from "./scheduledTasks/WorkbenchQueue.ts";
+import * as WorkbenchQueueHttp from "./scheduledTasks/workbenchQueueHttp.ts";
 import * as WorkItemsHttp from "./scheduledTasks/workItemsHttp.ts";
 import * as WorkItems from "./scheduledTasks/WorkbenchWorkItems.ts";
 import * as ScheduledTaskExecutionsHttp from "./scheduledTasks/executionsHttp.ts";
@@ -871,6 +873,11 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(EventOrchestrationHttp.layer),
       Layer.provide(ScheduledTaskExecutionsHttp.layer),
       Layer.provide(WorkItemsHttp.layer.pipe(Layer.provide(WorkItems.layer))),
+      Layer.provide(
+        WorkbenchQueueHttp.layer.pipe(
+          Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkItems.layer))),
+        ),
+      ),
       Layer.provide(AuthHttp.layerAuthenticatedAuth),
     ),
     ServerHttp.layerOtlpTracesProxyRoute,

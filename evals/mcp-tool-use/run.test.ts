@@ -1009,6 +1009,41 @@ it.effect("saves a new secret file for each request and tells the shell simulato
   }).pipe(Effect.provide(FetchHttpClient.layer)),
 );
 
+it.effect("workbench dispatch validates real required identity before a canned queue receipt", () =>
+  Effect.gen(function* () {
+    const base = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
+    const mock = { workItem: null, remaining: 0, next: "End this turn and wait for a queue wake." };
+    const sample = makeSample(
+      { ...childCase, setup: { role: "top", mocks: { t3_workbench_dispatch: mock } } },
+      base,
+    );
+    sample.tools.push({ name: "mcp__t3-code__t3_workbench_dispatch" });
+    const config = {
+      apiKey: "",
+      model: "claude-sonnet-5-5",
+      effort: "high",
+      maxSteps: 6,
+      shellModel: "claude-haiku-5-5",
+    } as const;
+    const missing = yield* answerToolCall(sample, config, {
+      type: "tool_use",
+      id: "missing",
+      name: "mcp__t3-code__t3_workbench_dispatch",
+      input: {},
+    });
+    assert.isTrue(missing.is_error);
+    assert.include(String(missing.content), "taskId");
+    const valid = yield* answerToolCall(sample, config, {
+      type: "tool_use",
+      id: "valid",
+      name: "mcp__t3-code__t3_workbench_dispatch",
+      input: { taskId: "scheduled-task:workbench" },
+    });
+    assert.notEqual(valid.is_error, true);
+    assert.deepEqual(JSON.parse(String(valid.content)), mock);
+  }).pipe(Effect.provide(FetchHttpClient.layer)),
+);
+
 it.effect("saves a pasted value with no card where request_secret takes one", () =>
   Effect.gen(function* () {
     const base = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });

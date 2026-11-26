@@ -92,7 +92,6 @@ import * as Stream from "effect/Stream";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
   subagentResultForRun,
-  delegatedTaskProgress,
   delegatedTaskReportRuns,
 } from "@t3tools/provider-core/server/subagentProjection";
 import {
@@ -103,12 +102,11 @@ import type {
   ProjectionRecordField,
   ProjectionRecordFilter,
 } from "../orchestration-v2/ProjectionStore.ts";
+import { runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import {
-  delegatedTaskAwaitsWork,
-  delegatedTaskResultRun,
-  delegatedTaskRuns,
-  runOutcome,
-} from "../orchestration-v2/RestartBackgroundNote.ts";
+  delegatedTaskRun,
+  delegatedTaskWorkProgress,
+} from "../orchestration-v2/delegatedTaskWorkProgress.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { placeholderThreadTitle } from "../orchestration-v2/placeholderThreadTitle.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -515,26 +513,6 @@ function taskStatusForRun(
     case undefined:
       return "running";
   }
-}
-
-function delegatedTaskRun(
-  childProjection: Pick<OrchestrationV2ThreadProjection, "runs" | "contextTransfers">,
-  task: OrchestrationV2Subagent,
-): OrchestrationV2Run | undefined {
-  const taskRun = childProjection.runs.find((run) => run.delegatedTaskId === task.id);
-  if (taskRun !== undefined) return taskRun;
-  const spawnTransfer = childProjection.contextTransfers.find(
-    (transfer) =>
-      transfer.type === "subagent_spawn" &&
-      transfer.sourceThreadId === task.threadId &&
-      transfer.targetThreadId === task.childThreadId,
-  );
-  if (spawnTransfer === undefined) {
-    return childProjection.runs[0];
-  }
-  return spawnTransfer.targetRunId === null
-    ? undefined
-    : childProjection.runs.find((run) => run.id === spawnTransfer.targetRunId);
 }
 
 function hasPendingChildRuns(
@@ -1734,20 +1712,10 @@ const make = Effect.gen(function* () {
         { messageRoles: ["user"], omitSettledLeafNodes: true, omitSettledSubagents: true },
       )
       .pipe(Effect.mapError(threadManagementFailure));
-    const childRun = delegatedTaskRun(childControls, task);
-    const progress = delegatedTaskProgress(childControls);
-    const followupRuns =
-      childRun?.delegatedTaskId === task.id ? delegatedTaskRuns(childControls, task.id) : undefined;
-    const taskResultRun =
-      followupRuns === undefined ? progress.resultRun : delegatedTaskResultRun(followupRuns);
-    const taskWorkState =
-      followupRuns === undefined
-        ? progress.state
-        : !isTerminalTaskStatus(taskStatusForRun(taskResultRun))
-          ? "working"
-          : delegatedTaskAwaitsWork(followupRuns, childControls)
-            ? "waiting_for_children"
-            : "result_available";
+    const { childRun, taskResultRun, taskWorkState } = delegatedTaskWorkProgress(
+      childControls,
+      task,
+    );
     const heldForRestart =
       task.result === null &&
       taskWorkState === "result_available" &&
