@@ -39,6 +39,7 @@ type EntryRow = WorkItems.WorkItemRow & {
   priority: number;
   queue_state: "queued" | "occupied" | "finished";
   claim_id: string | null;
+  wake_generation: number;
   work_state: WorkbenchQueueSnapshot["items"][number]["workState"];
   blocked_reason: WorkbenchQueueSnapshot["items"][number]["blockedReason"];
   needs_dispatch: number;
@@ -120,7 +121,7 @@ const make = Effect.gen(function* () {
     queueId: string,
     occupiedOnly = false,
   ) {
-    return yield* sql<EntryRow>`SELECT w.*, e.enqueue_sequence,e.priority,e.state AS queue_state,e.claim_id,e.work_state,e.blocked_reason,e.needs_dispatch,e.updated_at AS queue_updated_at
+    return yield* sql<EntryRow>`SELECT w.*, e.enqueue_sequence,e.priority,e.state AS queue_state,e.claim_id,e.wake_generation,e.work_state,e.blocked_reason,e.needs_dispatch,e.updated_at AS queue_updated_at
       FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id WHERE e.queue_id=${queueId}
       AND ${occupiedOnly ? sql`e.state='occupied'` : sql`(e.state!='finished' OR e.enqueue_sequence IN (SELECT enqueue_sequence FROM workbench_queue_entries WHERE queue_id=${queueId} AND state='finished' ORDER BY updated_at DESC,enqueue_sequence DESC LIMIT 100))`}
       ORDER BY e.priority DESC,e.enqueue_sequence`;
@@ -255,45 +256,84 @@ const make = Effect.gen(function* () {
   const observeEntry = Effect.fn("WorkbenchQueue.observeEntry")(
     function* (row: EntryRow) {
       const item = yield* items.observe(row);
+      if (row.matter_id !== null) {
+        const preparation =
+          item.runId === null || item.workThreadId === null
+            ? false
+            : (yield* threads.getThreadRecords(ThreadId.make(item.workThreadId), ["runs"], {
+                runIds: [RunId.make(item.runId)],
+              })).runs[0]?.status === "preparing";
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const [current] =
+              yield* sql<EntryRow>`SELECT w.*,e.state AS queue_state,e.claim_id,e.wake_generation
+              FROM workbench_work_items w JOIN workbench_queue_entries e ON e.work_item_id=w.id WHERE w.id=${row.id}`;
+            // Native observation may yield while admission requeues this same cycle under a new claim.
+            if (
+              current === undefined ||
+              current.queue_state !== "occupied" ||
+              current.claim_id !== row.claim_id ||
+              current.wake_generation !== row.wake_generation ||
+              current.version !== item.version ||
+              current.latest_event_sequence !== item.latestEventSequence ||
+              current.dispatched_through_sequence !== item.dispatchedThroughSequence ||
+              current.processed_through_sequence !== item.processedThroughSequence ||
+              current.business_state !== item.businessState ||
+              current.run_id !== item.runId ||
+              current.state !== item.state ||
+              current.error_code !== item.errorCode
+            )
+              return;
+            if (item.errorCode === "batch_too_large") {
+              yield* sql`UPDATE workbench_queue_entries SET needs_dispatch=0,work_state='unknown',blocked_reason='state_unknown' WHERE work_item_id=${row.id}`;
+              return;
+            }
+            if (item.workThreadId === null || item.delegatedTaskId === null) {
+              yield* sql`UPDATE workbench_queue_entries SET work_state='unknown',blocked_reason=${item.requestId === null ? "awaiting_dispatcher" : "state_unknown"},needs_dispatch=1 WHERE work_item_id=${row.id}`;
+              return;
+            }
+            const batches =
+              yield* sql<Lifecycle.BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${row.id}`;
+            const uncertain =
+              item.state === "unknown" ||
+              batches.some((batch) => batch.state === "unknown" || batch.state === "failed");
+            const active = batches.filter(
+              (batch) => !["completed", "failed"].includes(batch.state),
+            );
+            const needs =
+              current.latest_event_sequence > current.dispatched_through_sequence ||
+              batches.some((batch) =>
+                ["pending", "dispatching", "unknown"].includes(batch.state),
+              ) ||
+              preparation;
+            const settled =
+              !uncertain &&
+              !needs &&
+              active.length === 0 &&
+              current.processed_through_sequence === current.latest_event_sequence &&
+              ["awaiting_delivery", "completed"].includes(current.business_state);
+            const state = uncertain
+              ? "unknown"
+              : active.some((batch) => batch.work_state === "waiting_for_children")
+                ? "waiting_for_children"
+                : active.length > 0
+                  ? "working"
+                  : settled
+                    ? "result_available"
+                    : "unknown";
+            yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${state},needs_dispatch=${needs ? 1 : 0},
+              blocked_reason=${item.state === "blocked" ? "approval" : uncertain ? "state_unknown" : needs ? "awaiting_dispatcher" : null},updated_at=${DateTime.formatIso(yield* DateTime.now)}
+              WHERE work_item_id=${row.id}`;
+          }),
+        );
+        return;
+      }
       if (item.errorCode === "batch_too_large") {
         yield* sql`UPDATE workbench_queue_entries SET needs_dispatch=0,work_state='unknown',blocked_reason='state_unknown' WHERE work_item_id=${row.id} AND state='occupied'`;
         return;
       }
       if (item.workThreadId === null || item.delegatedTaskId === null) {
         yield* sql`UPDATE workbench_queue_entries SET work_state='unknown',blocked_reason=${item.requestId === null ? "awaiting_dispatcher" : "state_unknown"},needs_dispatch=1 WHERE work_item_id=${row.id} AND state='occupied'`;
-        return;
-      }
-      if (row.matter_id !== null) {
-        const batches =
-          yield* sql<Lifecycle.BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${row.id}`;
-        const uncertain =
-          item.state === "unknown" ||
-          batches.some((batch) => batch.state === "unknown" || batch.state === "failed");
-        const active = batches.filter((batch) => !["completed", "failed"].includes(batch.state));
-        const preparation =
-          item.runId === null
-            ? false
-            : (yield* threads.getThreadRecords(ThreadId.make(item.workThreadId), ["runs"], {
-                runIds: [RunId.make(item.runId)],
-              })).runs[0]?.status === "preparing";
-        const needs =
-          item.latestEventSequence > item.dispatchedThroughSequence ||
-          batches.some((batch) => ["pending", "dispatching", "unknown"].includes(batch.state)) ||
-          preparation;
-        const settled =
-          !uncertain && active.length === 0 && item.businessState === "awaiting_delivery";
-        const state = uncertain
-          ? "unknown"
-          : active.some((batch) => batch.work_state === "waiting_for_children")
-            ? "waiting_for_children"
-            : active.length > 0
-              ? "working"
-              : settled
-                ? "result_available"
-                : "unknown";
-        yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${state},needs_dispatch=${needs ? 1 : 0},
-          blocked_reason=${item.state === "blocked" ? "approval" : uncertain ? "state_unknown" : needs ? "awaiting_dispatcher" : null},updated_at=${DateTime.formatIso(yield* DateTime.now)}
-          WHERE work_item_id=${row.id} AND state='occupied'`;
         return;
       }
       const parent = yield* threads.getThreadRecords(

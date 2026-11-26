@@ -32,17 +32,26 @@ import { derive } from "@t3tools/provider-core/server/IdAllocator";
 const decodeRequest = Schema.decodeEffect(Schema.fromJsonString(OrchestratorMcpDelegateTaskInput));
 const encodeRequest = Schema.encodeEffect(Schema.fromJsonString(OrchestratorMcpDelegateTaskInput));
 
-const failure = () =>
-  new OrchestratorMcpFailure({
-    code: "invalid_request",
-    message: "This operation requires this task's fixed dispatcher and trusted project binding.",
-  });
-const unavailable = () =>
-  new OrchestratorMcpFailure({
-    code: "orchestration_error",
-    message:
-      "Work item state is unknown. Retry the same task and business delivery; do not create another child.",
-  });
+const withPrivateCause = (error: OrchestratorMcpFailure, cause: unknown) =>
+  cause === undefined ? error : Object.defineProperty(error, "cause", { value: cause });
+
+const failure = (cause?: unknown) =>
+  withPrivateCause(
+    new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "This operation requires this task's fixed dispatcher and trusted project binding.",
+    }),
+    cause,
+  );
+const unavailable = (cause?: unknown) =>
+  withPrivateCause(
+    new OrchestratorMcpFailure({
+      code: "orchestration_error",
+      message:
+        "Work item state is unknown. Retry the same task and business delivery; do not create another child.",
+    }),
+    cause,
+  );
 
 const dispatchResult = (
   workItem: WorkbenchDispatchResult["workItem"],

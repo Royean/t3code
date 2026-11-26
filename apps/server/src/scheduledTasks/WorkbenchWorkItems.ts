@@ -216,25 +216,32 @@ const make = Effect.gen(function* () {
         Effect.mapError(ledgerError),
       );
     }
-    const latest =
-      yield* sql<Lifecycle.BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${row.id} ORDER BY from_sequence`.pipe(
-        Effect.mapError(ledgerError),
-      );
-    let processed = 0;
-    for (const batch of latest) {
-      if (batch.state !== "completed" || batch.from_sequence !== processed + 1) break;
-      processed = batch.through_sequence;
-    }
-    const selected = latest.find((batch) => batch.state !== "completed") ?? latest.at(-1);
-    const current = latest.findLast((batch) => batch.run_id !== null);
-    const state =
-      processed === row.latest_event_sequence && processed > 0 ? "awaiting_delivery" : "active";
-    yield* sql`UPDATE workbench_work_items SET processed_through_sequence=${processed},
-      business_state=CASE WHEN business_state='completed' THEN 'completed' ELSE ${state} END,
-      version=version+CASE WHEN processed_through_sequence!=${processed} OR (business_state!='completed' AND business_state!=${state}) THEN 1 ELSE 0 END,
-      run_id=COALESCE(${current?.run_id ?? null},run_id),message_id=COALESCE(${current?.message_id ?? null},message_id)
-      WHERE id=${row.id}`.pipe(Effect.mapError(ledgerError));
-    return selected === undefined ? null : Lifecycle.batchView(selected);
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [cycle] =
+          yield* sql<WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${row.id}`;
+        const latest =
+          yield* sql<Lifecycle.BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${row.id} ORDER BY from_sequence`;
+        let processed = 0;
+        for (const batch of latest) {
+          if (batch.state !== "completed" || batch.from_sequence !== processed + 1) break;
+          processed = batch.through_sequence;
+        }
+        const selected = latest.find((batch) => batch.state !== "completed") ?? latest.at(-1);
+        const current = latest.findLast((batch) => batch.run_id !== null);
+        // Admission can advance this cycle while the native projections above are being read.
+        const state =
+          processed === cycle!.latest_event_sequence && processed > 0
+            ? "awaiting_delivery"
+            : "active";
+        yield* sql`UPDATE workbench_work_items SET processed_through_sequence=${processed},
+          business_state=CASE WHEN business_state='completed' THEN 'completed' ELSE ${state} END,
+          version=version+CASE WHEN processed_through_sequence!=${processed} OR (business_state!='completed' AND business_state!=${state}) THEN 1 ELSE 0 END,
+          run_id=COALESCE(${current?.run_id ?? null},run_id),message_id=COALESCE(${current?.message_id ?? null},message_id)
+          WHERE id=${row.id}`;
+        return selected === undefined ? null : Lifecycle.batchView(selected);
+      }),
+    );
   }, Effect.mapError(ledgerError));
   const observe = Effect.fn("WorkbenchWorkItems.observe")(function* (
     row: WorkItemRow,

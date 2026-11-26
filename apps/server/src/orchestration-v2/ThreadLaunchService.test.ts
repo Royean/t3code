@@ -48,6 +48,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   OrchestrationV2ThreadProjectionJson,
+  OrchestratorMcpFailure,
   ScheduledTaskId,
   type ServerProvider,
   ThreadId,
@@ -99,6 +100,8 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 const projectId = ProjectId.make("project:launch-test");
 const otherProjectId = ProjectId.make("project:launch-other");
 const encodeThreadProjection = Schema.encodeEffect(OrchestrationV2ThreadProjectionJson);
+const isGitCommandError = Schema.is(GitCommandError);
+const encodeMcpFailure = Schema.encodeEffect(OrchestratorMcpFailure);
 const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.1-codex",
@@ -4388,6 +4391,9 @@ it.live(
         threadMode: "continue",
         schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
       } as const;
+      const realGit = yield* GitVcsDriver.make.pipe(
+        Effect.provide(ServerConfig.layerTest(root, { prefix: "workbench-matters-vcs-" })),
+      );
       const dependencies = Layer.succeedContext(
         yield* Layer.build(
           Layer.mergeAll(
@@ -4398,20 +4404,7 @@ it.live(
             }),
             Layer.mock(SecretRequests.SecretRequests)({}),
             Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-            Layer.mock(GitVcsDriver.GitVcsDriver)({
-              resolveCommit: (input) =>
-                Effect.sync(() => ({
-                  commitSha: git(input.cwd, ["rev-parse", `${input.revision}^{commit}`]),
-                })),
-              execute: (input) =>
-                Effect.sync(() => ({
-                  stdout: git(input.cwd, [...input.args]),
-                  stderr: "",
-                  exitCode: 0 as never,
-                  stdoutTruncated: false,
-                  stderrTruncated: false,
-                })),
-            }),
+            Layer.succeed(GitVcsDriver.GitVcsDriver, realGit),
           ),
         ),
       );
@@ -4608,14 +4601,52 @@ it.live(
         assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 1);
         yield* finish(child.runs.find((run) => run.id !== firstRun)!.id);
         yield* finishDelegations;
+        const observed = yield* Deferred.make<void>();
+        const releaseObservation = yield* Deferred.make<void>();
+        let pausedObservation = false;
+        const staleObserver = Layer.fresh(
+          WorkbenchQueue.layer.pipe(
+            Layer.provide(
+              Layer.succeed(WorkbenchWorkItems.WorkbenchWorkItems, {
+                ...items,
+                observe: (row, deliveryId) =>
+                  items.observe(row, deliveryId).pipe(
+                    Effect.tap((item) => {
+                      if (pausedObservation || item.id !== first.workItem!.id) return Effect.void;
+                      pausedObservation = true;
+                      return Deferred.succeed(observed, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseObservation)),
+                      );
+                    }),
+                  ),
+              }),
+            ),
+            Layer.provide(dependencies),
+          ),
+        );
+        const staleReconcile = yield* Effect.gen(function* () {
+          const observer = yield* WorkbenchQueue.WorkbenchQueue;
+          return yield* observer.reconcile("queue:matter", queueScope);
+        }).pipe(Effect.provide(staleObserver), Effect.forkScoped);
+        yield* Deferred.await(observed);
         yield* queue.reconcile("queue:matter", queueScope);
         const ended = (yield* items.get(taskId, "three")).workItems[0]!;
         assert.equal(ended.processedThroughSequence, 3);
         assert.equal(ended.businessState, "awaiting_delivery");
         assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 0);
+        const staleCycle =
+          (yield* sql<WorkbenchWorkItems.WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${ended.id}`)[0]!;
         const proofRef = "refs/t3/workbench-handoffs/test";
         git(actualChild.thread.worktreePath!, ["update-ref", proofRef, "HEAD"]);
         yield* admit("four");
+        yield* queue.reconcile("queue:matter", queueScope);
+        yield* Deferred.succeed(releaseObservation, undefined);
+        yield* Fiber.join(staleReconcile);
+        assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 1);
+        assert.equal(yield* queue.remaining(taskId), 1);
+        const afterOldObservation = yield* items.observe(staleCycle);
+        assert.equal(afterOldObservation.latestEventSequence, 4);
+        assert.equal(afterOldObservation.businessState, "active");
         const completion = {
           workItemId: ended.id,
           expectedVersion: ended.version,
@@ -4627,7 +4658,24 @@ it.live(
         const stale = yield* items.complete(completion).pipe(Effect.flip);
         assert.equal(stale._tag, "ScheduledTaskError");
         yield* queue.reconcile("queue:matter", queueScope);
-        const fourth = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "four" });
+        const childPath = actualChild.thread.worktreePath!;
+        const childBranch = git(childPath, ["symbolic-ref", "--short", "HEAD"]);
+        const workspaceFailure = yield* Effect.acquireUseRelease(
+          Effect.sync(() => git(childPath, ["checkout", "--detach", "HEAD"])),
+          () => dispatch.dispatch(scope, { taskId }).pipe(Effect.flip),
+          () => Effect.sync(() => git(childPath, ["checkout", childBranch])),
+        );
+        assert.equal(workspaceFailure.code, "orchestration_error");
+        assert.isTrue(isGitCommandError(workspaceFailure.cause));
+        assert.notInclude(Object.keys(workspaceFailure), "cause");
+        assert.notInclude(JSON.stringify(workspaceFailure), childPath);
+        const encodedFailure = yield* encodeMcpFailure(workspaceFailure);
+        assert.deepEqual(encodedFailure, {
+          _tag: "OrchestratorMcpFailure",
+          code: workspaceFailure.code,
+          message: workspaceFailure.message,
+        });
+        const fourth = yield* dispatch.dispatch(scope, { taskId });
         assert.equal(fourth.workItem?.id, ended.id);
         assert.equal(fourth.workItem?.workThreadId, childId);
         assert.notEqual(
@@ -4673,6 +4721,7 @@ it.live(
         assert.notEqual(reopened.workItem?.workThreadId, childId);
         assert.equal(reopened.workItem?.cycleNumber, 2);
         assert.equal(reopened.workItem?.previousTaskId, ended.id);
+        assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 1);
         const successor = yield* threads.getThreadRecords(
           ThreadId.make(reopened.workItem!.workThreadId!),
           ["messages"],
