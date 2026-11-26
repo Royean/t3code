@@ -2,11 +2,13 @@ import {
   CommandId,
   type NodeId,
   type RunId,
-  type ThreadId,
+  ThreadId,
+  MessageId,
   ScheduledTaskError,
 } from "@t3tools/contracts";
 import { derive } from "@t3tools/provider-core/server/IdAllocator";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -14,6 +16,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Receipts from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Projections from "../orchestration-v2/ProjectionStore.ts";
 import { ledgerError } from "./executionLedger.ts";
+
+import type { BatchRow } from "./workbenchLifecycle.ts";
 
 interface ChildIntent {
   readonly id: string;
@@ -35,6 +39,13 @@ export class WorkbenchChildRelations extends Context.Service<
     readonly resolve: (
       intent: ChildIntent,
     ) => Effect.Effect<Option.Option<ChildRelation>, ScheduledTaskError>;
+    readonly resolveBatch: (
+      intent: ChildIntent,
+      batch: BatchRow,
+    ) => Effect.Effect<
+      Option.Option<ChildRelation & { messageId: MessageId; runId: RunId }>,
+      ScheduledTaskError
+    >;
     readonly find: (
       childThreadId?: ThreadId,
     ) => Effect.Effect<ReadonlyArray<ChildRelation>, ScheduledTaskError>;
@@ -102,6 +113,84 @@ const make = Effect.gen(function* () {
       acceptedRunId,
     });
   }, Effect.mapError(ledgerError));
+  const resolveBatch = Effect.fn("WorkbenchChildRelations.resolveBatch")(function* (
+    intent: ChildIntent,
+    batch: BatchRow,
+  ) {
+    const initial = yield* resolve(intent);
+    if (Option.isNone(initial) || batch.command_id === null)
+      return Option.none<ChildRelation & { messageId: MessageId; runId: RunId }>();
+    const first = batch.command_id === intent.requestId;
+    const messageId = first
+      ? derive.delegatedTaskMessage({ commandId: CommandId.make(intent.requestId) })
+      : batch.message_id === null
+        ? null
+        : MessageId.make(batch.message_id);
+    if (messageId === null)
+      return Option.none<ChildRelation & { messageId: MessageId; runId: RunId }>();
+    if (!first) {
+      const receipt = yield* receipts.getByCommandId(CommandId.make(batch.command_id));
+      if (
+        Option.isNone(receipt) ||
+        receipt.value.status !== "accepted" ||
+        receipt.value.threadId !== initial.value.workThreadId ||
+        receipt.value.commandType !== "message.dispatch"
+      )
+        return Option.none<ChildRelation & { messageId: MessageId; runId: RunId }>();
+    }
+    const child = yield* projections.getThreadRecords(
+      initial.value.workThreadId,
+      ["messages", "runs"],
+      { messageIds: [messageId] },
+    );
+    const message = child.messages.find(
+      (candidate) =>
+        candidate.id === messageId && candidate.threadId === initial.value.workThreadId,
+    );
+    const run = child.runs.find((candidate) => candidate.id === message?.runId);
+    const taskId = run?.delegatedTaskId ?? initial.value.delegatedTaskId;
+    if (
+      run === undefined ||
+      taskId === undefined ||
+      child.thread.projectId !== intent.projectId ||
+      child.thread.lineage.parentThreadId !== intent.dispatcherThreadId
+    )
+      return Option.none<ChildRelation & { messageId: MessageId; runId: RunId }>();
+    const parent = yield* projections.getThreadRecords(
+      ThreadId.make(intent.dispatcherThreadId),
+      ["subagents"],
+      { subagentIds: [taskId] },
+    );
+    const task = parent.subagents.find(
+      (candidate) =>
+        candidate.id === taskId &&
+        candidate.origin === "app_owned" &&
+        candidate.childThreadId === initial.value.workThreadId,
+    );
+    if (
+      task?.runId == null ||
+      parent.thread.projectId !== intent.projectId ||
+      (!first &&
+        run.delegatedTaskId === undefined &&
+        task.result !== null &&
+        (task.completedAt === null ||
+          message === undefined ||
+          DateTime.toEpochMillis(message.createdAt) > DateTime.toEpochMillis(task.completedAt)))
+    )
+      return Option.none<ChildRelation & { messageId: MessageId; runId: RunId }>();
+    const accepted =
+      batch.accepted_run_id === null
+        ? (child.runs.find((candidate) => candidate.userMessageId === messageId)?.id ?? run.id)
+        : batch.accepted_run_id;
+    return Option.some({
+      ...initial.value,
+      delegatedTaskId: task.id,
+      parentRunId: task.runId,
+      acceptedRunId: accepted as RunId,
+      messageId,
+      runId: run.id,
+    });
+  }, Effect.mapError(ledgerError));
   const find = Effect.fn("WorkbenchChildRelations.find")(function* (childThreadId?: ThreadId) {
     const rows = yield* sql<{
       id: string;
@@ -127,9 +216,27 @@ const make = Effect.gen(function* () {
           projectId: row.project_id,
         }),
     );
-    return resolved.filter(Option.isSome).map((relation) => relation.value);
-  });
-  return { resolve, find };
+    const initial = resolved.filter(Option.isSome).map((relation) => relation.value);
+    const result = [...initial];
+    for (const relation of initial) {
+      const batches =
+        yield* sql<BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${relation.id} AND command_id IS NOT NULL`;
+      for (const batch of batches) {
+        const current = yield* resolveBatch(relation, batch);
+        if (
+          Option.isSome(current) &&
+          !result.some(
+            (other) =>
+              other.id === current.value.id &&
+              other.delegatedTaskId === current.value.delegatedTaskId,
+          )
+        )
+          result.push(current.value);
+      }
+    }
+    return result;
+  }, Effect.mapError(ledgerError));
+  return { resolve, resolveBatch, find };
 });
 
 export const layer = Layer.effect(WorkbenchChildRelations, make).pipe(

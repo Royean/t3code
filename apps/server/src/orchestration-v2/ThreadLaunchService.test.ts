@@ -4,6 +4,8 @@ import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as RuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as WorkbenchLifecycle from "../scheduledTasks/workbenchLifecycle.ts";
+import * as ExecutionLedger from "../scheduledTasks/executionLedger.ts";
 import * as WorkbenchQueue from "../scheduledTasks/WorkbenchQueue.ts";
 import * as WorkbenchDispatch from "../scheduledTasks/WorkbenchDispatch.ts";
 import * as WorkbenchWorkItems from "../scheduledTasks/WorkbenchWorkItems.ts";
@@ -214,6 +216,7 @@ function makeHarness(options: HarnessOptions = {}) {
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),
   );
   const layerExternalServices = Layer.mergeAll(
+    Layer.mock(GitVcsDriver.GitVcsDriver)({}),
     WorktreeSetupTracker.layer,
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: closeTerminal }),
@@ -3707,6 +3710,7 @@ it.live(
           commandId: CommandId.make("parent:stop-workbench"),
           threadId: parentId,
           runId: originalRunId,
+          holdQueue: true,
         });
         const retry = yield* invoke({
           ...scope,
@@ -3729,6 +3733,7 @@ it.live(
             commandId: CommandId.make(`parent:stop-queue-wake:${run.id}`),
             threadId: parentId,
             runId: run.id,
+            holdQueue: true,
           });
         }
         assert.isFalse(
@@ -4312,3 +4317,402 @@ it.effect("atomically reserves two workbench slots by project priority across di
     );
   }).pipe(Effect.provide(Layer.mergeAll(queueLayer, itemLayer, dependencies)));
 });
+
+it.live(
+  "queues ordered matter batches into the same isolated child without releasing its reservation",
+  () =>
+    Effect.gen(function* () {
+      const root = yield* checkpointWorkspace("workbench-matters");
+      const git = (cwd: string, args: string[]) =>
+        NodeChildProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+      let worktrees = 0;
+      const provider: ServerProvider = {
+        instanceId: modelSelection.instanceId,
+        driver: ProviderDriverKind.make("codex"),
+        enabled: true,
+        installed: true,
+        version: "test",
+        status: "ready",
+        auth: { status: "authenticated" },
+        checkedAt: "2026-11-26T00:00:00.000Z",
+        models: [
+          {
+            slug: modelSelection.model,
+            name: modelSelection.model,
+            isCustom: false,
+            capabilities: null,
+          },
+        ],
+        slashCommands: [],
+        skills: [],
+      };
+      const harness = makeHarness({
+        workspaceRoot: root,
+        providers: [provider],
+        hasCommit: () => Effect.succeed(true),
+        generateBranchName: () => Effect.succeed({ branch: `matter-${worktrees}` }),
+        createWorktree: (input) =>
+          Effect.sync(() => {
+            const path = `${root}/child-${++worktrees}`;
+            git(root, [
+              "worktree",
+              "add",
+              "-b",
+              input.newRefName!,
+              path,
+              input.baseRefName ?? input.refName,
+            ]);
+            return {
+              worktree: {
+                path,
+                refName: input.newRefName!,
+                headSha: git(path, ["rev-parse", "HEAD"]),
+              },
+            };
+          }),
+        renameBranch: (input) =>
+          Effect.sync(() => {
+            git(input.cwd, ["branch", "-m", input.newBranch]);
+            return { branch: input.newBranch };
+          }),
+      });
+      const parentId = ThreadId.make("thread:matter-dispatcher"),
+        taskId = ScheduledTaskId.make("task:matter");
+      const stamp = "2026-11-26T00:00:00.000Z";
+      const task = {
+        id: taskId,
+        createdAt: stamp,
+        projectId,
+        threadId: parentId,
+        enabled: true,
+        threadMode: "continue",
+        schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+      } as const;
+      const dependencies = Layer.succeedContext(
+        yield* Layer.build(
+          Layer.mergeAll(
+            harness.layer,
+            Layer.mock(ScheduledTasks.ScheduledTaskService)({
+              list: () => Effect.succeed({ tasks: [task] } as never),
+              getExecutions: () => Effect.succeed({ effectiveExecutions: [] } as never),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({
+              resolveCommit: (input) =>
+                Effect.sync(() => ({
+                  commitSha: git(input.cwd, ["rev-parse", `${input.revision}^{commit}`]),
+                })),
+              execute: (input) =>
+                Effect.sync(() => ({
+                  stdout: git(input.cwd, [...input.args]),
+                  stderr: "",
+                  exitCode: 0 as never,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                })),
+            }),
+          ),
+        ),
+      );
+      const itemsLayer = WorkbenchWorkItems.layer.pipe(Layer.provide(dependencies));
+      const queues = WorkbenchQueue.layer.pipe(
+        Layer.provide(itemsLayer),
+        Layer.provide(dependencies),
+      );
+      const dispatchLayer = WorkbenchDispatch.layer.pipe(
+        Layer.provide(queues),
+        Layer.provide(itemsLayer),
+        Layer.provide(OrchestratorMcp.layer.pipe(Layer.provide(dependencies))),
+        Layer.provide(dependencies),
+      );
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService,
+          threads = yield* ThreadManagement.ThreadManagementService,
+          sql = yield* SqlClient.SqlClient;
+        yield* launches.launch(launchInput({ command: "matter:parent", thread: parentId }));
+        const queue = yield* WorkbenchQueue.WorkbenchQueue;
+        const queueScope = { controllerId: "controller:matter", projectId };
+        const binding = yield* queue.bind("queue:matter", {
+          ...queueScope,
+          taskId,
+          dispatcherThreadId: parentId,
+        });
+        const admit = (id: string, padding = "") =>
+          Effect.gen(function* () {
+            const bodyText = JSON.stringify({
+              deliveryId: id,
+              issue: { id: 42, number: 1 },
+              action: id,
+              padding,
+            });
+            yield* queue.prepareDeliveryIntent("queue:matter", {
+              ...queueScope,
+              expectedTrackingId: binding.trackingId,
+              taskId,
+              taskCreatedAt: stamp,
+              dispatcherThreadId: parentId,
+              intentId: `intent:${id}`,
+              subscriptionScopeId: "subscription:matter",
+              businessDeliveryId: id,
+              bodySha256: WorkbenchLifecycle.digest(bodyText),
+              matter: {
+                provider: "github",
+                namespace: "https://github.com/repositories/7",
+                kind: "issue",
+                key: "1",
+                label: "Issue #1",
+              },
+            });
+            yield* sql.withTransaction(
+              ExecutionLedger.recordAlias({
+                task: task as never,
+                attemptId: `attempt:${id}`,
+                deliveryId: `native:${id}`,
+                businessDeliveryId: id,
+                outcome: "accepted",
+                executionId: `execution:${id}`,
+                receivedAt: stamp,
+                create: true,
+                rawBody: new TextEncoder().encode(bodyText),
+                request: { method: "POST", path: "/secret", query: "", headers: {}, bodyText },
+              }),
+            );
+          });
+        yield* admit("one");
+        yield* queue.reconcile("queue:matter", queueScope);
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("env-test"),
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 0,
+          requestNamespace: "session:matter",
+          thread: {
+            threadId: parentId,
+            providerSessionId: "session:matter",
+            providerInstanceId: modelSelection.instanceId,
+          },
+          client: undefined,
+        };
+        const dispatch = yield* WorkbenchDispatch.WorkbenchDispatch;
+        const first = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "one" });
+        assert.isNotNull(first.workItem?.activeBatch);
+        assert.equal(first.workItem?.latestEventSequence, 1);
+        const childId = ThreadId.make(first.workItem!.workThreadId!);
+        const firstRun = first.workItem!.runId;
+        yield* admit("two");
+        yield* admit("three");
+        yield* queue.reconcile("queue:matter", queueScope);
+        const registered = (yield* sql<{
+          branch: string | null;
+          worktree_path: string | null;
+        }>`SELECT * FROM workbench_work_items WHERE id=${first.workItem!.id}`)[0]!;
+        const actualChild = yield* threads.getThreadRecords(childId, []);
+        assert.deepEqual(
+          [registered.worktree_path, registered.branch],
+          [actualChild.thread.worktreePath, actualChild.thread.branch],
+        );
+        const next = yield* dispatch.dispatch(
+          { ...scope, requestNamespace: "session:new" },
+          { taskId, businessDeliveryId: "two" },
+        );
+        assert.equal(next.workItem?.id, first.workItem!.id);
+        assert.equal(next.workItem?.workThreadId, childId);
+        assert.equal(next.workItem?.acceptedRunId, first.workItem!.acceptedRunId);
+        assert.equal(next.workItem?.requestId, first.workItem!.requestId);
+        assert.equal(next.workItem?.latestEventSequence, 3);
+        assert.equal(next.workItem?.processedThroughSequence, 0);
+        const child = yield* threads.getThreadRecords(childId, ["runs", "messages"]);
+        assert.equal(child.runs.length, 2);
+        assert.equal(child.runs.find((run) => run.id === firstRun)?.status, "starting");
+        assert.equal(child.runs.filter((run) => run.status === "queued").length, 1);
+        assert.equal(worktrees, 1);
+        const queued = yield* queue.get("queue:matter", queueScope);
+        assert.equal(queued.occupied, 1);
+        assert.equal(queued.items.length, 1);
+        const batches = yield* sql<{
+          from_sequence: number;
+          through_sequence: number;
+        }>`SELECT * FROM workbench_work_batches ORDER BY from_sequence`;
+        assert.deepEqual(
+          batches.map((batch) => [batch.from_sequence, batch.through_sequence]),
+          [
+            [1, 1],
+            [2, 3],
+          ],
+        );
+        const before = (yield* threads.getThreadRecords(childId, ["messages"])).messages.length;
+        yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "two" });
+        assert.equal(
+          (yield* threads.getThreadRecords(childId, ["messages"])).messages.length,
+          before,
+        );
+        assert.equal(worktrees, 1);
+        const items = yield* WorkbenchWorkItems.WorkbenchWorkItems;
+        const sink = yield* EventSink.EventSinkV2;
+        const finish = (runId: string) =>
+          Effect.gen(function* () {
+            const state = yield* threads.getThreadRecords(childId, ["runs", "nodes"]);
+            const run = state.runs.find((run) => run.id === runId)!;
+            const now = yield* DateTime.now;
+            yield* sink.write({
+              commandId: CommandId.make(`finish:${runId}`),
+              events: [
+                {
+                  id: EventId.make(`event:finish:${runId}`),
+                  type: "run.updated",
+                  threadId: childId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+                },
+                ...state.nodes
+                  .filter((node) => node.runId === runId)
+                  .map((node) => ({
+                    id: EventId.make(`event:finish:${node.id}`),
+                    type: "node.updated" as const,
+                    threadId: childId,
+                    runId: run.id,
+                    nodeId: node.id,
+                    occurredAt: now,
+                    payload: { ...node, status: "completed" as const, completedAt: now },
+                  })),
+              ],
+            });
+          });
+        const finishDelegations = Effect.gen(function* () {
+          const parent = yield* threads.getThreadRecords(parentId, ["subagents"]),
+            now = yield* DateTime.now;
+          yield* sink.write({
+            events: parent.subagents
+              .filter((task) => task.result === null)
+              .map((task) => ({
+                id: EventId.make(`finished:${task.id}`),
+                type: "subagent.updated" as const,
+                threadId: parentId,
+                occurredAt: now,
+                payload: {
+                  ...task,
+                  status: "completed" as const,
+                  result: "Completed this batch",
+                  completedAt: now,
+                  updatedAt: now,
+                },
+              })),
+          });
+        });
+        yield* finish(firstRun!);
+        yield* queue.reconcile("queue:matter", queueScope);
+        const partial = (yield* items.get(taskId, "three")).workItems[0]!;
+        assert.equal(partial.processedThroughSequence, 1);
+        assert.equal(partial.businessState, "active");
+        assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 1);
+        yield* finish(child.runs.find((run) => run.id !== firstRun)!.id);
+        yield* finishDelegations;
+        yield* queue.reconcile("queue:matter", queueScope);
+        const ended = (yield* items.get(taskId, "three")).workItems[0]!;
+        assert.equal(ended.processedThroughSequence, 3);
+        assert.equal(ended.businessState, "awaiting_delivery");
+        assert.equal((yield* queue.get("queue:matter", queueScope)).occupied, 0);
+        const proofRef = "refs/t3/workbench-handoffs/test";
+        git(actualChild.thread.worktreePath!, ["update-ref", proofRef, "HEAD"]);
+        yield* admit("four");
+        const completion = {
+          workItemId: ended.id,
+          expectedVersion: ended.version,
+          expectedLatestEventSequence: 3,
+          processedThroughSequence: 3,
+          handoffRef: "handoff:verified",
+          preservedRef: proofRef,
+        };
+        const stale = yield* items.complete(completion).pipe(Effect.flip);
+        assert.equal(stale._tag, "ScheduledTaskError");
+        yield* queue.reconcile("queue:matter", queueScope);
+        const fourth = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "four" });
+        assert.equal(fourth.workItem?.id, ended.id);
+        assert.equal(fourth.workItem?.workThreadId, childId);
+        assert.notEqual(
+          fourth.workItem?.activeBatch?.delegatedTaskId,
+          first.workItem!.delegatedTaskId,
+        );
+        const claimed = (yield* queue.get("queue:matter", queueScope)).items[0]!;
+        assert.notEqual(claimed.claimId, queued.items[0]!.claimId);
+        const batch = fourth.workItem!.activeBatch!;
+        const countBefore = (yield* threads.getThreadRecords(childId, ["messages"])).messages
+          .length;
+        yield* sql`UPDATE workbench_work_batches SET run_id=NULL,accepted_run_id=NULL,delegated_task_id=NULL,parent_run_id=NULL,state='unknown' WHERE id=${batch.id}`;
+        yield* sql`DELETE FROM orchestration_events WHERE command_id=${batch.commandId}`;
+        const recovered = yield* Effect.gen(function* () {
+          const fresh = yield* WorkbenchWorkItems.WorkbenchWorkItems;
+          return yield* fresh.get(taskId, "four");
+        }).pipe(Effect.provide(Layer.fresh(itemsLayer)));
+        assert.equal(recovered.workItems[0]?.activeBatch?.runId, batch.runId);
+        yield* dispatch.dispatch(
+          { ...scope, requestNamespace: "session:restart" },
+          { taskId, businessDeliveryId: "four" },
+        );
+        assert.equal(
+          (yield* threads.getThreadRecords(childId, ["messages"])).messages.length,
+          countBefore,
+        );
+        yield* finish(batch.runId!);
+        yield* finishDelegations;
+        const ready = (yield* items.get(taskId, "four")).workItems[0]!;
+        const complete = yield* items.complete({
+          ...completion,
+          expectedVersion: ready.version,
+          expectedLatestEventSequence: 4,
+          processedThroughSequence: 4,
+        });
+        assert.equal(complete.businessState, "completed");
+        git(root, ["commit", "--allow-empty", "-m", "New trusted baseline"]);
+        const newHead = git(root, ["rev-parse", "HEAD"]);
+        yield* admit("five");
+        yield* queue.reconcile("queue:matter", queueScope);
+        const reopened = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "five" });
+        assert.notEqual(reopened.workItem?.id, ended.id);
+        assert.notEqual(reopened.workItem?.workThreadId, childId);
+        assert.equal(reopened.workItem?.cycleNumber, 2);
+        assert.equal(reopened.workItem?.previousTaskId, ended.id);
+        const successor = yield* threads.getThreadRecords(
+          ThreadId.make(reopened.workItem!.workThreadId!),
+          ["messages"],
+        );
+        assert.equal(git(successor.thread.worktreePath!, ["rev-parse", "HEAD"]), newHead);
+        assert.include(successor.messages[0]!.text, ended.id);
+        assert.equal(worktrees, 2);
+        yield* admit("six", "A".repeat(55_000));
+        yield* admit("seven", "B".repeat(55_000));
+        yield* queue.reconcile("queue:matter", queueScope);
+        const bounded = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "six" });
+        assert.equal(bounded.remaining, 1);
+        yield* dispatch.dispatch(scope, { taskId });
+        const prefixes = yield* sql<{
+          from_sequence: number;
+          through_sequence: number;
+        }>`SELECT * FROM workbench_work_batches WHERE work_item_id=${reopened.workItem!.id} ORDER BY from_sequence`;
+        assert.deepEqual(
+          prefixes.map((batch) => [batch.from_sequence, batch.through_sequence]),
+          [
+            [1, 1],
+            [2, 2],
+            [3, 3],
+          ],
+        );
+        const successorId = ThreadId.make(reopened.workItem!.workThreadId!);
+        const priorRuns = (yield* threads.getThreadRecords(successorId, ["runs"])).runs.length;
+        yield* admit("eight", "<".repeat(20_000));
+        yield* queue.reconcile("queue:matter", queueScope);
+        const oversized = yield* dispatch.dispatch(scope, { taskId, businessDeliveryId: "eight" });
+        assert.equal(oversized.workItem?.errorCode, "batch_too_large");
+        assert.equal(oversized.workItem?.state, "blocked");
+        assert.equal(oversized.remaining, 0);
+        assert.equal(oversized.workItem?.latestEventSequence, 4);
+        assert.equal(oversized.workItem?.dispatchedThroughSequence, 3);
+        assert.equal(
+          (yield* threads.getThreadRecords(successorId, ["runs"])).runs.length,
+          priorRuns,
+        );
+        assert.equal(worktrees, 2);
+      }).pipe(Effect.provide(Layer.mergeAll(dispatchLayer, queues, itemsLayer, dependencies)));
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
+);

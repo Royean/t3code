@@ -39,6 +39,25 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       bindings: [],
       items: [],
     };
+    const receipt = {
+      trackingId: "epoch",
+      queueId: "queue",
+      controllerId: "controller",
+      projectId: "project" as never,
+      taskId: "task" as never,
+      taskCreatedAt: "2026-11-26T00:00:00.000Z",
+      dispatcherThreadId: "thread" as never,
+      intentId: "intent",
+      subscriptionScopeId: "scope",
+      businessDeliveryId: "event",
+      bodySha256: "a".repeat(64),
+    };
+    const prepare = () =>
+      Effect.gen(function* () {
+        calls++;
+        if (failure !== undefined) return yield* failure;
+        return receipt;
+      });
     const result = () =>
       Effect.gen(function* () {
         calls++;
@@ -54,6 +73,7 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
             bind: result,
             reconcile: result,
             priority: result,
+            prepareDeliveryIntent: prepare,
           }),
         ),
         Layer.provide(
@@ -109,6 +129,13 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
           }),
       ),
     ];
+    requests.push(
+      new Request("http://env.local/api/workbench/queues/queue/delivery-intents", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...receipt, expectedTrackingId: "epoch", matter: null }),
+      }),
+    );
     for (const request of requests) {
       expect((yield* Effect.promise(() => web.handler(request.clone()))).status).toBe(401);
       for (const scope of ["orchestration:read", "orchestration:operate"]) {
@@ -129,11 +156,11 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       const response = yield* Effect.promise(() => web.handler(allowed));
       expect(response.status).toBe(200);
       expect(yield* Effect.promise(() => response.json())).toEqual({
-        ...snapshot,
+        ...(request.url.endsWith("/delivery-intents") ? receipt : snapshot),
         environmentId: "env-test",
       });
     }
-    expect(calls).toBe(4);
+    expect(calls).toBe(5);
     failure = Object.defineProperty(new WorkbenchQueueError({ reason: "unavailable" }), "cause", {
       value: new Error("private SQL connection credential"),
     });

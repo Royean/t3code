@@ -38,6 +38,7 @@ import { Tool } from "effect/ai";
 import * as McpSchema from "effect/ai/McpSchema";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
+import { renderWorkbenchBatchBrief } from "../../apps/server/src/scheduledTasks/workbenchBrief.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
 import { advertisedJsonSchema } from "../../apps/server/src/mcp/advertisedJsonSchema.ts";
@@ -344,6 +345,16 @@ export const McpToolUseCase = Schema.Struct({
   }),
   /** Empty to resume a top-level thread without side-chat context after its last tool result. */
   prompt: Schema.String,
+  /** Uses the current service-generated child brief, not a copied prompt in case data. */
+  workbenchBrief: Schema.optional(
+    Schema.Struct({
+      eventJson: Schema.String,
+      followup: Schema.Boolean,
+      previous: Schema.optional(
+        Schema.Struct({ id: Schema.String, handoffRef: Schema.NullOr(Schema.String) }),
+      ),
+    }),
+  ),
   /** Records for the context chips `prompt` links, projected as T3 sends them. */
   promptContext: Schema.optional(Schema.Struct({ records: Schema.Array(ComposerContextRecord) })),
   expect: McpToolUseExpect,
@@ -1030,6 +1041,17 @@ const loadTools = (tools: Array<ApiTool>, id: string, found: ReadonlyArray<ApiTo
   return { type: "tool_result", tool_use_id: id, content };
 };
 
+const casePrompt = (testCase: McpToolUseCase) =>
+  testCase.workbenchBrief === undefined
+    ? testCase.prompt
+    : renderWorkbenchBatchBrief({
+        eventJson: testCase.workbenchBrief.eventJson,
+        followup: testCase.workbenchBrief.followup,
+        ...(testCase.workbenchBrief.previous === undefined
+          ? {}
+          : { previous: testCase.workbenchBrief.previous }),
+      });
+
 /** Messages for a case: reminders, context, prior turns with real tool blocks, then the prompt. */
 export const buildMessages = (sample: Sample) => {
   const { testCase, base, tools } = sample;
@@ -1101,10 +1123,11 @@ export const buildMessages = (sample: Sample) => {
     }
     if (turn.text) push(turn.role, text(turn.text));
   }
+  const sourcePrompt = casePrompt(testCase);
   const userText =
     testCase.promptContext === undefined
-      ? testCase.prompt
-      : projectComposerContextForProvider({ text: testCase.prompt, ...testCase.promptContext });
+      ? sourcePrompt
+      : projectComposerContextForProvider({ text: sourcePrompt, ...testCase.promptContext });
   const prompt =
     sideChatContext === undefined ? userText : withInlineContext(sideChatContext, userText);
   const childPrompt = () => taskPrompt({ task: prompt, role: delegateRole });
@@ -1549,7 +1572,7 @@ export const shellRequest = (sample: Sample, call: Omit<ShellEntry, "output">, m
         ]
       : []),
     ...(context ? [`The agent was told: ${context}`] : []),
-    `The agent's task: ${testCase.prompt}`,
+    `The agent's task: ${casePrompt(testCase)}`,
     ...namedPathsLine(testCase),
   ];
   const history = shell.map((entry) => `${callText(entry)}\n<output>\n${entry.output}\n</output>`);

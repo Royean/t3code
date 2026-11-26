@@ -17,6 +17,17 @@ export const layer = HttpApiBuilder.group(
     const identity = yield* ServerEnvironment.ServerEnvironmentIdentity;
     return handlers
       .handle(
+        "prepareDeliveryIntent",
+        Effect.fnUntraced(function* ({ params, payload }) {
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          return {
+            ...(yield* queue.prepareDeliveryIntent(params.queueId, payload)),
+            environmentId: yield* identity.getEnvironmentId,
+          };
+        }),
+      )
+      .handle(
         "get",
         Effect.fnUntraced(function* ({ params, query }) {
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);

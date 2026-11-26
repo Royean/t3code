@@ -623,13 +623,16 @@ const cleanupFixture = (
       },
     };
   });
-const pausedMeasurementFixture = (storageCleanup?: StorageCleanupSettings) =>
+const pausedMeasurementFixture = (
+  storageCleanup?: StorageCleanupSettings,
+  sqlOverride?: SqlClient.SqlClient,
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const measuring = yield* Deferred.make<void>();
     const resume = yield* Deferred.make<void>();
     let measuredPath: string | undefined;
-    const fixture = yield* cleanupFixture(storageCleanup).pipe(
+    const fixture = yield* cleanupFixture(storageCleanup, sqlOverride).pipe(
       Effect.provideService(FileSystem.FileSystem, {
         ...fs,
         readDirectory: (directory, options) =>
@@ -761,6 +764,29 @@ describe("checkpoint ref cleanup", () => {
         yield* command(repo, ["worktree", "remove", worktree]);
         yield* service.runNow;
         expect(yield* listRefs()).toEqual(retained.sort());
+      }).pipe(Effect.provide(Sqlite.layerMemory)),
+    ),
+  );
+
+  it.live("retains deleted business checkpoint history while recovery still depends on it", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const { service, sql, repo, worktree, command, addThread, listRefs } =
+          yield* checkpointCleanupFixture();
+        const owned = yield* addThread("business-child", { deleted: true });
+        const handoff = "refs/t3/workbench-handoffs/history";
+        yield* command(repo, ["update-ref", handoff, "HEAD"]);
+        yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,created_at,updated_at,matter_id,work_thread_id,worktree_path,latest_event_sequence,processed_through_sequence)
+        VALUES('history-cycle','task','2026-11-26T00:00:00.000Z','project-1','delivery','dispatcher','{}','2026-11-26T00:00:00.000Z','2026-11-26T00:00:00.000Z','matter','business-child',${worktree},1,1)`;
+        yield* command(repo, ["worktree", "remove", worktree]);
+        yield* service.runNow;
+        expect(yield* listRefs()).toEqual([...owned, handoff].sort());
+        yield* sql`UPDATE workbench_work_items SET business_state='completed',handoff_ref='handoff:history',preserved_ref=${handoff},recovery_ref='checkpoint:dependent'`;
+        yield* service.runNow;
+        expect(yield* listRefs()).toEqual([...owned, handoff].sort());
+        yield* sql`UPDATE workbench_work_items SET recovery_ref=NULL`;
+        yield* service.runNow;
+        expect(yield* listRefs()).toEqual([handoff]);
       }).pipe(Effect.provide(Sqlite.layerMemory)),
     ),
   );
@@ -3309,6 +3335,85 @@ describe("storage cleanup reports and local file policies", () => {
         });
       }),
     ),
+  );
+  it.live("rechecks business recovery dependencies before removing a measured worktree", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const { service, fs, worktree, command, measuring, resume } =
+          yield* pausedMeasurementFixture(
+            { ...DEFAULT_SERVER_SETTINGS.storageCleanup, worktreeAfterDays: 8 },
+            sql,
+          );
+        const proof = "refs/t3/workbench-handoffs/race";
+        yield* command(worktree, ["update-ref", proof, "HEAD"]);
+        yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,created_at,updated_at,matter_id,work_thread_id,worktree_path,business_state,latest_event_sequence,processed_through_sequence,handoff_ref,preserved_ref)
+        VALUES('race-cycle','task','2026-11-26T00:00:00.000Z','project-1','delivery','dispatcher','{}','2026-11-26T00:00:00.000Z','2026-11-26T00:00:00.000Z','matter','thread-1',${worktree},'completed',1,1,'handoff:race',${proof})`;
+        const removing = yield* service.runNow.pipe(Effect.forkScoped);
+        yield* Deferred.await(measuring);
+        yield* sql`UPDATE workbench_work_items SET recovery_ref='checkpoint:created-during-inspection'`;
+        yield* Deferred.succeed(resume, undefined);
+        expect(
+          (yield* Fiber.join(removing)).entries.find((entry) => entry.path === worktree),
+        ).toMatchObject({
+          outcome: "kept",
+          reason: "Business task is active or retained for recovery",
+        });
+        expect(yield* fs.exists(worktree)).toBe(true);
+      }).pipe(Effect.provide(Sqlite.layerMemory)),
+    ),
+  );
+
+  it.live(
+    "retains business work until its handoff, unique files and recovery dependencies are safe",
+    () =>
+      runCleanupTest(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const { service, fs, repo, worktree, command } = yield* cleanupFixture(
+            {
+              ...DEFAULT_SERVER_SETTINGS.storageCleanup,
+              worktreeAfterDays: 8,
+              worktreeKeepWhen: "any-local-files",
+            },
+            sql,
+          );
+          yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,created_at,updated_at,matter_id,work_thread_id,worktree_path,branch,latest_event_sequence,processed_through_sequence)
+        VALUES('business-cycle','task','2026-11-26T00:00:00.000Z','project-1','delivery','dispatcher','{}','2026-11-26T00:00:00.000Z','2026-11-26T00:00:00.000Z','matter','thread-1',${worktree},'feature',1,1)`;
+          const active = yield* service.runNow;
+          expect(active.entries.find((entry) => entry.path === worktree)).toMatchObject({
+            outcome: "kept",
+            reason: "Business task is active or retained for recovery",
+          });
+          expect(yield* fs.exists(worktree)).toBe(true);
+          const proof = "refs/t3/workbench-handoffs/cleanup";
+          yield* sql`UPDATE workbench_work_items SET business_state='completed',handoff_ref='handoff:verified',preserved_ref=${proof}`;
+          expect(
+            (yield* service.runNow).entries.find((entry) => entry.path === worktree),
+          ).toMatchObject({ outcome: "kept" });
+          yield* command(worktree, ["update-ref", proof, "HEAD"]);
+          yield* sql`UPDATE workbench_work_items SET recovery_ref='checkpoint:retained'`;
+          expect(
+            (yield* service.runNow).entries.find((entry) => entry.path === worktree),
+          ).toMatchObject({
+            outcome: "kept",
+            reason: "Business task is active or retained for recovery",
+          });
+          yield* sql`UPDATE workbench_work_items SET recovery_ref=NULL`;
+          yield* fs.writeFileString(`${worktree}/unique-notes.txt`, "unpreserved context");
+          expect(
+            (yield* service.runNow).entries.find((entry) => entry.path === worktree),
+          ).toMatchObject({ outcome: "kept" });
+          yield* fs.remove(`${worktree}/unique-notes.txt`);
+          expect(
+            (yield* service.runNow).entries.find((entry) => entry.path === worktree),
+          ).toMatchObject({ outcome: "removed" });
+          expect(yield* fs.exists(worktree)).toBe(false);
+          expect((yield* command(repo, ["rev-parse", proof])).stdout.trim()).toBe(
+            (yield* command(repo, ["rev-parse", "HEAD"])).stdout.trim(),
+          );
+        }).pipe(Effect.provide(Sqlite.layerMemory)),
+      ),
   );
   it.live(
     "discovers trunk without a remote HEAD or tracking ref and removes an integrated worktree",

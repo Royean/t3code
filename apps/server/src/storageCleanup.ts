@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as WorkbenchLifecycle from "./scheduledTasks/workbenchLifecycle.ts";
 import * as NodeFSP from "node:fs/promises";
 import {
   CheckpointScopeId,
@@ -64,6 +65,9 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { isNetworkPath } from "@t3tools/shared/path";
 
+const encodeRetainedThreads = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Array(Schema.String)),
+);
 const decodeCleanupThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
@@ -1141,6 +1145,37 @@ const make = Effect.gen(function* () {
       }
       return false;
     });
+    const workbenchReason = Effect.fnUntraced(function* (
+      paths: ReadonlyArray<string>,
+      threadIds: ReadonlyArray<string>,
+    ) {
+      const bindings = yield* WorkbenchLifecycle.workspaceBindings(paths, threadIds).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      for (const binding of bindings) {
+        if (
+          binding.business_state !== "completed" ||
+          binding.handoff_ref === null ||
+          binding.preserved_ref === null ||
+          binding.recovery_ref !== null ||
+          binding.latest_event_sequence !== binding.processed_through_sequence
+        )
+          return "business task is active or retained for recovery";
+        const head = yield* git
+          .resolveCommit({ cwd: paths[0]!, revision: "HEAD" })
+          .pipe(Effect.option);
+        const preserved = yield* git
+          .resolveCommit({ cwd: paths[0]!, revision: binding.preserved_ref })
+          .pipe(Effect.option);
+        if (
+          Option.isNone(head) ||
+          Option.isNone(preserved) ||
+          head.value.commitSha !== preserved.value.commitSha
+        )
+          return "business handoff evidence is unavailable or changed";
+      }
+      return null;
+    });
     const liveThreads = snapshot.threads.filter((thread) => thread.worktreePath !== null);
     const liveKeys = yield* Effect.forEach(liveThreads, (thread) =>
       canonical(thread.worktreePath!),
@@ -1222,6 +1257,11 @@ const make = Effect.gen(function* () {
         );
         if (!exists) return;
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
+        const businessProtection = yield* workbenchReason(
+          worktreePaths,
+          members.map((member) => member.id),
+        );
+        if (businessProtection !== null) return keep(businessProtection);
         if (members.length > 1 && worktreeOwner(members) === undefined)
           return keep(`shared by ${members.length} threads`);
         if (project === undefined) return keep("project is unavailable");
@@ -1287,6 +1327,11 @@ const make = Effect.gen(function* () {
         if (!eligible && !unchangedApplies && !settings.worktreeOnMerge) return keep(notDueReason);
         // Re-read this path's threads and sessions so new activity cancels removal; full per-worktree snapshots take seconds.
         const blockedSinceCheck = Effect.fnUntraced(function* () {
+          const businessProtection = yield* workbenchReason(
+            worktreePaths,
+            members.map((member) => member.id),
+          );
+          if (businessProtection !== null) return businessProtection;
           const latestProjects = yield* projectStore.listShells();
           if (yield* containsProjectRoot(worktreePaths, [project, ...latestProjects]))
             return "contains a project checkout";
@@ -1650,6 +1695,10 @@ const make = Effect.gen(function* () {
 
   const reportRef = yield* SubscriptionRef.make<StorageCleanupReport | null>(null);
   const cleanCheckpointRefs = Effect.fn("StorageCleanup.cleanCheckpointRefs")(function* () {
+    const protectedBusiness = yield* WorkbenchLifecycle.retainedBusinessThreads().pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.flatMap(encodeRetainedThreads),
+    );
     // Forks display their source history even after its thread is deleted. Keep
     // that ancestry, including deleted intermediate forks and archived children.
     const rows = yield* sql<{
@@ -1661,6 +1710,8 @@ const make = Effect.gen(function* () {
     }>`
       WITH RECURSIVE retained_checkpoint_threads(thread_id) AS (
         SELECT thread_id FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL
+        UNION
+        SELECT value FROM json_each(${protectedBusiness})
         UNION
         SELECT json_extract(t.payload_json, '$.forkedFrom.threadId')
         FROM orchestration_v2_projection_threads t

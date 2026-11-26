@@ -35,6 +35,7 @@ import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
+import * as Lifecycle from "./workbenchLifecycle.ts";
 import { renderWebhookPrompt } from "./webhookTemplate.ts";
 
 const decodeUpsertInput = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
@@ -205,6 +206,197 @@ it.effect("keeps every coalesced and replayed business alias independently of sa
         const native = yield* service.getExecutions({ id: task.id, deliveryId: first.deliveryId });
         assert.equal(native.aliases.length, 1);
       }
+    }),
+  ),
+);
+
+it.effect("admits prepared same-subscription events into one durable matter cycle", () =>
+  withService(({ service, sql }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          threadMode: "continue",
+          schedule: {
+            type: "webhook",
+            dedupe: {
+              replayKey: "{{body.deliveryId}}",
+              coalesceKey: "{{body.group}}",
+              coalesceWindowSeconds: 10,
+            },
+          },
+        }),
+      );
+      yield* sql`UPDATE scheduled_tasks SET thread_id='thread-1' WHERE task_id=${task.id}`;
+      yield* sql`INSERT INTO workbench_queues VALUES('queue:matter','controller',${task.projectId})`;
+      yield* sql`INSERT INTO workbench_queue_bindings VALUES(${task.id},${task.createdAt},'queue:matter',${task.projectId},'thread-1')`;
+      const [metadata] = yield* sql<{
+        tracking_id: string;
+      }>`SELECT tracking_id FROM scheduled_task_execution_metadata WHERE singleton=1`;
+      const prepare = (
+        id: string,
+        scope = "subscription:one",
+        matterKey: string | null = "123",
+        details: Record<string, unknown> = {},
+      ) =>
+        Effect.gen(function* () {
+          const bodyText = JSON.stringify({ deliveryId: id, group: "one", ...details });
+          const input = {
+            controllerId: "controller",
+            projectId: task.projectId,
+            expectedTrackingId: metadata!.tracking_id,
+            taskId: task.id,
+            taskCreatedAt: task.createdAt,
+            dispatcherThreadId: ThreadId.make("thread-1"),
+            intentId: `intent:${id}`,
+            subscriptionScopeId: scope,
+            businessDeliveryId: id,
+            bodySha256: NodeCrypto.createHash("sha256").update(bodyText).digest("hex"),
+            matter:
+              matterKey === null
+                ? null
+                : {
+                    provider: "github" as const,
+                    namespace: "https://github.com/repositories/42",
+                    kind: "issue" as const,
+                    key: matterKey,
+                    label: "Issue #123",
+                  },
+          };
+          yield* Lifecycle.prepareDeliveryIntent("queue:matter", input).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+          yield* Lifecycle.prepareDeliveryIntent("queue:matter", input).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+          return bodyText;
+        });
+      const one = yield* prepare("matter-one");
+      assert.equal((yield* sql`SELECT id FROM workbench_work_items`).length, 0);
+      yield* service.triggerWebhook(
+        requestFor(task, { bodyText: one, body: new TextEncoder().encode(one) }),
+      );
+      const two = yield* prepare("matter-two");
+      yield* service.triggerWebhook(
+        requestFor(task, { bodyText: two, body: new TextEncoder().encode(two) }),
+      );
+      yield* service.triggerWebhook(
+        requestFor(task, { bodyText: one, body: new TextEncoder().encode(one) }),
+      );
+      assert.equal((yield* sql`SELECT id FROM workbench_work_items`).length, 1);
+      const members = yield* sql<{
+        sequence: number;
+        event_json: string;
+      }>`SELECT sequence,event_json FROM workbench_work_item_events ORDER BY sequence`;
+      assert.deepEqual(
+        members.map((row) => row.sequence),
+        [1, 2],
+      );
+      assert.deepEqual(
+        members.map((row) => JSON.parse(row.event_json).bodyText),
+        [one, two],
+      );
+      const other = yield* prepare("other-subscription", "subscription:two");
+      yield* service.triggerWebhook(
+        requestFor(task, { bodyText: other, body: new TextEncoder().encode(other) }),
+      );
+      const issue = yield* prepare("other-issue", "subscription:one", "124");
+      yield* service.triggerWebhook(
+        requestFor(task, { bodyText: issue, body: new TextEncoder().encode(issue) }),
+      );
+      assert.equal((yield* sql`SELECT id FROM workbench_work_items`).length, 3);
+      const protectedBody = yield* prepare("body-bound");
+      const changed = protectedBody.replace('"group":"one"', '"group":"changed"');
+      yield* service
+        .triggerWebhook(
+          requestFor(task, { bodyText: changed, body: new TextEncoder().encode(changed) }),
+        )
+        .pipe(Effect.exit);
+      assert.equal(
+        (yield* sql`SELECT business_delivery_id FROM workbench_work_item_events WHERE business_delivery_id='body-bound'`)
+          .length,
+        0,
+      );
+      const validUtf8 = yield* prepare("invalid-utf8", "subscription:one", "123", {
+        note: "\uFFFD",
+      });
+      const bytes = new TextEncoder().encode(validUtf8),
+        marker = bytes.indexOf(0xef);
+      assert.isAtLeast(marker, 0);
+      const invalidBytes = new Uint8Array([
+        ...bytes.slice(0, marker),
+        0xff,
+        ...bytes.slice(marker + 3),
+      ]);
+      yield* service
+        .triggerWebhook(requestFor(task, { bodyText: validUtf8, body: invalidBytes }))
+        .pipe(Effect.exit);
+      assert.equal(
+        (yield* sql`SELECT * FROM workbench_work_item_events WHERE business_delivery_id='invalid-utf8'`)
+          .length,
+        0,
+      );
+      for (const id of ["fallback-one", "fallback-two"]) {
+        const body = yield* prepare(id, "subscription:fallback", null);
+        yield* service.triggerWebhook(
+          requestFor(task, { bodyText: body, body: new TextEncoder().encode(body) }),
+        );
+      }
+      const concurrent = yield* Effect.forEach(["parallel-one", "parallel-two"], (id) =>
+        prepare(id, "subscription:parallel"),
+      );
+      yield* Effect.forEach(
+        concurrent,
+        (body) =>
+          service.triggerWebhook(
+            requestFor(task, { bodyText: body, body: new TextEncoder().encode(body) }),
+          ),
+        { concurrency: "unbounded" },
+      );
+      assert.equal((yield* sql`SELECT id FROM workbench_work_items`).length, 6);
+      const parallel = yield* sql<{
+        work_item_id: string;
+        sequence: number;
+      }>`SELECT work_item_id,sequence FROM workbench_work_item_events WHERE business_delivery_id LIKE 'parallel-%' ORDER BY sequence`;
+      assert.equal(new Set(parallel.map((row) => row.work_item_id)).size, 1);
+      assert.deepEqual(
+        parallel.map((row) => row.sequence),
+        [1, 2],
+      );
+      yield* service.upsert(
+        yield* webhookTaskInput({
+          threadMode: "continue",
+          schedule: {
+            type: "webhook",
+            dedupe: { replayKey: "{{body.deliveryId}}" },
+            filters: [{ path: "body.kind", op: "equals", value: "wanted" }],
+          },
+        }),
+      );
+      const filteredBody = yield* prepare("filtered-prepared");
+      const filtered = yield* service.triggerWebhook(
+        requestFor(task, { bodyText: filteredBody, body: new TextEncoder().encode(filteredBody) }),
+      );
+      assert.isTrue(filtered._tag === "accepted" && filtered.outcome === "filtered");
+      yield* service.upsert(
+        yield* webhookTaskInput({
+          threadMode: "continue",
+          prompt: "{{body.note}}",
+          schedule: { type: "webhook", filters: [], dedupe: { replayKey: "{{body.deliveryId}}" } },
+        }),
+      );
+      const longBody = yield* prepare("long-prepared", "subscription:one", "123", {
+        note: "x".repeat(120_001),
+      });
+      const tooLong = yield* service.triggerWebhook(
+        requestFor(task, { bodyText: longBody, body: new TextEncoder().encode(longBody) }),
+      );
+      assert.isTrue(tooLong._tag === "accepted" && tooLong.outcome === "prompt_too_long");
+      assert.equal(
+        (yield* sql`SELECT * FROM workbench_work_item_events WHERE business_delivery_id IN ('filtered-prepared','long-prepared')`)
+          .length,
+        0,
+      );
+      assert.equal((yield* sql`SELECT id FROM workbench_work_items`).length, 6);
     }),
   ),
 );

@@ -411,6 +411,7 @@ export interface OrchestratorV2Shape {
   readonly delegatedTaskResultPending: (
     childThreadId: ThreadId,
     taskId?: NodeId,
+    runIds?: ReadonlyArray<RunId>,
   ) => Effect.Effect<boolean, OrchestratorProjectionError>;
   readonly restartContinuationPending: (run: OrchestrationV2Run) => Effect.Effect<boolean>;
   /** Declined continuations emit no thread event; this still wakes waiters. */
@@ -16137,14 +16138,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const delegatedTaskResultPending = Effect.fn("Orchestrator.delegatedTaskResultPending")(
-    function* (childThreadId: ThreadId, taskId?: NodeId) {
+    function* (childThreadId: ThreadId, taskId?: NodeId, runIds?: ReadonlyArray<RunId>) {
       const child = yield* projectionStore.getThreadRecords(
         childThreadId,
         ["runs", "messages", "subagents", "providerThreads", "providerTurns", "attempts"],
         { messageRoles: ["user"] },
       );
-      if (taskId !== undefined) {
-        const runs = delegatedTaskRuns(child, taskId);
+      if (taskId !== undefined || runIds !== undefined) {
+        const runs =
+          runIds === undefined
+            ? delegatedTaskRuns(child, taskId!)
+            : child.runs.filter((run) => runIds.includes(run.id));
         const run = delegatedTaskResultRun(runs);
         if (
           run === undefined ||
@@ -16159,7 +16163,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (progress.resultRun === undefined) return false;
       return yield* childAwaitsRestartContinuation(child.runs, progress.resultRun);
     },
-    (effect, childThreadId, _taskId?) =>
+    (effect, childThreadId, _taskId?, _runIds?) =>
       effect.pipe(
         Effect.mapError(
           (cause) => new OrchestratorProjectionError({ threadId: childThreadId, cause }),

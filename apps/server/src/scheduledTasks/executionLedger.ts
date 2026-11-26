@@ -4,6 +4,8 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { redactHeaders, redactQuery, type WebhookRequest } from "./webhookTemplate.ts";
 
+import { admitMatterEvent, digest } from "./workbenchLifecycle.ts";
+
 const encodeEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export interface ExecutionRow {
@@ -47,8 +49,14 @@ export function businessDeliveryId(task: ScheduledTask, request: WebhookRequest)
   }
 }
 
+const isScheduledTaskError = Schema.is(ScheduledTaskError);
 export const ledgerError = (cause: unknown) =>
-  new ScheduledTaskError({ message: "Could not access scheduled task execution tracking.", cause });
+  isScheduledTaskError(cause)
+    ? cause
+    : new ScheduledTaskError({
+        message: "Could not access scheduled task execution tracking.",
+        cause,
+      });
 
 export const recordAlias = Effect.fn("ScheduledTaskService.recordExecutionAlias")(
   function* (input: {
@@ -61,6 +69,7 @@ export const recordAlias = Effect.fn("ScheduledTaskService.recordExecutionAlias"
     receivedAt: string;
     create?: boolean;
     request?: WebhookRequest;
+    rawBody?: Uint8Array;
   }) {
     const sql = yield* SqlClient.SqlClient;
     if (input.create && input.executionId !== null) {
@@ -85,7 +94,20 @@ export const recordAlias = Effect.fn("ScheduledTaskService.recordExecutionAlias"
         headers: redactHeaders(request.headers),
         bodyText: request.bodyText,
       });
-      yield* sql`INSERT OR IGNORE INTO workbench_work_items
+      const handled = yield* admitMatterEvent({
+        taskId: input.task.id,
+        taskCreatedAt: input.task.createdAt,
+        projectId: input.task.projectId,
+        dispatcherThreadId: input.task.threadId,
+        businessDeliveryId: input.businessDeliveryId,
+        attemptId: input.attemptId,
+        executionId: input.executionId,
+        bodyDigest: input.rawBody === undefined ? null : digest(input.rawBody),
+        eventJson,
+        receivedAt: input.receivedAt,
+      });
+      if (!handled)
+        yield* sql`INSERT OR IGNORE INTO workbench_work_items
         (id, task_id, task_created_at, project_id, business_delivery_id, dispatcher_thread_id, source_execution_id, event_json, created_at, updated_at)
         SELECT ${`work-item:${input.attemptId}`}, ${input.task.id}, ${input.task.createdAt}, ${input.task.projectId},
           ${input.businessDeliveryId}, ${input.task.threadId}, ${input.executionId},

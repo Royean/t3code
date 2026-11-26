@@ -71,6 +71,8 @@ import {
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
 import {
+  WorkbenchDeliveryIntentInput,
+  WorkbenchDeliveryIntentReceipt,
   WorkbenchQueueScope,
   WorkbenchQueueBindInput,
   WorkbenchQueuePriorityInput,
@@ -1225,6 +1227,16 @@ class EnvironmentWorkbenchWorkItemsHttpApi extends HttpApiGroup.make("workbenchW
 ) {}
 
 class EnvironmentWorkbenchQueueHttpApi extends HttpApiGroup.make("workbenchQueue").add(
+  HttpApiEndpoint.post("prepareDeliveryIntent", "/api/workbench/queues/:queueId/delivery-intents", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchDeliveryIntentInput,
+    success: WorkbenchDeliveryIntentReceipt,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
   HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId", {
     params: { queueId: TrimmedNonEmptyString },
     headers: OptionalBearerHeaders,
