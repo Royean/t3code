@@ -12,13 +12,13 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Scope from "effect/Scope";
-import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import { reportLabel } from "@t3tools/provider-core/server/notification";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import { forkParked } from "../serverActivation.ts";
+import * as WorkbenchRelations from "../scheduledTasks/WorkbenchChildRelations.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -31,7 +31,7 @@ export class DelegatedTaskQuestionReactor extends Context.Service<
 >()("t3/orchestration-v2/DelegatedTaskQuestionReactor") {}
 
 const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const workbenchRelations = yield* WorkbenchRelations.WorkbenchChildRelations;
   const engine = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
 
@@ -184,25 +184,22 @@ const make = Effect.gen(function* () {
           event.payload.kind,
         )
       ) {
-        const rows = yield* sql<{
-          dispatcher_thread_id: string;
-          delegated_task_id: string;
-          project_id: string;
-          id: string;
-        }>`SELECT id, dispatcher_thread_id, delegated_task_id, project_id FROM workbench_work_items WHERE work_thread_id = ${event.threadId} AND delegated_task_id IS NOT NULL`;
+        // A provider may request approval before delegateTask returns to persist its association.
+        // The committed command receipt and projections already prove the registered child.
+        const rows = yield* workbenchRelations.find(event.threadId);
         for (const row of rows) {
           const child = yield* projections.getThreadRecords(event.threadId, [
             "runs",
             "nodes",
             "runtimeRequests",
           ]);
-          const parent = yield* projections.getThreadRecords(row.dispatcher_thread_id as ThreadId, [
+          const parent = yield* projections.getThreadRecords(row.dispatcherThreadId as ThreadId, [
             "subagents",
           ]);
           const task = parent.subagents.find(
             (task) =>
               task.origin === "app_owned" &&
-              task.id === row.delegated_task_id &&
+              task.id === row.delegatedTaskId &&
               task.childThreadId === event.threadId,
           );
           const request = child.runtimeRequests.find(
@@ -224,8 +221,8 @@ const make = Effect.gen(function* () {
             ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(
               run.status,
             ) ||
-            child.thread.projectId !== row.project_id ||
-            parent.thread.projectId !== row.project_id ||
+            child.thread.projectId !== row.projectId ||
+            parent.thread.projectId !== row.projectId ||
             parent.thread.deletedAt !== null ||
             parent.thread.archivedAt !== null
           )
@@ -354,13 +351,9 @@ const make = Effect.gen(function* () {
     // Recover an approval accepted just before a shutdown. The dispatch receipt makes each wake
     // idempotent with the live-event path; waiting runs alone never qualify.
     yield* Effect.gen(function* () {
-      const rows = yield* sql<{
-        work_thread_id: string;
-      }>`SELECT DISTINCT work_thread_id FROM workbench_work_items WHERE work_thread_id IS NOT NULL`;
+      const rows = yield* workbenchRelations.find();
       for (const row of rows) {
-        const child = yield* projections.getThreadRecords(row.work_thread_id as ThreadId, [
-          "runtimeRequests",
-        ]);
+        const child = yield* projections.getThreadRecords(row.workThreadId, ["runtimeRequests"]);
         for (const request of child.runtimeRequests) {
           if (
             request.status !== "pending" ||
@@ -389,4 +382,6 @@ const make = Effect.gen(function* () {
   return { start, handle } satisfies DelegatedTaskQuestionReactor["Service"];
 });
 
-export const layer = Layer.effect(DelegatedTaskQuestionReactor, make);
+export const layer = Layer.effect(DelegatedTaskQuestionReactor, make).pipe(
+  Layer.provide(WorkbenchRelations.layer),
+);

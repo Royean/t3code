@@ -3607,6 +3607,9 @@ it.live(
           ),
           Effect.scoped,
         );
+        // Maintenance may retain the thread marker while pruning the command's linkage events.
+        // Recovery must use the accepted receipt and durable projections, not those events.
+        yield* sql`DELETE FROM orchestration_events WHERE command_id = ${first.workItem!.requestId} AND event_type <> 'thread.created'`;
         const engine = yield* Orchestrator.OrchestratorV2;
         yield* engine.dispatch({
           type: "run.interrupt",
@@ -3635,6 +3638,9 @@ it.live(
         const sink = yield* EventSink.EventSinkV2;
         const now = yield* DateTime.now;
         const acceptedRun = (yield* threads.getThreadRecords(childId, ["runs"])).runs[0]!;
+        // The provider can request approval before the caller persists the child association.
+        // Its accepted delegation receipt and native projections already prove ownership.
+        yield* sql`UPDATE workbench_work_items SET work_thread_id = NULL, delegated_task_id = NULL WHERE id = 'work-item:stable'`;
         const approvalNodeId = NodeId.make("node:workbench-approval");
         const approval = {
           id: EventId.make("event:workbench-approval"),
@@ -3690,8 +3696,11 @@ it.live(
           const reactor = yield* QuestionReactor.DelegatedTaskQuestionReactor;
           yield* reactor.handle(approval);
           yield* reactor.handle(approval);
-          yield* reactor.start();
         }).pipe(Effect.provide(QuestionReactor.layer.pipe(Layer.provide(ProjectionStore.layer))));
+        const [unwritten] = yield* sql<{
+          work_thread_id: string | null;
+        }>`SELECT work_thread_id FROM workbench_work_items WHERE id = 'work-item:stable'`;
+        assert.isNull(unwritten?.work_thread_id);
         const observed = yield* Effect.gen(function* () {
           const items = yield* WorkbenchWorkItems.WorkbenchWorkItems;
           return yield* items.get(taskId, "business-one");
@@ -3703,6 +3712,15 @@ it.live(
         }>`SELECT status, COUNT(*) AS count FROM orchestration_command_receipts WHERE command_id = 'server:workbench-approval:work-item:stable:request:workbench-approval'`;
         assert.equal(wakeReceipt?.status, "accepted");
         assert.equal(wakeReceipt?.count, 1);
+        yield* sql`UPDATE workbench_work_items SET work_thread_id = NULL, delegated_task_id = NULL WHERE id = 'work-item:stable'`;
+        yield* Effect.gen(function* () {
+          const reactor = yield* QuestionReactor.DelegatedTaskQuestionReactor;
+          yield* reactor.start();
+        }).pipe(Effect.provide(QuestionReactor.layer.pipe(Layer.provide(ProjectionStore.layer))));
+        const [afterRestart] = yield* sql<{
+          count: number;
+        }>`SELECT COUNT(*) AS count FROM orchestration_command_receipts WHERE command_id = 'server:workbench-approval:work-item:stable:request:workbench-approval'`;
+        assert.equal(afterRestart?.count, 1);
         // An ordinary native child never gains this workflow's approval wake by inference.
         yield* sql`UPDATE workbench_work_items SET work_thread_id = NULL`;
         const unrelated = {

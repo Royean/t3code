@@ -1,5 +1,4 @@
 import {
-  CommandId,
   NodeId,
   type ScheduledTaskId,
   type ScheduledTask,
@@ -12,14 +11,12 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Receipts from "../orchestration-v2/CommandReceiptStore.ts";
-import * as Events from "../orchestration-v2/EventStore.ts";
 import * as Layer from "effect/Layer";
-import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ScheduledTasks from "./ScheduledTaskService.ts";
 import { ledgerError } from "./executionLedger.ts";
+import * as Relations from "./WorkbenchChildRelations.ts";
 
 export interface WorkItemRow {
   id: string;
@@ -61,8 +58,7 @@ export class WorkbenchWorkItems extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const receipts = yield* Receipts.CommandReceiptStoreV2;
-  const events = yield* Events.EventStoreV2;
+  const relations = yield* Relations.WorkbenchChildRelations;
   const tasks = yield* ScheduledTasks.ScheduledTaskService;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const binding = Effect.fn("WorkbenchWorkItems.binding")(function* (taskId: ScheduledTaskId) {
@@ -90,41 +86,26 @@ const make = Effect.gen(function* () {
   });
   const observe = Effect.fn("WorkbenchWorkItems.observe")(function* (row: WorkItemRow) {
     if (row.request_id !== null && row.work_thread_id === null) {
-      const receipt = yield* receipts
-        .getByCommandId(CommandId.make(row.request_id))
-        .pipe(Effect.mapError(ledgerError));
-      if (
-        Option.isSome(receipt) &&
-        receipt.value.status === "accepted" &&
-        receipt.value.threadId === row.dispatcher_thread_id &&
-        receipt.value.commandType === "delegated_task.request"
-      ) {
-        const stored = yield* events
-          .readByCommandId({ commandId: CommandId.make(row.request_id) })
-          .pipe(Stream.runCollect, Effect.mapError(ledgerError));
-        const taskEvent = stored.find(
-          (stored) =>
-            stored.event.type === "subagent.updated" &&
-            stored.event.payload.origin === "app_owned" &&
-            stored.event.payload.threadId === row.dispatcher_thread_id,
-        )?.event;
-        if (taskEvent?.type === "subagent.updated" && taskEvent.payload.childThreadId !== null) {
-          const childId = taskEvent.payload.childThreadId;
-          const runEvent = stored.find(
-            (stored) => stored.event.type === "run.created" && stored.event.threadId === childId,
-          )?.event;
-          yield* sql`UPDATE workbench_work_items SET delegated_task_id = ${taskEvent.payload.id}, work_thread_id = ${childId}, parent_run_id = ${taskEvent.payload.runId},
-            accepted_run_id = ${runEvent?.type === "run.created" ? runEvent.payload.id : null}, state = 'unknown', error_code = NULL WHERE id = ${row.id}`.pipe(
+      const relation = yield* relations.resolve({
+        id: row.id,
+        requestId: row.request_id,
+        dispatcherThreadId: row.dispatcher_thread_id,
+        projectId: row.project_id,
+      });
+      if (Option.isSome(relation)) {
+        const link = relation.value;
+        yield* sql`UPDATE workbench_work_items SET delegated_task_id = ${link.delegatedTaskId}, work_thread_id = ${link.workThreadId}, parent_run_id = ${link.parentRunId},
+          accepted_run_id = ${link.acceptedRunId}, state = 'unknown', error_code = NULL WHERE id = ${row.id}`.pipe(
+          Effect.mapError(ledgerError),
+        );
+        const [current] =
+          yield* sql<WorkItemRow>`SELECT * FROM workbench_work_items WHERE id = ${row.id}`.pipe(
             Effect.mapError(ledgerError),
           );
-          const [current] =
-            yield* sql<WorkItemRow>`SELECT * FROM workbench_work_items WHERE id = ${row.id}`.pipe(
-              Effect.mapError(ledgerError),
-            );
-          row = current!;
-        }
+        row = current!;
       }
     }
+
     // Reconcile the formal source message/run through its existing receipt-aware observer.
     const source = yield* tasks.getExecutions({
       id: row.task_id as ScheduledTaskId,
@@ -248,7 +229,4 @@ const make = Effect.gen(function* () {
   });
   return { binding, observe, get };
 });
-export const layer = Layer.effect(WorkbenchWorkItems, make).pipe(
-  Layer.provide(Receipts.layer),
-  Layer.provide(Events.layer),
-);
+export const layer = Layer.effect(WorkbenchWorkItems, make).pipe(Layer.provide(Relations.layer));
