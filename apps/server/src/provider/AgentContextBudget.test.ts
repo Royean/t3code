@@ -52,7 +52,10 @@ import { ProviderRegistry } from "./ProviderRegistry.ts";
 import budget from "./agentContextBudget.json" with { type: "json" };
 
 // Registration only stores tool definitions, so the handlers' services are never called.
+import * as WorkbenchDispatch from "../scheduledTasks/WorkbenchDispatch.ts";
+
 const toolHandlerServices = Layer.mergeAll(
+  Layer.mock(WorkbenchDispatch.WorkbenchDispatch)({}),
   Layer.mock(AssetSigner)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),

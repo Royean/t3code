@@ -1,4 +1,4 @@
-// Eval-only helper: it reads the local Codex config through python3 at startup.
+// Eval-only OpenAI Responses configuration; credentials stay in process memory.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as Schema from "effect/Schema";
@@ -7,9 +7,33 @@ import * as Schema from "effect/Schema";
 const decodeProxyConfig = Schema.decodeUnknownSync(
   Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String) }),
 );
-/** Reads the `vibeproxy` CLIProxyAPI provider from `~/.codex/config.toml`. */
-export const proxyConfig = () =>
-  decodeProxyConfig(
+/** Explicit eval credentials take precedence over the optional Codex proxy. */
+export const proxyConfig = () => {
+  const key = process.env.T3_EVAL_OPENAI_API_KEY;
+  const endpoint = process.env.T3_EVAL_OPENAI_BASE_URL;
+  if (key !== undefined || endpoint !== undefined) {
+    if (!key?.trim() || /[\r\n]/.test(key))
+      throw new Error("OpenAI eval credentials are not configured.");
+    let url: URL;
+    try {
+      url = new URL(endpoint ?? "https://api.openai.com/v1");
+    } catch {
+      throw new Error("OpenAI eval endpoint is invalid.");
+    }
+    if (
+      !["https:", "http:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    )
+      throw new Error("OpenAI eval endpoint is invalid.");
+    return {
+      url: url.href.replace(/\/+$/, ""),
+      headers: { Authorization: `Bearer ${key.trim()}` },
+    };
+  }
+  return decodeProxyConfig(
     JSON.parse(
       NodeChildProcess.execFileSync(
         "python3",
@@ -31,3 +55,4 @@ print(json.dumps({'url': p['base_url'].rstrip('/'), 'headers': h}))
       ),
     ),
   );
+};

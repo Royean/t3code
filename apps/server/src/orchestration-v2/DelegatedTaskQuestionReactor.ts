@@ -1,4 +1,5 @@
 import {
+  EventId,
   CommandId,
   MessageId,
   type OrchestrationV2DomainEvent,
@@ -11,6 +12,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Scope from "effect/Scope";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import { reportLabel } from "@t3tools/provider-core/server/notification";
@@ -29,6 +31,7 @@ export class DelegatedTaskQuestionReactor extends Context.Service<
 >()("t3/orchestration-v2/DelegatedTaskQuestionReactor") {}
 
 const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const engine = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
 
@@ -174,6 +177,79 @@ const make = Effect.gen(function* () {
         );
         return;
       }
+      if (
+        event.type === "runtime-request.updated" &&
+        event.payload.status === "pending" &&
+        ["command", "file-change", "file-read", "permission", "mcp-elicitation"].includes(
+          event.payload.kind,
+        )
+      ) {
+        const rows = yield* sql<{
+          dispatcher_thread_id: string;
+          delegated_task_id: string;
+          project_id: string;
+          id: string;
+        }>`SELECT id, dispatcher_thread_id, delegated_task_id, project_id FROM workbench_work_items WHERE work_thread_id = ${event.threadId} AND delegated_task_id IS NOT NULL`;
+        for (const row of rows) {
+          const child = yield* projections.getThreadRecords(event.threadId, [
+            "runs",
+            "nodes",
+            "runtimeRequests",
+          ]);
+          const parent = yield* projections.getThreadRecords(row.dispatcher_thread_id as ThreadId, [
+            "subagents",
+          ]);
+          const task = parent.subagents.find(
+            (task) =>
+              task.origin === "app_owned" &&
+              task.id === row.delegated_task_id &&
+              task.childThreadId === event.threadId,
+          );
+          const request = child.runtimeRequests.find(
+            (request) => request.id === event.payload.id && request.status === "pending",
+          );
+          const node = child.nodes.find((node) => node.id === request?.nodeId);
+          const run = child.runs.find(
+            (run) =>
+              run.id === node?.runId &&
+              (run.delegatedTaskId === task?.id ||
+                (run.delegatedTaskId === undefined &&
+                  child.thread.forkedFrom?.type === "node" &&
+                  child.thread.forkedFrom.nodeId === task?.id)),
+          );
+          if (
+            task === undefined ||
+            request === undefined ||
+            run === undefined ||
+            ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(
+              run.status,
+            ) ||
+            child.thread.projectId !== row.project_id ||
+            parent.thread.projectId !== row.project_id ||
+            parent.thread.deletedAt !== null ||
+            parent.thread.archivedAt !== null
+          )
+            continue;
+          const key = `${row.id}:${request.id}`;
+          yield* engine.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`server:workbench-approval:${key}`),
+            threadId: task.threadId,
+            messageId: MessageId.make(`message:workbench-approval:${key}`),
+            text: `Workbench child ${task.childThreadId} is blocked on approval ${request.id}. Read the native pending request and ask the user when approval is required. Do not infer approval from waiting status or grant broader permissions.`,
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            creationSource: "server",
+            notification: {
+              source: { kind: "delegated_task", taskIds: [task.id], childThreadId: event.threadId },
+              outcome: "updated",
+              summary: "Workbench child needs approval",
+            },
+          });
+        }
+        return;
+      }
       if (event.type !== "runtime-request.updated" || event.payload.kind !== "user_input") {
         return;
       }
@@ -237,7 +313,10 @@ const make = Effect.gen(function* () {
       case "subagent.updated":
         return Effect.succeed(event.payload.threadId);
       case "runtime-request.updated":
-        return event.payload.kind === "user_input"
+        return event.payload.kind === "user_input" ||
+          ["command", "file-change", "file-read", "permission", "mcp-elicitation"].includes(
+            event.payload.kind,
+          )
           ? projections
               .getThread(event.threadId)
               .pipe(Effect.map((child) => child.lineage.parentThreadId))
@@ -270,6 +349,39 @@ const make = Effect.gen(function* () {
         Effect.catchCause((cause) =>
           Effect.logWarning("delegated task question event stream failed", { cause }),
         ),
+      ),
+    );
+    // Recover an approval accepted just before a shutdown. The dispatch receipt makes each wake
+    // idempotent with the live-event path; waiting runs alone never qualify.
+    yield* Effect.gen(function* () {
+      const rows = yield* sql<{
+        work_thread_id: string;
+      }>`SELECT DISTINCT work_thread_id FROM workbench_work_items WHERE work_thread_id IS NOT NULL`;
+      for (const row of rows) {
+        const child = yield* projections.getThreadRecords(row.work_thread_id as ThreadId, [
+          "runtimeRequests",
+        ]);
+        for (const request of child.runtimeRequests) {
+          if (
+            request.status !== "pending" ||
+            !["command", "file-change", "file-read", "permission", "mcp-elicitation"].includes(
+              request.kind,
+            )
+          )
+            continue;
+          yield* handle({
+            id: EventId.make(`server:workbench-approval-catchup:${request.id}`),
+            type: "runtime-request.updated",
+            threadId: child.thread.id,
+            nodeId: request.nodeId,
+            occurredAt: request.createdAt,
+            payload: request,
+          });
+        }
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("recovering workbench approval notifications failed", { cause }),
       ),
     );
   });

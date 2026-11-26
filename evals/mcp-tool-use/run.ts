@@ -58,6 +58,7 @@ import { DeviceToolkit } from "../../apps/server/src/mcp/toolkits/device/tools.t
 import { EnvironmentToolkit } from "../../apps/server/src/mcp/toolkits/environment/tools.ts";
 import { HtmlToolkit } from "../../apps/server/src/mcp/toolkits/html/tools.ts";
 import { MessageToolkit } from "../../apps/server/src/mcp/toolkits/message/tools.ts";
+import { WorkbenchToolkit } from "../../apps/server/src/mcp/toolkits/workbench/tools.ts";
 import { OrchestratorToolkit } from "../../apps/server/src/mcp/toolkits/orchestrator/tools.ts";
 import { EventOrchestrationToolkit } from "../../apps/server/src/mcp/toolkits/eventOrchestration/tools.ts";
 import { PreviewToolkit } from "../../apps/server/src/mcp/toolkits/preview/tools.ts";
@@ -450,6 +451,7 @@ export const normalizeToolInput = (name: string, input: unknown) => {
 // description, and schema through unchanged.
 const t3SourceTools: ReadonlyArray<Tool.Any> = [
   OrchestratorToolkit,
+  WorkbenchToolkit,
   EventOrchestrationToolkit,
   ThreadToolkit,
   AttachmentToolkit,
@@ -1217,6 +1219,18 @@ export const t3Default = (
         inheritedProviderInstanceId: "claudeAgent",
         inheritedModel: sample.base.model,
         providers: PROVIDERS,
+      };
+    case "t3_workbench_dispatch":
+      return {
+        workItem: {
+          id: "work-item:one",
+          businessDeliveryId: input.businessDeliveryId ?? "business-one",
+          dispatcherThreadId: "33333333-3333-4333-8333-333333333333",
+          workThreadId: uuid(1),
+          state: "linked",
+        },
+        remaining: 0,
+        next: "End your turn. Native completion or questions wake this dispatcher; do not poll running children.",
       };
     case "delegate_task": {
       const n = sample.nextTask++;
@@ -2409,10 +2423,10 @@ export const summarize = (
     `- Pass: ${percent(passRate(rows))} of ${finished} samples.`,
     ...(errors.length > 0 ? [errorNote] : []),
     codex
-      ? "- Cost: the agent is not priced. `vibeproxy` in `~/.codex/config.toml` may use a subscription or bill an API key per token; agent tokens are below."
+      ? "- Cost: the OpenAI agent is not priced here. The configured endpoint may use subscription or API billing; agent token usage is below."
       : `- Estimated cost $${cost.toFixed(2)}, $${(cost / rows.length).toFixed(3)} per sample.`,
     `- Agent tokens: ${agent.tokens}${codex ? "." : ` ($${agent.cost.toFixed(2)}).`}`,
-    `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} (API-price estimate $${shell.cost.toFixed(2)}).`,
+    `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} (${isPricedModel(options.shellModel) ? `API-price estimate $${shell.cost.toFixed(2)}` : "price not estimated"}).`,
     ...(codex
       ? [
           "- Code-mode tools use case mocks and a simulated machine. Native subagent prompts and asynchronous notifications are approximate.",

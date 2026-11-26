@@ -14,6 +14,7 @@ pnpm mcp-tool-use --model claude-opus-5-5 --out runs/opus
 
 - `ANTHROPIC_API_KEY` in the repo root `.env` pays for Claude models and the Haiku shell simulator.
 - Codex models (`gpt-*` in `MODELS` in `run.ts`) go through a CLIProxyAPI server, set up as the `vibeproxy` model provider in `~/.codex/config.toml`. Keep the proxy under about 12 samples in flight across all runs.
+- To use an OpenAI Responses endpoint directly, pass `T3_EVAL_OPENAI_API_KEY` in the eval process environment, optionally with `T3_EVAL_OPENAI_BASE_URL` (default `https://api.openai.com/v1`). This explicit eval configuration takes precedence over the Codex proxy. Keep credentials in memory or a private local environment; never put them in cases, output or commits.
 - `--shell-model` picks the model that plays the shell: `claude-haiku-5-5` by default, or `gpt-6.1-terra` / `gpt-6-luna` through the same proxy, so Codex runs need no Anthropic key. Prefer Terra: Luna often contradicts the case's world (it calls named checkouts missing or files empty). Compare runs only when they used the same shell model.
 - Flags: `--case <ids>`, `--cases <file.ndjson>`, `--samples <n>` (default 2, and a 3rd when the first 2 disagree), `--concurrency <n>` (samples in flight, default 8), `--max-steps <n>`, `--effort <level>`, `--dry-run` (prints request bodies, no model calls), and `--context` (prints the size of T3's text and schemas, no key needed).
 - `--baseline <results.jsonl> --stop-on-regression` stops as soon as a case that passed every baseline sample fails. Use it to test one copy change against a baseline run.
@@ -288,6 +289,18 @@ Passes per case, main's runtime text (3 samples) → this branch's "Link every o
 | file-links-no-files-control   | 3/3 → 6/6 | 3/3 → 6/6  |
 
 After the change, the first reference to a file is an absolute link. The remaining failures come from two other kinds of span. Some repeat the file later as relative inline code (Sonnet's other-checkout failures). Others quote values rather than cite files, such as `main` set to `src/index.ts` or the import `./ws`. Chat still turns those spans into pills.
+
+## Workbench dispatcher cases
+
+`cases/workbench-dispatch.ndjson` covers the fixed OnWebhook dispatcher's use of
+`t3_workbench_dispatch`: drain one persisted item at a time, recover the same business identity
+after a lost response, and end the turn for native notifications instead of polling or starting a
+replacement child. The fake threads contain authored data from development-workbench issue #7;
+SQLite receipts, worktree isolation and approval delivery are covered by server integration tests.
+
+```sh
+node mcp-tool-use/run.ts --cases mcp-tool-use/cases/workbench-dispatch.ndjson --dry-run --out runs/workbench-dispatch
+```
 
 ## Where T3's text lives
 

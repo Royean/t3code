@@ -59,6 +59,10 @@ import * as EnvironmentHandlers from "./toolkits/environment/handlers.ts";
 import { ThemeToolkit } from "./toolkits/theme/tools.ts";
 import * as ThemeHandlers from "./toolkits/theme/handlers.ts";
 import * as AlwaysOnPeer from "./toolkits/alwaysOnPeer.ts";
+import { WorkbenchToolkit } from "./toolkits/workbench/tools.ts";
+import * as WorkbenchHandlers from "./toolkits/workbench/handlers.ts";
+import * as WorkbenchDispatch from "../scheduledTasks/WorkbenchDispatch.ts";
+import * as WorkbenchWorkItems from "../scheduledTasks/WorkbenchWorkItems.ts";
 import { EventOrchestrationToolkit } from "./toolkits/eventOrchestration/tools.ts";
 import * as EventOrchestrationHandlers from "./toolkits/eventOrchestration/handlers.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
@@ -1284,6 +1288,8 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+const layerWorkbenchToolkit = toolkitRegistration(WorkbenchToolkit, WorkbenchHandlers.layer);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
 const layerMessageToolkit = toolkitRegistration(MessageToolkit, MessageHandlers.layer);
@@ -1394,6 +1400,7 @@ export const layerTools = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerEventOrchestrationToolkit,
+  layerWorkbenchToolkit,
   layerThreadToolkit,
   layerAttachmentToolkit,
   layerProjectRegistration,
@@ -1465,5 +1472,12 @@ export const layerToolSearch = Layer.mergeAll(
 ).pipe(Layer.provide(layerToolExposure));
 
 export const layer = layerMcpTransport(
-  Layer.mergeAll(layerTools, layerToolSearch, layerAlwaysOnPeer),
+  Layer.mergeAll(layerTools, layerToolSearch, layerAlwaysOnPeer).pipe(
+    Layer.provide(
+      WorkbenchDispatch.layer.pipe(
+        Layer.provide(WorkbenchWorkItems.layer),
+        Layer.provide(OrchestratorMcpService.layer),
+      ),
+    ),
+  ),
 );

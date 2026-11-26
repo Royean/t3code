@@ -179,6 +179,8 @@ export interface OrchestratorMcpServiceShape {
   readonly delegateTask: (
     scope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
+    /** Internal persisted workbench base; never accepted from the MCP tool input. */
+    worktreeBaseRef?: string,
   ) => Effect.Effect<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure>;
   readonly taskStatus: (
     scope: McpInvocationScope,
@@ -764,7 +766,7 @@ function stablePart(value: string): string {
   return encodeURIComponent(value);
 }
 
-function stableCommandId(input: {
+export function stableCommandId(input: {
   readonly scope: McpInvocationScope;
   readonly requestKey: string;
   readonly operation: string;
@@ -2668,14 +2670,14 @@ const make = Effect.gen(function* () {
         },
       };
     }),
-    delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+    delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (caller, input, ref) {
       const environmentId =
         input.target === undefined
           ? undefined
-          : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
+          : PeerForwarding.remoteTarget(caller, input.target.environmentId);
       if (input.target !== undefined && environmentId !== undefined) {
-        yield* requireCapability(callerScope);
-        const scope = yield* requireThreadScope(callerScope, "delegate_task");
+        yield* requireCapability(caller);
+        const scope = yield* requireThreadScope(caller, "delegate_task");
         // The task's child runs as an ordinary thread there; this thread keeps the task.
         const { taskId } = yield* remoteDelegation.delegate(scope, {
           ...input,
@@ -2685,7 +2687,7 @@ const make = Effect.gen(function* () {
           ? awaitTask(scope, taskId, taskId, input.timeoutMs)
           : readTask(scope, taskId, false, true);
       }
-      const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+      const { scope, parent } = yield* loadThreadCaller(caller, "delegate_task");
       if (
         input.target?.projectId !== undefined &&
         input.target.projectId !== parent.thread.projectId
@@ -2737,7 +2739,7 @@ const make = Effect.gen(function* () {
         const base = yield* gitDriver
           .resolveCommit({
             cwd: parent.thread.worktreePath ?? project.workspaceRoot,
-            revision: "HEAD",
+            revision: ref ?? "HEAD",
           })
           .pipe(
             Effect.mapError(() =>
@@ -2747,7 +2749,7 @@ const make = Effect.gen(function* () {
         // Launch preparation creates the worktree from the project root, so a
         // parent checkout in another repository (such as a Git folder inside
         // Scratch) would hand it a commit it cannot find.
-        if (parent.thread.worktreePath !== null) {
+        if (parent.thread.worktreePath !== null || ref !== undefined) {
           yield* gitDriver
             .resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha })
             .pipe(

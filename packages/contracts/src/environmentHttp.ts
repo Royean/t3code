@@ -70,7 +70,12 @@ import {
   EnvironmentSpeechStatus,
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
-import { ScheduledTaskExecutionsQuery, ScheduledTaskExecutionsResult } from "./scheduledTask.ts";
+import {
+  WorkbenchWorkItemsQuery,
+  WorkbenchWorkItemsResult,
+  ScheduledTaskExecutionsQuery,
+  ScheduledTaskExecutionsResult,
+} from "./scheduledTask.ts";
 import { SecretReference } from "./secretReference.ts";
 import {
   EventOrchestrationAdmission,
@@ -1201,6 +1206,19 @@ class EnvironmentScheduledTaskExecutionsHttpApi extends HttpApiGroup.make(
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchWorkItemsHttpApi extends HttpApiGroup.make("workbenchWorkItems").add(
+  HttpApiEndpoint.get("get", "/api/scheduled-tasks/:taskId/work-items", {
+    params: { taskId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchWorkItemsQuery,
+    success: Schema.Struct({ ...WorkbenchWorkItemsResult.fields, environmentId: Schema.String }),
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      EnvironmentScheduledTaskExecutionError.pipe(HttpApiSchema.status(400)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
@@ -1213,4 +1231,5 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentAlwaysOnHttpApi)
   .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi)
+  .add(EnvironmentWorkbenchWorkItemsHttpApi)
   .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

@@ -473,3 +473,47 @@ export const ScheduledTaskExecutionsResult = Schema.Struct({
   ),
 });
 export type ScheduledTaskExecutionsResult = typeof ScheduledTaskExecutionsResult.Type;
+
+export const WorkbenchWorkItem = Schema.Struct({
+  id: Schema.String,
+  businessDeliveryId: Schema.String,
+  dispatcherThreadId: Schema.String,
+  sourceExecutionId: Schema.NullOr(Schema.String),
+  sourceRunId: Schema.NullOr(Schema.String),
+  requestId: Schema.NullOr(Schema.String),
+  parentRunId: Schema.NullOr(Schema.String),
+  delegatedTaskId: Schema.NullOr(Schema.String),
+  workThreadId: Schema.NullOr(Schema.String),
+  messageId: Schema.NullOr(Schema.String),
+  acceptedRunId: Schema.NullOr(Schema.String),
+  runId: Schema.NullOr(Schema.String),
+  branch: Schema.NullOr(Schema.String),
+  worktreePath: Schema.NullOr(Schema.String),
+  state: Schema.Literals(["pending", "dispatching", "linked", "unknown", "blocked"]),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  errorCode: Schema.NullOr(Schema.String),
+});
+export type WorkbenchWorkItem = typeof WorkbenchWorkItem.Type;
+export const WorkbenchWorkItemsQuery = Schema.Struct({
+  businessDeliveryId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+});
+export const WorkbenchWorkItemsResult = Schema.Struct({
+  trackingId: Schema.String,
+  taskId: Schema.String,
+  taskCreatedAt: IsoDateTime,
+  projectId: Schema.String,
+  workItems: Schema.Array(WorkbenchWorkItem),
+});
+export type WorkbenchWorkItemsResult = typeof WorkbenchWorkItemsResult.Type;
+export const WorkbenchDispatchInput = Schema.Struct({
+  taskId: ScheduledTaskId,
+  businessDeliveryId: Schema.optional(WorkbenchWorkItemsQuery.fields.businessDeliveryId),
+});
+export type WorkbenchDispatchInput = typeof WorkbenchDispatchInput.Type;
+export const WorkbenchDispatchResult = Schema.Struct({
+  workItem: Schema.NullOr(WorkbenchWorkItem),
+  remaining: Schema.Number,
+  next: Schema.String,
+});
+export type WorkbenchDispatchResult = typeof WorkbenchDispatchResult.Type;

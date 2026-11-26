@@ -3203,6 +3203,26 @@ it("leaves errored samples out of pass rates and lists them in the summary", () 
   assert.include(summary, "input 30");
 });
 
+it("does not label an unpriced OpenAI shell simulator as free", () => {
+  const usage = { input: 100, output: 20, cacheWrite: 0, cacheRead: 0 };
+  const summary = summarize(
+    [
+      {
+        id: "api-eval",
+        kind: "guard",
+        pattern: "workbench",
+        role: "top",
+        pass: true,
+        usage,
+        shellUsage: usage,
+      },
+    ],
+    { header: "direct API", shellModel: "gpt-6.1-terra", model: "gpt-6.1-sol" },
+  );
+  assert.include(summary, "price not estimated");
+  assert.notInclude(summary, "API-price estimate $0.00");
+});
+
 it.each(["couldn't", "couldn’t", "can’t"])(
   "accepts a typographic apostrophe in FAIL-AFTER-hub's disclosure: %s",
   (word) => {

@@ -2385,6 +2385,7 @@ export const layer = Layer.effect(
           attemptId,
           deliveryId,
           businessDeliveryId: ExecutionLedger.businessDeliveryId(task, request),
+          request,
           outcome,
           executionId: ownerExecutionId,
           receivedAt: iso(receivedAt),

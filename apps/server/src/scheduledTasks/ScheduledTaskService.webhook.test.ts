@@ -135,10 +135,11 @@ it.effect("tracks filtered business deliveries independently of sampled logs", (
 );
 
 it.effect("keeps every coalesced and replayed business alias independently of sampled logs", () =>
-  withService(({ service }) =>
+  withService(({ service, sql }) =>
     Effect.gen(function* () {
       const { task } = yield* service.upsert(
         yield* webhookTaskInput({
+          threadMode: "continue",
           schedule: {
             type: "webhook",
             dedupe: {
@@ -159,6 +160,7 @@ it.effect("keeps every coalesced and replayed business alias independently of sa
           }),
         );
       };
+      yield* sql`UPDATE scheduled_tasks SET thread_id = 'thread-1' WHERE task_id = ${task.id}`;
       const first = yield* trigger("one");
       const firstQuery = yield* service.getExecutions({ id: task.id, businessDeliveryId: "one" });
       assert.equal(firstQuery.effectiveExecutions.length, 1);
@@ -174,6 +176,30 @@ it.effect("keeps every coalesced and replayed business alias independently of sa
       assert.equal(coalesced.aliases.length, 2);
       assert.isTrue(coalesced.aliases.every((alias) => alias.executionId === executionId));
       assert.equal(coalesced.effectiveExecutions[0]!.id, executionId);
+      const items = yield* sql<{
+        business_delivery_id: string;
+        event_json: string;
+        source_execution_id: string;
+      }>`SELECT * FROM workbench_work_items ORDER BY rowid`;
+      assert.deepEqual(
+        items.map((item) => item.business_delivery_id),
+        ["one", "two"],
+      );
+      assert.deepEqual(
+        items.map((item) => JSON.parse(item.event_json).bodyText),
+        [
+          JSON.stringify({ deliveryId: "one", group: "one" }),
+          JSON.stringify({ deliveryId: "two", group: "one" }),
+        ],
+      );
+      assert.isTrue(items.every((item) => item.source_execution_id === executionId));
+      // A pre-migration alias has no provable first payload. A later duplicate cannot invent it.
+      yield* sql`DELETE FROM workbench_work_items WHERE business_delivery_id = 'one'`;
+      yield* trigger("one");
+      assert.equal(
+        (yield* sql`SELECT id FROM workbench_work_items WHERE business_delivery_id = 'one'`).length,
+        0,
+      );
       assert.isTrue(first._tag === "accepted" && other._tag === "accepted");
       if (first._tag === "accepted") {
         const native = yield* service.getExecutions({ id: task.id, deliveryId: first.deliveryId });

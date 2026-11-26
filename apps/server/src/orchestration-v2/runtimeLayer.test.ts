@@ -2253,7 +2253,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       // Started as server.ts starts it, so its wakes come from its own event stream.
       yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor.pipe(
         Effect.flatMap((reactor) => reactor.start()),
-        Effect.provide(DelegatedTaskQuestionReactor.layer),
+        Effect.provide(
+          DelegatedTaskQuestionReactor.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+        ),
       );
       const busyThreadId = ThreadId.make("runtime-question-wake-busy");
       const busy = yield* delegate(busyThreadId);
