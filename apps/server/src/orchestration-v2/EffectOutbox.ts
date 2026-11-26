@@ -188,6 +188,7 @@ export interface OrchestrationEffectV2 {
   readonly updatedAt: string;
   readonly completedAt: string | null;
   readonly lastError: string | null;
+  readonly attentionEpoch?: number | null;
 }
 
 export interface PendingOrchestrationEffectV2 {
@@ -284,6 +285,7 @@ type EffectRow = {
   readonly updated_at: string;
   readonly completed_at: string | null;
   readonly last_error: string | null;
+  readonly attention_epoch: number | null;
 };
 
 const encodeRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
@@ -306,6 +308,7 @@ const rowToEffect = (row: EffectRow) =>
       updatedAt: row.updated_at,
       completedAt: row.completed_at,
       lastError: row.last_error,
+      attentionEpoch: row.attention_epoch,
     })),
   );
 
@@ -419,7 +422,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
                 attempt_count,
                 available_at,
                 created_at,
-                updated_at
+                updated_at,
+                attention_epoch
               )
               VALUES (
                 ${effect.id},
@@ -431,7 +435,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
                 0,
                 ${DateTime.formatIso(effect.availableAt ?? now)},
                 ${nowIso},
-                ${nowIso}
+                ${nowIso},
+                (SELECT attention_epoch FROM workbench_work_items WHERE work_thread_id=${effect.threadId} LIMIT 1)
               )
               ON CONFLICT(effect_id) DO NOTHING
             `,

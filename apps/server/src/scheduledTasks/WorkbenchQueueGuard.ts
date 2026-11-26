@@ -7,7 +7,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
 
 export const WorkbenchQueuePermit = Context.Reference<
-  { readonly workItemId: string; readonly claimId: string } | undefined
+  | { readonly workItemId: string; readonly claimId: string; readonly attentionEpoch?: number }
+  | undefined
 >("t3/workbench/QueuePermit", { defaultValue: () => undefined });
 
 export class WorkbenchQueueGuard extends Context.Service<
@@ -49,7 +50,7 @@ const make = Effect.gen(function* () {
           ? []
           : yield* sql`SELECT 1 FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id
       JOIN workbench_queue_bindings b ON b.queue_id=e.queue_id AND b.task_id=w.task_id AND b.task_created_at=w.task_created_at
-      WHERE e.state='occupied' AND e.work_item_id=${permit.workItemId} AND e.claim_id=${permit.claimId} AND w.request_id=${command.commandId}
+      WHERE w.attention_hold=0 AND w.attention_epoch=${permit?.attentionEpoch ?? 0} AND e.state='occupied' AND e.work_item_id=${permit.workItemId} AND e.claim_id=${permit.claimId} AND w.request_id=${command.commandId}
       AND b.dispatcher_thread_id=${command.parentThreadId} AND w.dispatcher_thread_id=b.dispatcher_thread_id AND w.project_id=b.project_id LIMIT 1`;
       if (rows.length !== 1)
         return yield* new OrchestratorDispatchError({

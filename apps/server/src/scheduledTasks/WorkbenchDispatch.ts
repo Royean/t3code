@@ -23,6 +23,7 @@ import * as Option from "effect/Option";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import { WorkbenchQueuePermit } from "./WorkbenchQueueGuard.ts";
+import * as Attention from "./WorkbenchAttention.ts";
 import * as WorkbenchQueue from "./WorkbenchQueue.ts";
 import * as WorkItems from "./WorkbenchWorkItems.ts";
 import { renderWorkbenchBatchBrief } from "./workbenchBrief.ts";
@@ -78,6 +79,7 @@ export class WorkbenchDispatch extends Context.Service<
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const queue = yield* WorkbenchQueue.WorkbenchQueue;
+  const attention = yield* Effect.serviceOption(Attention.WorkbenchAttention);
   const items = yield* WorkItems.WorkbenchWorkItems;
   const threads = yield* Threads.ThreadManagementService;
   const delegate = yield* McpOrchestrator.OrchestratorMcpService;
@@ -122,6 +124,22 @@ const make = Effect.gen(function* () {
           selected === undefined
             ? null
             : yield* items.observe(selected).pipe(Effect.mapError(unavailable));
+        if (selected?.attention_hold === 1) {
+          if (Option.isNone(attention) || selectedPermit === null) return yield* unavailable();
+          yield* attention.value
+            .resumeClaim(selected.id, selectedPermit.claimId)
+            .pipe(Effect.mapError(unavailable));
+          const [current] =
+            yield* sql<WorkItems.WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${selected.id}`.pipe(
+              Effect.mapError(unavailable),
+            );
+          workItem = yield* items.observe(current!).pipe(Effect.mapError(unavailable));
+          yield* queue.dispatched(selected.id).pipe(Effect.mapError(unavailable));
+          return dispatchResult(
+            workItem,
+            yield* queue.remaining(task.id).pipe(Effect.mapError(unavailable)),
+          );
+        }
         if (selected !== undefined && workItem !== null) {
           const batch =
             selected.matter_id === null

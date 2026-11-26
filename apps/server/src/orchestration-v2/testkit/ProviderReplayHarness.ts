@@ -59,6 +59,7 @@ import * as ProviderTurnStartServiceTestkit from "../ProviderTurnStartService.te
 import * as McpAppModelContext from "../../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../../preview/PreviewAgentActivity.ts";
 import * as RunExecutionService from "../RunExecutionService.ts";
+import * as WorkbenchAttentionGuard from "../WorkbenchAttentionGuard.ts";
 import * as RunFinalizationService from "../RunFinalizationService.ts";
 import * as ThreadTitleRegenerationService from "../ThreadTitleRegenerationService.ts";
 import * as RuntimePolicy from "../RuntimePolicy.ts";
@@ -295,6 +296,8 @@ export function layerWithRegistry<Error>(
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
+  | RunExecutionService.RunExecutionServiceV2
+  | WorkbenchAttentionGuard.WorkbenchAttentionGuard
   | CommandOutputRecorder.CommandOutputRecorder
   | ThreadCommandExecutor.ThreadCommandExecutor,
   Error | MigrationError | PlatformError.PlatformError | SqlError
@@ -341,13 +344,14 @@ export function layerWithRegistry<Error>(
           }),
         ).pipe(Layer.provide(ProjectionStore.layer));
   const layerStores = Layer.mergeAll(
+    WorkbenchAttentionGuard.layer,
     EventStore.layer,
     layerProjectionStore,
     ProjectStore.layer,
     CommandReceiptStore.layer,
     layerEffectOutboxProvided,
     TurnItemPositionStore.layer,
-  ).pipe(Layer.provide(layerDatabase));
+  ).pipe(Layer.provideMerge(layerDatabase));
   const layerEventSinkProvided = EventSink.layerFromStores.pipe(
     Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
   );
@@ -560,6 +564,8 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
   );
   const layerReplayRuntime = Layer.mergeAll(
+    WorkbenchAttentionGuard.layer,
+    layerRunExecutionServiceProvided,
     layerEffectOutboxProvided,
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
@@ -569,6 +575,7 @@ export function layerWithRegistry<Error>(
     layerCommandOutputHubProvided,
     ThreadCommandExecutor.layer,
   ).pipe(
+    Layer.provideMerge(layerDatabase),
     Layer.provide(ProviderTurnStartServiceTestkit.layer),
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );

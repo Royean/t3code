@@ -846,6 +846,8 @@ it.effect("rechecks run ownership immediately before calling the provider", () =
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const guardCalls = yield* Ref.make(0);
     const providerStarts = yield* Ref.make(0);
+    const preparing = yield* Deferred.make<void>();
+    const releasePreparation = yield* Deferred.make<void>();
     const threadId = ThreadId.make("thread:run-execution-start-guard");
     const runId = RunId.make("run:run-execution-start-guard");
     const attemptId = RunAttemptId.make("attempt:run-execution-start-guard");
@@ -873,42 +875,56 @@ it.effect("rechecks run ownership immediately before calling the provider", () =
       startTurn: () => Ref.update(providerStarts, (count) => count + 1),
     } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
 
-    yield* runExecution.startRootRun({
-      commandId: CommandId.make("command:run-execution-start-guard"),
-      appThread: rootAppThread(threadId),
-      providerSessionId,
-      session,
-      run,
-      rootNode,
-      checkpointScope: {
-        id: CheckpointScopeId.make("checkpoint-scope:run-execution-start-guard"),
-      } as OrchestrationV2CheckpointScope,
-      providerThread,
-      attempt,
-      attemptId,
-      providerTurnOrdinal: 1,
-      shouldStartProviderTurn: () =>
-        Ref.modify(guardCalls, (calls) => [calls === 0, calls + 1] as const),
-      message: {
-        messageId: MessageId.make("message:run-execution-start-guard"),
-        text: "Do not start after ownership changes.",
-        attachments: [],
-        createdBy: "user",
-        creationSource: "web",
-      },
-      modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
-      runtimePolicy: {
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        cwd: process.cwd(),
-        approvalPolicy: "never",
-        sandboxPolicy: {
-          type: "readOnly",
-          access: { type: "fullAccess" },
-          networkAccess: false,
+    const startup = yield* runExecution
+      .startRootRun({
+        commandId: CommandId.make("command:run-execution-start-guard"),
+        appThread: rootAppThread(threadId),
+        providerSessionId,
+        session,
+        run,
+        rootNode,
+        checkpointScope: {
+          id: CheckpointScopeId.make("checkpoint-scope:run-execution-start-guard"),
+        } as OrchestrationV2CheckpointScope,
+        providerThread,
+        attempt,
+        attemptId,
+        providerTurnOrdinal: 1,
+        shouldStartProviderTurn: () =>
+          Deferred.succeed(preparing, undefined).pipe(
+            Effect.andThen(Deferred.await(releasePreparation)),
+            Effect.andThen(Ref.modify(guardCalls, (calls) => [calls === 0, calls + 1] as const)),
+          ),
+        message: {
+          messageId: MessageId.make("message:run-execution-start-guard"),
+          text: "Do not start after ownership changes.",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
         },
-      },
-    });
+        modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+          approvalPolicy: "never",
+          sandboxPolicy: {
+            type: "readOnly",
+            access: { type: "fullAccess" },
+            networkAccess: false,
+          },
+        },
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }));
+
+    yield* Deferred.await(preparing);
+    const quiescent = yield* runExecution
+      .awaitThreadQuiescent(threadId)
+      .pipe(Effect.forkChild({ startImmediately: true }));
+    assert.isUndefined(quiescent.pollUnsafe());
+    yield* Deferred.succeed(releasePreparation, undefined);
+    yield* Fiber.join(startup);
+    yield* Fiber.join(quiescent);
 
     assert.equal(yield* Ref.get(guardCalls), 2);
     assert.equal(yield* Ref.get(providerStarts), 0);
@@ -3823,11 +3839,16 @@ it.effect.each([
     const key = `preview-activity:background:${openSubagent}`;
     const consumerWaiting = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
+    const closing = yield* Deferred.make<void>();
+    const releaseClose = yield* Deferred.make<void>();
     const providerInstanceId = ProviderInstanceId.make("codex");
     yield* captureRootRunTermination({
       key,
       shouldFinalizeRun: () => Effect.succeed(true),
       hasPendingBackgroundWorkForThread: () => Effect.succeed(true),
+      onSubscriptionClose: Deferred.succeed(closing, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseClose)),
+      ),
       events: (ids) =>
         Stream.concat(
           Stream.fromIterable([
@@ -3860,7 +3881,16 @@ it.effect.each([
           assert.isFalse(yield* Deferred.isDone(closed));
           const activity = yield* PreviewAgentActivity.PreviewAgentActivity;
           assert.equal(yield* activity.active(ThreadId.make(`thread:${key}`)), openSubagent);
+          const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+          const quiescent = yield* runExecution
+            .awaitThreadQuiescent(ThreadId.make(`thread:${key}`))
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          assert.isUndefined(quiescent.pollUnsafe());
           yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(closing);
+          assert.isUndefined(quiescent.pollUnsafe());
+          yield* Deferred.succeed(releaseClose, undefined);
+          yield* Fiber.join(quiescent);
         }),
     });
   }),
@@ -4013,7 +4043,11 @@ function captureRootRunTermination(input: {
   ) => Effect.Effect<boolean, EventSink.EventSinkV2Error>;
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
-  ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
+  ) => Effect.Effect<
+    void,
+    never,
+    PreviewAgentActivity.PreviewAgentActivity | RunExecutionService.RunExecutionServiceV2
+  >;
   /** Changes the stored rows after the provider reported them, as a concurrent Stop does. */
   readonly settleStored?: (
     work: RunExecutionService.UnsettledWork,

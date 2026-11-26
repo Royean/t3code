@@ -5,6 +5,7 @@ import {
   ForwardCompatibleArray,
   IsoDateTime,
   ProjectId,
+  RunId,
   ScheduledTaskId,
   SecretRef,
   ThreadId,
@@ -641,7 +642,9 @@ export const WorkbenchQueueSnapshot = Schema.Struct({
       dispatcherThreadId: ThreadId,
       priority: Schema.Int,
       enqueueSequence: Schema.Int,
-      queueState: Schema.Literals(["queued", "occupied", "finished"]),
+      queueState: Schema.Literals(["queued", "occupied", "finished", "paused"]),
+      workItemVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      latestEventSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
       claimId: Schema.NullOr(Schema.String),
       workThreadId: Schema.NullOr(Schema.String),
       runId: Schema.NullOr(Schema.String),
@@ -658,6 +661,7 @@ export const WorkbenchQueueSnapshot = Schema.Struct({
           "approval",
           "state_unknown",
           "over_capacity",
+          "attention",
         ]),
       ),
       createdAt: IsoDateTime,
@@ -674,7 +678,121 @@ export class WorkbenchQueueError extends Schema.TaggedError<WorkbenchQueueError>
       "conflict",
       "not_found",
       "not_queued",
+      "stale_state",
       "unavailable",
     ]),
   },
 ) {}
+
+const AttentionText = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1024));
+const AttentionAction = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(2048));
+const AttentionVersion = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const AttentionRequestId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
+export const WorkbenchAttentionScope = Schema.Struct({
+  ...WorkbenchQueueScope.fields,
+  expectedTrackingId: AttentionRequestId,
+});
+export const WorkbenchAttentionQuery = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  cursor: Schema.optional(AttentionRequestId),
+});
+export const WorkbenchAttentionPauseInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  clientRequestId: AttentionRequestId,
+  expectedWorkItemVersion: AttentionVersion,
+  expectedLatestEventSequence: AttentionVersion,
+  reason: Schema.Struct({
+    code: Schema.Literal("manual"),
+    summary: AttentionText,
+    requiredAction: AttentionAction,
+  }),
+});
+export type WorkbenchAttentionPauseInput = typeof WorkbenchAttentionPauseInput.Type;
+export const WorkbenchAttentionRecordInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  clientRequestId: AttentionRequestId,
+  expectedVersion: AttentionVersion,
+  result: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(16000)),
+  priority: WorkbenchQueuePriorityInput.fields.priority,
+});
+export type WorkbenchAttentionRecordInput = typeof WorkbenchAttentionRecordInput.Type;
+export const WorkbenchAttentionRequeueInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  clientRequestId: AttentionRequestId,
+  expectedVersion: AttentionVersion,
+});
+export type WorkbenchAttentionRequeueInput = typeof WorkbenchAttentionRequeueInput.Type;
+export const WorkbenchAttentionSummary = Schema.Struct({
+  id: Schema.String,
+  workItemId: Schema.String,
+  taskId: ScheduledTaskId,
+  taskCreatedAt: IsoDateTime,
+  version: AttentionVersion,
+  phase: Schema.Literals([
+    "pausing",
+    "awaiting_user",
+    "requeue_pending",
+    "resuming",
+    "resolved",
+    "blocked",
+  ]),
+  reason: Schema.Struct({
+    code: Schema.Literals(["manual", "user_input", "approval", "external_action", "unknown"]),
+    summary: AttentionText,
+    requiredAction: AttentionAction,
+  }),
+  priority: Schema.Int,
+  slotState: Schema.Literals(["occupied", "released", "queued"]),
+  checkpoint: Schema.Struct({
+    status: Schema.Literals(["pending", "ready", "missing", "error"]),
+    capturedAt: Schema.NullOr(IsoDateTime),
+  }),
+  resolution: Schema.Struct({
+    summary: Schema.NullOr(AttentionText),
+    recordedAt: Schema.NullOr(IsoDateTime),
+  }),
+  canRequeue: Schema.Boolean,
+  blockedReason: Schema.NullOr(
+    Schema.Literals([
+      "state_unknown",
+      "not_quiescent",
+      "checkpoint_failed",
+      "workspace_unavailable",
+      "workspace_changed",
+      "provider_context_unavailable",
+      "pending_runtime_request",
+      "stale_state",
+    ]),
+  ),
+  dispatcherThreadId: ThreadId,
+  workThreadId: Schema.NullOr(ThreadId),
+  sourceRunId: Schema.NullOr(RunId),
+  resumeRunId: Schema.NullOr(RunId),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkbenchAttentionSummary = typeof WorkbenchAttentionSummary.Type;
+const AttentionIdentity = Schema.Struct({
+  environmentId: Schema.String,
+  trackingId: Schema.String,
+  queueId: Schema.String,
+  controllerId: Schema.String,
+  projectId: ProjectId,
+});
+export const WorkbenchAttentionSnapshot = Schema.Struct({
+  ...AttentionIdentity.fields,
+  attentions: Schema.Array(WorkbenchAttentionSummary),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+export type WorkbenchAttentionSnapshot = typeof WorkbenchAttentionSnapshot.Type;
+export const WorkbenchAttentionMutationResult = Schema.Struct({
+  ...AttentionIdentity.fields,
+  attention: WorkbenchAttentionSummary,
+  operation: Schema.Struct({
+    clientRequestId: AttentionRequestId,
+    kind: Schema.Literals(["pause", "record", "requeue"]),
+    state: Schema.Literals(["pending", "applied", "blocked", "unknown"]),
+  }),
+  queue: WorkbenchQueueSnapshot,
+});
+export type WorkbenchAttentionMutationResult = typeof WorkbenchAttentionMutationResult.Type;

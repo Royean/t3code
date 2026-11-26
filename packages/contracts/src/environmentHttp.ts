@@ -71,6 +71,12 @@ import {
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
 import {
+  WorkbenchAttentionQuery,
+  WorkbenchAttentionPauseInput,
+  WorkbenchAttentionRecordInput,
+  WorkbenchAttentionRequeueInput,
+  WorkbenchAttentionSnapshot,
+  WorkbenchAttentionMutationResult,
   WorkbenchDeliveryIntentInput,
   WorkbenchDeliveryIntentReceipt,
   WorkbenchQueueScope,
@@ -1279,6 +1285,49 @@ class EnvironmentWorkbenchQueueHttpApi extends HttpApiGroup.make("workbenchQueue
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchAttentionHttpApi extends HttpApiGroup.make("workbenchAttention").add(
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/attention", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchAttentionQuery,
+    success: WorkbenchAttentionSnapshot,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("pause", "/api/workbench/queues/:queueId/attention/:workItemId/pause", {
+    params: { queueId: TrimmedNonEmptyString, workItemId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchAttentionPauseInput,
+    success: WorkbenchAttentionMutationResult,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("record", "/api/workbench/queues/:queueId/attention/:attentionId/record", {
+    params: { queueId: TrimmedNonEmptyString, attentionId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchAttentionRecordInput,
+    success: WorkbenchAttentionMutationResult,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("requeue", "/api/workbench/queues/:queueId/attention/:attentionId/requeue", {
+    params: { queueId: TrimmedNonEmptyString, attentionId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchAttentionRequeueInput,
+    success: WorkbenchAttentionMutationResult,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
@@ -1292,5 +1341,6 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi)
   .add(EnvironmentWorkbenchQueueHttpApi)
+  .add(EnvironmentWorkbenchAttentionHttpApi)
   .add(EnvironmentWorkbenchWorkItemsHttpApi)
   .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

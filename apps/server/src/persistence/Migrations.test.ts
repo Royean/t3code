@@ -61,6 +61,7 @@ describe("runMigrations", () => {
           { migration_id: 5, name: "WorkbenchWorkItems" },
           { migration_id: 6, name: "WorkbenchQueue" },
           { migration_id: 7, name: "WorkbenchMatters" },
+          { migration_id: 8, name: "WorkbenchAttention" },
         ]);
         const alwaysOn = yield* sql`SELECT name FROM sqlite_master WHERE name = 'always_on_agent'`;
         assert.deepStrictEqual(alwaysOn, [{ name: "always_on_agent" }]);
@@ -87,7 +88,7 @@ describe("runMigrations", () => {
       assert.isFalse(yield* hasPendingForkMigrations);
       yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,created_at,updated_at)
         VALUES('legacy-work','task','2026-11-26T00:00:00.000Z','project','delivery','dispatcher','{"kept":true}','2026-11-26T00:00:00.000Z','2026-11-26T00:00:00.000Z')`;
-      yield* sql`DELETE FROM t3_fork_migrations WHERE migration_id=7`;
+      yield* sql`DELETE FROM t3_fork_migrations WHERE migration_id IN (7,8)`;
       assert.isTrue(yield* hasPendingForkMigrations);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(
@@ -151,6 +152,7 @@ describe("runMigrations", () => {
           { migration_id: 5, name: "WorkbenchWorkItems" },
           { migration_id: 6, name: "WorkbenchQueue" },
           { migration_id: 7, name: "WorkbenchMatters" },
+          { migration_id: 8, name: "WorkbenchAttention" },
         ],
       );
       assert.deepStrictEqual(

@@ -14,6 +14,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import * as AttentionGuardTestkit from "./WorkbenchAttentionGuard.testkit.ts";
 
 it.effect.each(["expired", "resolved"] as const)(
   "responds only to resolved requests and preserves feedback (%s)",
@@ -48,6 +49,7 @@ it.effect.each(["expired", "resolved"] as const)(
       ],
     } as unknown as OrchestrationV2ThreadProjection;
     const layerTest = RuntimeRequestService.layer.pipe(
+      Layer.provide(AttentionGuardTestkit.layer),
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({

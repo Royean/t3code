@@ -16,6 +16,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as EventSink from "./EventSink.ts";
@@ -115,12 +116,14 @@ export const layer: Layer.Layer<
   | EventSink.EventSinkV2
   | ProjectionStore.ProjectionStoreV2
   | ProviderSessionManager.ProviderSessionManagerV2
+  | WorkbenchAttentionGuard.WorkbenchAttentionGuard
 > = Layer.effect(
   ProviderTurnControlServiceV2,
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -416,6 +419,10 @@ export const layer: Layer.Layer<
       ),
       steer: Effect.fn("ProviderTurnControlService.steer")(
         function* (input) {
+          yield* attentionGuard.assertAdmission({
+            threadId: input.threadId,
+            messageId: input.messageId,
+          });
           const context = yield* projections.getProviderControlContext(input.threadId, input);
           const ownership = context.message?.delegatedCompletion;
           if (ownership !== undefined) {

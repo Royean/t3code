@@ -1,5 +1,6 @@
 import * as SqlClient from "effect/sql/SqlClient";
 import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -609,6 +610,7 @@ const isForceStopThreadError = Schema.is(OrchestrationV2ForceStopThreadError);
 
 const make = Effect.gen(function* () {
   const workbenchGuard = yield* WorkbenchGuard.WorkbenchQueueGuard;
+  const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -875,6 +877,31 @@ const make = Effect.gen(function* () {
     "ThreadManagementService.sendToThread",
   )(function* (input) {
     const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    const replay = yield* hasReceipt(input.commandId);
+    yield* replay
+      ? Effect.void
+      : attentionGuard.assertAdmission(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: input.commandId,
+                commandType: "message.dispatch",
+                cause,
+              }),
+          ),
+        );
+    const originalResume = yield* replay
+      ? Effect.undefined
+      : attentionGuard.originalResume(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: input.commandId,
+                commandType: "message.dispatch",
+                cause,
+              }),
+          ),
+        );
     if (target.thread.archivedAt !== null) {
       return yield* new ThreadManagementThreadArchivedError({
         threadId: input.threadId,
@@ -911,7 +938,7 @@ const make = Effect.gen(function* () {
 
     // Turn start would fail on its own after the send reported success; a replay keeps its answer.
     // A live steer starts no turn, so it needs no workspace.
-    if (dispatchMode.type !== "steer_active") {
+    if (dispatchMode.type !== "steer_active" && !replay && originalResume === undefined) {
       yield* worktreeRestore
         .restore(target.thread)
         .pipe(
@@ -1825,6 +1852,7 @@ export const layer: Layer.Layer<
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
 > = Layer.effect(ThreadManagementService, make).pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(WorkbenchGuard.layer),
   Layer.provide(layerLegacyV1ThreadImporterNoop),
   Layer.provide(layerThreadWorktreeRestoreNoop),
@@ -1842,6 +1870,7 @@ export const layerWithLegacyImporter: Layer.Layer<
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
 > = Layer.effect(ThreadManagementService, make).pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(WorkbenchGuard.layer),
   Layer.provide(ThreadCommandExecutor.layer),
 );

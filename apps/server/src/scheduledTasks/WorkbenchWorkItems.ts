@@ -59,6 +59,8 @@ function batchRuns(
 }
 
 export interface WorkItemRow {
+  attention_epoch: number;
+  attention_hold: number;
   matter_id: string | null;
   cycle_number: number;
   previous_work_item_id: string | null;
@@ -182,7 +184,23 @@ const make = Effect.gen(function* () {
         "nodes",
       ]);
       const run = child.runs.find((run) => run.id === link.runId)!;
-      const related = batchRuns(child, run.id);
+      const resumeIntents = yield* sql<{
+        run_id: string;
+        message_id: string;
+      }>`SELECT run_id,message_id FROM workbench_attention_resume_intents WHERE work_item_id=${row.id} AND batch_id=${batch.id} AND run_id IS NOT NULL AND state IN ('accepted','running','completed')`;
+      const resumeRuns = child.runs.filter((candidate) =>
+        resumeIntents.some(
+          (intent) =>
+            candidate.id === intent.run_id && candidate.userMessageId === intent.message_id,
+        ),
+      );
+      const related = [
+        ...new Map(
+          [run, ...resumeRuns]
+            .flatMap((root) => batchRuns(child, root.id))
+            .map((candidate) => [candidate.id, candidate]),
+        ).values(),
+      ];
       const result = delegatedTaskResultRun(related);
       const ended =
         result !== undefined &&
@@ -198,7 +216,10 @@ const make = Effect.gen(function* () {
       const workState =
         !ended || held ? "working" : awaits ? "waiting_for_children" : "result_available";
       const terminal =
-        ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(run.status) &&
+        result !== undefined &&
+        ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(
+          result.status,
+        ) &&
         workState === "result_available";
       const outcome = terminal
         ? result?.status === "completed"
@@ -207,7 +228,7 @@ const make = Effect.gen(function* () {
             ? "failed"
             : "cancelled"
         : null;
-      yield* sql`UPDATE workbench_work_batches SET message_id=${link.messageId},accepted_run_id=COALESCE(accepted_run_id,${link.acceptedRunId}),run_id=${link.runId},
+      yield* sql`UPDATE workbench_work_batches SET message_id=${link.messageId},accepted_run_id=COALESCE(accepted_run_id,${link.acceptedRunId}),run_id=${result?.id ?? link.runId},
         delegated_task_id=${link.delegatedTaskId},parent_run_id=${link.parentRunId},state=${terminal ? (outcome === "succeeded" ? "completed" : "failed") : "dispatched"},
         outcome=${outcome},work_state=${workState},updated_at=${DateTime.formatIso(yield* DateTime.now)} WHERE id=${batch.id}`.pipe(
         Effect.mapError(ledgerError),
@@ -358,6 +379,29 @@ const make = Effect.gen(function* () {
       row = current!;
     }
     const activeBatch = row.matter_id === null ? null : yield* observeBatches(row);
+    const [resume] = yield* sql<{
+      run_id: string;
+      message_id: string;
+    }>`SELECT run_id,message_id FROM workbench_attention_resume_intents WHERE work_item_id=${row.id} AND run_id IS NOT NULL AND state IN ('accepted','running','completed') ORDER BY rowid DESC LIMIT 1`;
+    if (resume && row.work_thread_id !== null) {
+      const proof = yield* threads.getThreadRecords(
+        ThreadId.make(row.work_thread_id),
+        ["runs", "messages"],
+        { messageIds: [resume.message_id as never] },
+      );
+      const resumedRun = proof.runs.find(
+        (run) => run.id === resume.run_id && run.userMessageId === resume.message_id,
+      );
+      if (
+        resumedRun &&
+        proof.messages.some(
+          (message) => message.id === resume.message_id && message.runId === resumedRun.id,
+        )
+      )
+        yield* sql`UPDATE workbench_work_items SET run_id=${resumedRun.id},message_id=${resume.message_id} WHERE id=${row.id}`.pipe(
+          Effect.mapError(ledgerError),
+        );
+    }
     if (row.matter_id !== null) {
       row = (yield* sql<WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${row.id}`.pipe(
         Effect.mapError(ledgerError),
@@ -447,7 +491,7 @@ const make = Effect.gen(function* () {
       updatedAt: row.updated_at,
       errorCode: row.error_code,
     } satisfies WorkbenchWorkItem;
-  });
+  }, Effect.mapError(ledgerError));
   const get = Effect.fn("WorkbenchWorkItems.get")(function* (
     taskId: ScheduledTaskId,
     businessDeliveryId: string,

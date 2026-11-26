@@ -4,6 +4,8 @@ import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as RuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as RunExecution from "./RunExecutionService.ts";
+import * as WorkbenchAttention from "../scheduledTasks/WorkbenchAttention.ts";
 import * as WorkbenchLifecycle from "../scheduledTasks/workbenchLifecycle.ts";
 import * as ExecutionLedger from "../scheduledTasks/executionLedger.ts";
 import * as WorkbenchQueue from "../scheduledTasks/WorkbenchQueue.ts";
@@ -46,6 +48,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderSessionId,
   ProviderTurnId,
   OrchestrationV2ThreadProjectionJson,
   OrchestratorMcpFailure,
@@ -91,6 +94,8 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -4321,104 +4326,131 @@ it.effect("atomically reserves two workbench slots by project priority across di
   }).pipe(Effect.provide(Layer.mergeAll(queueLayer, itemLayer, dependencies)));
 });
 
+const setupWorkbenchMattersFixture = Effect.fn("setupWorkbenchMattersFixture")(function* () {
+  const root = yield* checkpointWorkspace("workbench-matters");
+  const git = (cwd: string, args: string[]) =>
+    NodeChildProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  let worktrees = 0;
+  const provider: ServerProvider = {
+    instanceId: modelSelection.instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    enabled: true,
+    installed: true,
+    version: "test",
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-11-26T00:00:00.000Z",
+    models: [
+      {
+        slug: modelSelection.model,
+        name: modelSelection.model,
+        isCustom: false,
+        capabilities: null,
+      },
+    ],
+    slashCommands: [],
+    skills: [],
+  };
+  const harness = makeHarness({
+    workspaceRoot: root,
+    providers: [provider],
+    hasCommit: () => Effect.succeed(true),
+    generateBranchName: () => Effect.succeed({ branch: `matter-${worktrees}` }),
+    createWorktree: (input) =>
+      Effect.sync(() => {
+        const path = `${root}/child-${++worktrees}`;
+        git(root, [
+          "worktree",
+          "add",
+          "-b",
+          input.newRefName!,
+          path,
+          input.baseRefName ?? input.refName,
+        ]);
+        return {
+          worktree: {
+            path,
+            refName: input.newRefName!,
+            headSha: git(path, ["rev-parse", "HEAD"]),
+          },
+        };
+      }),
+    renameBranch: (input) =>
+      Effect.sync(() => {
+        git(input.cwd, ["branch", "-m", input.newBranch]);
+        return { branch: input.newBranch };
+      }),
+  });
+  const parentId = ThreadId.make("thread:matter-dispatcher"),
+    taskId = ScheduledTaskId.make("task:matter");
+  const stamp = "2026-11-26T00:00:00.000Z";
+  const task = {
+    id: taskId,
+    createdAt: stamp,
+    projectId,
+    threadId: parentId,
+    enabled: true,
+    threadMode: "continue",
+    schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
+  } as const;
+  const realGit = yield* GitVcsDriver.make.pipe(
+    Effect.provide(ServerConfig.layerTest(root, { prefix: "workbench-matters-vcs-" })),
+  );
+  const dependencies = Layer.succeedContext(
+    yield* Layer.build(
+      Layer.mergeAll(
+        harness.layer,
+        Layer.mock(ScheduledTasks.ScheduledTaskService)({
+          list: () => Effect.succeed({ tasks: [task] } as never),
+          getExecutions: () => Effect.succeed({ effectiveExecutions: [] } as never),
+        }),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.succeed(GitVcsDriver.GitVcsDriver, realGit),
+      ),
+    ),
+  );
+  const itemsLayer = WorkbenchWorkItems.layer.pipe(Layer.provide(dependencies));
+  const queues = WorkbenchQueue.layer.pipe(Layer.provide(itemsLayer), Layer.provide(dependencies));
+  const dispatchLayer = WorkbenchDispatch.layer.pipe(
+    Layer.provide(queues),
+    Layer.provide(itemsLayer),
+    Layer.provide(OrchestratorMcp.layer.pipe(Layer.provide(dependencies))),
+    Layer.provide(dependencies),
+  );
+  return {
+    root,
+    git,
+    worktreeCount: () => worktrees,
+    parentId,
+    taskId,
+    stamp,
+    task,
+    realGit,
+    dependencies,
+    itemsLayer,
+    queues,
+    dispatchLayer,
+  };
+});
+
 it.live(
   "queues ordered matter batches into the same isolated child without releasing its reservation",
   () =>
     Effect.gen(function* () {
-      const root = yield* checkpointWorkspace("workbench-matters");
-      const git = (cwd: string, args: string[]) =>
-        NodeChildProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-      let worktrees = 0;
-      const provider: ServerProvider = {
-        instanceId: modelSelection.instanceId,
-        driver: ProviderDriverKind.make("codex"),
-        enabled: true,
-        installed: true,
-        version: "test",
-        status: "ready",
-        auth: { status: "authenticated" },
-        checkedAt: "2026-11-26T00:00:00.000Z",
-        models: [
-          {
-            slug: modelSelection.model,
-            name: modelSelection.model,
-            isCustom: false,
-            capabilities: null,
-          },
-        ],
-        slashCommands: [],
-        skills: [],
-      };
-      const harness = makeHarness({
-        workspaceRoot: root,
-        providers: [provider],
-        hasCommit: () => Effect.succeed(true),
-        generateBranchName: () => Effect.succeed({ branch: `matter-${worktrees}` }),
-        createWorktree: (input) =>
-          Effect.sync(() => {
-            const path = `${root}/child-${++worktrees}`;
-            git(root, [
-              "worktree",
-              "add",
-              "-b",
-              input.newRefName!,
-              path,
-              input.baseRefName ?? input.refName,
-            ]);
-            return {
-              worktree: {
-                path,
-                refName: input.newRefName!,
-                headSha: git(path, ["rev-parse", "HEAD"]),
-              },
-            };
-          }),
-        renameBranch: (input) =>
-          Effect.sync(() => {
-            git(input.cwd, ["branch", "-m", input.newBranch]);
-            return { branch: input.newBranch };
-          }),
-      });
-      const parentId = ThreadId.make("thread:matter-dispatcher"),
-        taskId = ScheduledTaskId.make("task:matter");
-      const stamp = "2026-11-26T00:00:00.000Z";
-      const task = {
-        id: taskId,
-        createdAt: stamp,
-        projectId,
-        threadId: parentId,
-        enabled: true,
-        threadMode: "continue",
-        schedule: { type: "webhook", dedupe: { replayKey: "{{body.deliveryId}}" } },
-      } as const;
-      const realGit = yield* GitVcsDriver.make.pipe(
-        Effect.provide(ServerConfig.layerTest(root, { prefix: "workbench-matters-vcs-" })),
-      );
-      const dependencies = Layer.succeedContext(
-        yield* Layer.build(
-          Layer.mergeAll(
-            harness.layer,
-            Layer.mock(ScheduledTasks.ScheduledTaskService)({
-              list: () => Effect.succeed({ tasks: [task] } as never),
-              getExecutions: () => Effect.succeed({ effectiveExecutions: [] } as never),
-            }),
-            Layer.mock(SecretRequests.SecretRequests)({}),
-            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-            Layer.succeed(GitVcsDriver.GitVcsDriver, realGit),
-          ),
-        ),
-      );
-      const itemsLayer = WorkbenchWorkItems.layer.pipe(Layer.provide(dependencies));
-      const queues = WorkbenchQueue.layer.pipe(
-        Layer.provide(itemsLayer),
-        Layer.provide(dependencies),
-      );
-      const dispatchLayer = WorkbenchDispatch.layer.pipe(
-        Layer.provide(queues),
-        Layer.provide(itemsLayer),
-        Layer.provide(OrchestratorMcp.layer.pipe(Layer.provide(dependencies))),
-        Layer.provide(dependencies),
-      );
+      const {
+        root,
+        git,
+        worktreeCount,
+        parentId,
+        taskId,
+        stamp,
+        task,
+        dependencies,
+        itemsLayer,
+        queues,
+        dispatchLayer,
+      } = yield* setupWorkbenchMattersFixture();
       yield* Effect.gen(function* () {
         const launches = yield* ThreadLaunch.ThreadLaunchService,
           threads = yield* ThreadManagement.ThreadManagementService,
@@ -4518,7 +4550,7 @@ it.live(
         assert.equal(child.runs.length, 2);
         assert.equal(child.runs.find((run) => run.id === firstRun)?.status, "starting");
         assert.equal(child.runs.filter((run) => run.status === "queued").length, 1);
-        assert.equal(worktrees, 1);
+        assert.equal(worktreeCount(), 1);
         const queued = yield* queue.get("queue:matter", queueScope);
         assert.equal(queued.occupied, 1);
         assert.equal(queued.items.length, 1);
@@ -4539,7 +4571,7 @@ it.live(
           (yield* threads.getThreadRecords(childId, ["messages"])).messages.length,
           before,
         );
-        assert.equal(worktrees, 1);
+        assert.equal(worktreeCount(), 1);
         const items = yield* WorkbenchWorkItems.WorkbenchWorkItems;
         const sink = yield* EventSink.EventSinkV2;
         const finish = (runId: string) =>
@@ -4728,7 +4760,7 @@ it.live(
         );
         assert.equal(git(successor.thread.worktreePath!, ["rev-parse", "HEAD"]), newHead);
         assert.include(successor.messages[0]!.text, ended.id);
-        assert.equal(worktrees, 2);
+        assert.equal(worktreeCount(), 2);
         yield* admit("six", "A".repeat(55_000));
         yield* admit("seven", "B".repeat(55_000));
         yield* queue.reconcile("queue:matter", queueScope);
@@ -4761,7 +4793,648 @@ it.live(
           (yield* threads.getThreadRecords(successorId, ["runs"])).runs.length,
           priorRuns,
         );
-        assert.equal(worktrees, 2);
+        assert.equal(worktreeCount(), 2);
       }).pipe(Effect.provide(Layer.mergeAll(dispatchLayer, queues, itemsLayer, dependencies)));
     }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
+);
+
+it.live("retains dirty workbench context before releasing a paused reservation", () =>
+  Effect.gen(function* () {
+    const {
+      root,
+      git,
+      parentId,
+      taskId,
+      stamp,
+      task,
+      dependencies,
+      itemsLayer,
+      queues,
+      dispatchLayer,
+    } = yield* setupWorkbenchMattersFixture();
+    const checkpointLayer = CheckpointStore.layer.pipe(
+      Layer.provide(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProcess.layer))),
+      Layer.provide(ServerConfig.layerTest(root, { prefix: "attention-git-" })),
+    );
+    const execution = yield* Effect.provide(RunExecution.RunExecutionServiceV2, dependencies);
+    const reachedQuiescence = yield* Deferred.make<void>(),
+      allowCheckpoint = yield* Deferred.make<void>();
+    const attentionLayer = WorkbenchAttention.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          queues,
+          itemsLayer,
+          dependencies,
+          checkpointLayer,
+          Layer.succeed(RunExecution.RunExecutionServiceV2, {
+            ...execution,
+            awaitThreadQuiescent: (threadId) =>
+              execution
+                .awaitThreadQuiescent(threadId)
+                .pipe(
+                  Effect.andThen(Deferred.succeed(reachedQuiescence, undefined)),
+                  Effect.andThen(Deferred.await(allowCheckpoint)),
+                ),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService,
+        threads = yield* ThreadManagement.ThreadManagementService,
+        sql = yield* SqlClient.SqlClient,
+        queue = yield* WorkbenchQueue.WorkbenchQueue,
+        dispatch = yield* WorkbenchDispatch.WorkbenchDispatch,
+        attention = yield* WorkbenchAttention.WorkbenchAttention,
+        fs = yield* FileSystem.FileSystem;
+      yield* launches.launch(launchInput({ command: "attention:parent", thread: parentId }));
+      const owner = { controllerId: "controller:matter", projectId };
+      const bound = yield* queue.bind("queue:matter", {
+        ...owner,
+        taskId,
+        dispatcherThreadId: parentId,
+      });
+      const scope = { ...owner, expectedTrackingId: bound.trackingId };
+      const bodyText = JSON.stringify({
+        deliveryId: "attention-event",
+        issue: { number: 1 },
+        action: "opened",
+      });
+      yield* queue.prepareDeliveryIntent("queue:matter", {
+        ...scope,
+        taskId,
+        taskCreatedAt: stamp,
+        dispatcherThreadId: parentId,
+        intentId: "intent:attention",
+        subscriptionScopeId: "subscription:matter",
+        businessDeliveryId: "attention-event",
+        bodySha256: WorkbenchLifecycle.digest(bodyText),
+        matter: {
+          provider: "github",
+          namespace: "https://github.com/repositories/7",
+          kind: "issue",
+          key: "1",
+          label: "Issue #1",
+        },
+      });
+      yield* sql.withTransaction(
+        ExecutionLedger.recordAlias({
+          task: task as never,
+          attemptId: "attention",
+          deliveryId: "native:attention",
+          businessDeliveryId: "attention-event",
+          outcome: "accepted",
+          executionId: "execution:attention",
+          receivedAt: stamp,
+          create: true,
+          rawBody: new TextEncoder().encode(bodyText),
+          request: { method: "POST", path: "/secret", query: "", headers: {}, bodyText },
+        }),
+      );
+      yield* queue.reconcile("queue:matter", scope);
+      const caller: McpInvocationScope = {
+        environmentId: EnvironmentId.make("env-test"),
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 0,
+        requestNamespace: "session:attention",
+        thread: {
+          threadId: parentId,
+          providerSessionId: "session:attention",
+          providerInstanceId: modelSelection.instanceId,
+        },
+        client: undefined,
+      };
+      const sink = yield* EventSink.EventSinkV2;
+      const high = yield* sink.latestSequence();
+      const prepared = yield* sink.stream({ afterSequence: high }).pipe(
+        Stream.filter(
+          (e) =>
+            e.event.type === "run.updated" &&
+            e.event.threadId !== parentId &&
+            e.event.payload.status === "starting",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* dispatch.dispatch(caller, { taskId });
+      yield* Fiber.join(prepared);
+      const started = (yield* (yield* WorkbenchWorkItems.WorkbenchWorkItems).get(
+        taskId,
+        "attention-event",
+      )).workItems[0]!;
+      assert.isNotNull(started.workThreadId);
+      assert.isNotNull(started.worktreePath, JSON.stringify(started));
+      const path = started.worktreePath!;
+      const nativeState = yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), [
+        "providerThreads",
+      ]);
+      const native = nativeState.providerThreads.at(-1)!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:native"),
+            type: "provider-thread.updated",
+            threadId: ThreadId.make(started.workThreadId!),
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...native,
+              nativeThreadRef: {
+                driver: ProviderDriverKind.make("codex"),
+                nativeId: "native:attention",
+                strength: "strong",
+              },
+              providerSessionId:
+                native.providerSessionId ?? ProviderSessionId.make("session:attention-native"),
+              status: "idle",
+            },
+          },
+        ],
+      });
+      yield* fs.writeFileString(`${path}/human-work.txt`, "unfinished change\n");
+      const activeChild = yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), [
+        "runs",
+        "nodes",
+      ]);
+      const activeRun = activeChild.runs.find((run) => run.id === started.runId)!;
+      const nativeRequest = {
+        id: RuntimeRequestId.make("attention:question"),
+        nodeId: activeRun.rootNodeId!,
+        providerThreadId: native.id,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: {
+          type: "live" as const,
+          providerSessionId:
+            native.providerSessionId ?? ProviderSessionId.make("session:attention-native"),
+        },
+        createdAt: yield* DateTime.now,
+        resolvedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:question-opened"),
+            type: "runtime-request.updated",
+            threadId: ThreadId.make(started.workThreadId!),
+            runId: activeRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: nativeRequest,
+          },
+        ],
+      });
+      const observed = (yield* attention.get("queue:matter", scope)).attentions;
+      assert.equal(observed.length, 1);
+      assert.equal(observed[0]?.phase, "blocked");
+      assert.equal(observed[0]?.reason.code, "user_input");
+      assert.equal(observed[0]?.blockedReason, "pending_runtime_request");
+      assert.equal(observed[0]?.checkpoint.status, "pending");
+      assert.equal(observed[0]?.canRequeue, false);
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      assert.equal(
+        (yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), [
+          "turnItems",
+        ])).turnItems.filter((item) => item.type === "run_interrupt_request").length,
+        0,
+      );
+      const sameObserved = yield* Effect.gen(function* () {
+        const service = yield* WorkbenchAttention.WorkbenchAttention;
+        return yield* service.get("queue:matter", scope);
+      }).pipe(Effect.provide(Layer.fresh(attentionLayer)));
+      assert.equal(sameObserved.attentions.length, 1);
+      assert.equal(sameObserved.attentions[0]?.id, observed[0]?.id);
+      assert.equal(
+        (yield* sql<{
+          attention_hold: number;
+          attention_epoch: number;
+        }>`SELECT attention_hold,attention_epoch FROM workbench_work_items WHERE id=${started.id}`)[0]
+          ?.attention_hold,
+        0,
+      );
+      const liveItem = (yield* queue.get("queue:matter", scope)).items[0]!;
+      const keepLive = yield* attention.pause("queue:matter", liveItem.id, {
+        ...scope,
+        clientRequestId: "pause:live-question",
+        expectedWorkItemVersion: liveItem.workItemVersion,
+        expectedLatestEventSequence: liveItem.latestEventSequence,
+        reason: {
+          code: "manual",
+          summary: "Keep the live question answerable",
+          requiredAction: "Use the original thread",
+        },
+      });
+      assert.equal(keepLive.operation.state, "blocked");
+      assert.equal(keepLive.attention.phase, "blocked");
+      assert.equal(keepLive.attention.blockedReason, "pending_runtime_request");
+      assert.equal(keepLive.queue.occupied, 1);
+      assert.equal(
+        (yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), [
+          "runtimeRequests",
+        ])).runtimeRequests.find((request) => request.id === nativeRequest.id)?.status,
+        "pending",
+      );
+      assert.equal(
+        (yield* sql<{
+          attention_hold: number;
+        }>`SELECT attention_hold FROM workbench_work_items WHERE id=${started.id}`)[0]
+          ?.attention_hold,
+        0,
+      );
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:question-resolved"),
+            type: "runtime-request.updated",
+            threadId: ThreadId.make(started.workThreadId!),
+            runId: activeRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...nativeRequest, status: "resolved", resolvedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      assert.equal(
+        (yield* attention.get("queue:matter", scope)).attentions.find(
+          (a) => a.id === observed[0]!.id,
+        )?.phase,
+        "resolved",
+      );
+      const item = (yield* queue.get("queue:matter", scope)).items[0]!;
+      const request = {
+        ...scope,
+        clientRequestId: "pause:one",
+        expectedWorkItemVersion: item.workItemVersion,
+        expectedLatestEventSequence: item.latestEventSequence,
+        reason: {
+          code: "manual" as const,
+          summary: "Needs user input",
+          requiredAction: "Fix the environment and continue",
+        },
+      };
+      const pending = yield* attention.pause("queue:matter", item.id, request);
+      assert.equal(pending.attention.phase, "pausing");
+      assert.equal(pending.queue.occupied, 1);
+      yield* Deferred.await(reachedQuiescence);
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      assert.equal((yield* sql`SELECT id FROM workbench_attention_points`).length, 0);
+      yield* Deferred.succeed(allowCheckpoint, undefined);
+      yield* attention.reconcile("queue:matter", scope);
+      const saved = (yield* attention.get("queue:matter", scope)).attentions.find(
+        (a) => a.id === pending.attention.id,
+      )!;
+      assert.equal(saved.phase, "awaiting_user");
+      assert.equal(saved.checkpoint.status, "ready");
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 0);
+      assert.equal(yield* fs.readFileString(`${path}/human-work.txt`), "unfinished change\n");
+      assert.equal(git(path, ["symbolic-ref", "--short", "HEAD"]), started.branch);
+      assert.equal(
+        (yield* attention.pause("queue:matter", item.id, request)).attention.id,
+        saved.id,
+      );
+      assert.equal(
+        (yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), ["runs"])).runs
+          .length,
+        1,
+      );
+      const points = yield* sql<{
+        checkpoint_ref: string;
+      }>`SELECT checkpoint_ref FROM workbench_attention_points WHERE attention_id=${saved.id}`;
+      assert.equal(points.length, 1);
+      assert.equal(
+        git(path, ["show", `${points[0]!.checkpoint_ref}:human-work.txt`]),
+        "unfinished change",
+      );
+      const recorded = yield* attention.record("queue:matter", saved.id, {
+        ...scope,
+        clientRequestId: "record:one",
+        expectedVersion: saved.version,
+        result: "The user fixed the local environment. Continue in this workspace.",
+        priority: 50,
+      });
+      assert.equal(recorded.attention.phase, "awaiting_user");
+      assert.equal(recorded.queue.occupied, 0);
+      assert.equal(
+        (yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), ["runs"])).runs
+          .length,
+        1,
+      );
+      yield* fs.writeFileString(`${path}/human-work.txt`, "user repair retained\n");
+      const requeueInput = {
+        ...scope,
+        clientRequestId: "resume:one",
+        expectedVersion: recorded.attention.version,
+      };
+      const accepted = yield* attention.requeue("queue:matter", saved.id, requeueInput);
+      assert.equal(accepted.attention.phase, "requeue_pending");
+      assert.equal(accepted.attention.slotState, "released");
+      yield* attention.reconcile("queue:matter", scope);
+      assert.equal((yield* queue.get("queue:matter", scope)).items[0]?.queueState, "queued");
+      assert.equal((yield* queue.get("queue:matter", scope)).items[0]?.priority, 50);
+      assert.equal(
+        (yield* attention.requeue("queue:matter", saved.id, requeueInput)).attention.id,
+        saved.id,
+      );
+      yield* queue.reconcile("queue:matter", scope);
+      const resumed = yield* dispatch.dispatch(caller, { taskId });
+      assert.equal(resumed.workItem?.workThreadId, started.workThreadId);
+      const resumeState = (yield* attention.get("queue:matter", scope)).attentions.find(
+        (a) => a.id === saved.id,
+      )!;
+      assert.equal(resumeState.phase, "resuming");
+      assert.isNotNull(resumeState.resumeRunId);
+      assert.equal(
+        (yield* threads.getThreadRecords(ThreadId.make(started.workThreadId!), ["runs"])).runs
+          .length,
+        2,
+      );
+      assert.equal(yield* fs.readFileString(`${path}/human-work.txt`), "user repair retained\n");
+      assert.equal(git(path, ["symbolic-ref", "--short", "HEAD"]), started.branch);
+      assert.notEqual(resumed.workItem?.runId, started.runId);
+      const childId = ThreadId.make(started.workThreadId!);
+      const beforeProof = yield* threads.getThreadRecords(childId, [
+        "runs",
+        "attempts",
+        "providerThreads",
+      ]);
+      const resumeRun = beforeProof.runs.find((run) => run.id === resumeState.resumeRunId)!;
+      const resumeAttempt = beforeProof.attempts.find(
+        (attempt) => attempt.id === resumeRun.activeAttemptId,
+      )!;
+      const stampNow = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:running"),
+            type: "run.updated",
+            threadId: childId,
+            runId: resumeRun.id,
+            occurredAt: stampNow,
+            payload: { ...resumeRun, status: "running", startedAt: stampNow },
+          },
+        ],
+      });
+      yield* attention.reconcile("queue:matter", scope);
+      assert.equal(
+        (yield* attention.get("queue:matter", scope)).attentions.find((a) => a.id === saved.id)
+          ?.phase,
+        "resuming",
+      );
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:native-accept"),
+            type: "run-attempt.updated",
+            threadId: childId,
+            runId: resumeRun.id,
+            occurredAt: stampNow,
+            payload: {
+              ...resumeAttempt,
+              status: "running",
+              startedAt: stampNow,
+              nativeThreadId: "native:attention",
+            },
+          },
+        ],
+      });
+      yield* attention.reconcile("queue:matter", scope);
+      assert.equal(
+        (yield* attention.get("queue:matter", scope)).attentions.find((a) => a.id === saved.id)
+          ?.phase,
+        "resuming",
+      );
+      const nativeTurn = {
+        id: ProviderTurnId.make("turn:attention-resume"),
+        providerThreadId: resumeRun.providerThreadId!,
+        nodeId: resumeRun.rootNodeId!,
+        runAttemptId: resumeAttempt.id,
+        nativeTurnRef: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "turn:attention-native",
+          strength: "strong" as const,
+        },
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "native:attention",
+          strength: "strong" as const,
+        },
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: stampNow,
+        completedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:turn-accepted"),
+            type: "provider-turn.updated",
+            threadId: childId,
+            runId: resumeRun.id,
+            occurredAt: stampNow,
+            payload: nativeTurn,
+          },
+        ],
+      });
+      yield* attention.reconcile("queue:matter", scope);
+      assert.equal(
+        (yield* attention.get("queue:matter", scope)).attentions.find((a) => a.id === saved.id)
+          ?.phase,
+        "resolved",
+      );
+      yield* queue.reconcile("queue:matter", scope);
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      const restored = yield* Effect.gen(function* () {
+        const service = yield* WorkbenchAttention.WorkbenchAttention;
+        return yield* service.pause("queue:matter", item.id, request);
+      }).pipe(Effect.provide(Layer.fresh(attentionLayer)));
+      assert.equal(restored.attention.id, saved.id);
+      assert.equal(restored.attention.phase, "resolved");
+      assert.equal((yield* threads.getThreadRecords(childId, ["runs"])).runs.length, 2);
+      const changed = yield* attention
+        .pause("queue:matter", item.id, {
+          ...request,
+          reason: { ...request.reason, summary: "changed same identity" },
+        })
+        .pipe(Effect.flip);
+      assert.equal(changed.reason, "stale_state");
+      const foreign = yield* attention
+        .get("queue:matter", { ...scope, controllerId: "other-account" })
+        .pipe(Effect.flip);
+      assert.equal(foreign.reason, "invalid_binding");
+      const beforeUnknown = (yield* queue.get("queue:matter", scope)).items[0]!;
+      const unknownPause = {
+        ...scope,
+        clientRequestId: "pause:unconfirmed-runtime",
+        expectedWorkItemVersion: beforeUnknown.workItemVersion,
+        expectedLatestEventSequence: beforeUnknown.latestEventSequence,
+        reason: {
+          code: "manual" as const,
+          summary: "Confirm the original process stopped",
+          requiredAction: "Verify the original runtime before switching",
+        },
+      };
+      const unknownAccepted = yield* attention.pause("queue:matter", item.id, unknownPause);
+      yield* attention.reconcile("queue:matter", scope);
+      const uncertain = (yield* attention.get("queue:matter", scope)).attentions.find(
+        (a) => a.id === unknownAccepted.attention.id,
+      )!;
+      assert.equal(uncertain.phase, "blocked");
+      assert.equal(uncertain.blockedReason, "state_unknown");
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      assert.equal(
+        (yield* threads.getThreadRecords(childId, ["runs"])).runs.find(
+          (run) => run.id === resumeRun.id,
+        )?.status,
+        "running",
+      );
+      const beforeComplete = yield* threads.getThreadRecords(childId, ["runs", "nodes"]);
+      const finalRun = beforeComplete.runs.find((run) => run.id === resumeRun.id)!;
+      const finalStamp = yield* DateTime.now;
+      const parentTasks = yield* threads.getThreadRecords(parentId, ["subagents"]);
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:run-completed"),
+            type: "run.updated",
+            threadId: childId,
+            runId: finalRun.id,
+            occurredAt: finalStamp,
+            payload: { ...finalRun, status: "completed", completedAt: finalStamp },
+          },
+          {
+            id: EventId.make("attention:turn-completed"),
+            type: "provider-turn.updated",
+            threadId: childId,
+            runId: finalRun.id,
+            occurredAt: finalStamp,
+            payload: { ...nativeTurn, status: "completed", completedAt: finalStamp },
+          },
+          ...beforeComplete.nodes
+            .filter((node) => node.runId === finalRun.id)
+            .map((node) => ({
+              id: EventId.make(`attention:node-completed:${node.id}`),
+              type: "node.updated" as const,
+              threadId: childId,
+              runId: finalRun.id,
+              occurredAt: finalStamp,
+              payload: { ...node, status: "completed" as const, completedAt: finalStamp },
+            })),
+          ...parentTasks.subagents
+            .filter((task) => task.result === null)
+            .map((task) => ({
+              id: EventId.make(`attention:task-completed:${task.id}`),
+              type: "subagent.updated" as const,
+              threadId: parentId,
+              occurredAt: finalStamp,
+              payload: {
+                ...task,
+                status: "completed" as const,
+                result: "Resumed batch completed",
+                completedAt: finalStamp,
+                updatedAt: finalStamp,
+              },
+            })),
+        ],
+      });
+      yield* queue.reconcile("queue:matter", scope);
+      const afterComplete = (yield* (yield* WorkbenchWorkItems.WorkbenchWorkItems).get(
+        taskId,
+        "attention-event",
+      )).workItems[0]!;
+      assert.equal(afterComplete.processedThroughSequence, 1);
+      assert.equal(afterComplete.businessState, "awaiting_delivery");
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      const secondPause = unknownPause;
+      let blockedId = "";
+      yield* Effect.acquireUseRelease(
+        fs.rename(path, `${path}-missing`),
+        () =>
+          Effect.gen(function* () {
+            const acceptedPause = yield* attention.pause("queue:matter", item.id, secondPause);
+            blockedId = acceptedPause.attention.id;
+            yield* attention.reconcile("queue:matter", scope);
+            const missing = (yield* attention.get("queue:matter", scope)).attentions.find(
+              (a) => a.id === blockedId,
+            )!;
+            assert.equal(missing.phase, "blocked");
+            assert.equal(missing.blockedReason, "workspace_unavailable");
+            assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+            assert.equal((yield* threads.getThreadRecords(childId, ["runs"])).runs.length, 2);
+          }),
+        () => fs.rename(`${path}-missing`, path),
+      );
+      yield* attention.reconcile("queue:matter", scope);
+      const readyAgain = (yield* attention.get("queue:matter", scope)).attentions.find(
+        (a) => a.id === blockedId,
+      )!;
+      assert.equal(readyAgain.phase, "awaiting_user");
+      const fixedAgain = yield* attention.record("queue:matter", blockedId, {
+        ...scope,
+        clientRequestId: "record:missing-path",
+        expectedVersion: readyAgain.version,
+        result: "Restored the original path with the user repair intact.",
+        priority: 75,
+      });
+      const [originalPoint] = yield* sql<{
+        manifest_json: string;
+        checkpoint_sha: string;
+      }>`SELECT p.* FROM workbench_attention_points p JOIN workbench_attention_items a ON a.point_id=p.id WHERE a.id=${blockedId}`;
+      const beforeMismatch = yield* threads.getThreadRecords(childId, ["providerThreads"]);
+      const originalProvider = beforeMismatch.providerThreads.find(
+        (p) => p.id === resumeRun.providerThreadId,
+      )!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:context-mismatch"),
+            type: "provider-thread.updated",
+            threadId: childId,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...originalProvider,
+              nativeThreadRef: {
+                ...originalProvider.nativeThreadRef!,
+                nativeId: "different-native-conversation",
+              },
+              status: "idle",
+            },
+          },
+        ],
+      });
+      const badResume = {
+        ...scope,
+        clientRequestId: "resume:wrong-context",
+        expectedVersion: fixedAgain.attention.version,
+      };
+      yield* attention.requeue("queue:matter", blockedId, badResume);
+      yield* attention.reconcile("queue:matter", scope);
+      const blocked = (yield* attention.get("queue:matter", scope)).attentions.find(
+        (a) => a.id === blockedId,
+      )!;
+      assert.equal(blocked.phase, "blocked");
+      assert.equal(blocked.blockedReason, "provider_context_unavailable");
+      assert.equal(blocked.canRequeue, false);
+      assert.equal(blocked.slotState, "released");
+      const [keptPoint] = yield* sql<{
+        manifest_json: string;
+        checkpoint_sha: string;
+      }>`SELECT p.* FROM workbench_attention_points p JOIN workbench_attention_items a ON a.point_id=p.id WHERE a.id=${blockedId}`;
+      assert.equal(keptPoint!.manifest_json, originalPoint!.manifest_json);
+      assert.equal(keptPoint!.checkpoint_sha, originalPoint!.checkpoint_sha);
+      assert.equal((yield* threads.getThreadRecords(childId, ["runs"])).runs.length, 2);
+      assert.equal(yield* fs.readFileString(`${path}/human-work.txt`), "user repair retained\n");
+
+      assert.equal((yield* threads.getThreadRecords(childId, ["runs"])).runs.length, 2);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          attentionLayer,
+          dispatchLayer.pipe(Layer.provide(attentionLayer)),
+          queues,
+          itemsLayer,
+          dependencies,
+        ),
+      ),
+    );
+  }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
 );

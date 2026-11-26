@@ -28,6 +28,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 import * as ServerConfig from "../config.ts";
 import {
@@ -231,6 +232,7 @@ export const layer: Layer.Layer<
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
   | TurnItemPositionStore.TurnItemPositionStoreV2
+  | WorkbenchAttentionGuard.WorkbenchAttentionGuard
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -248,6 +250,8 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+    const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
+    const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
     const makeRunControls = (input: {
@@ -286,7 +290,14 @@ export const layer: Layer.Layer<
             ),
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
-        shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        shouldStartProviderTurn: () =>
+          attentionGuard.assertAdmission({ threadId: input.threadId, runId: input.runId }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProjectionStore.ProjectionStoreReadError({ threadId: input.threadId, cause }),
+            ),
+            Effect.andThen(isCurrentAttemptInStatus("running")),
+          ),
         shouldFinalizeRun: () => isCurrentAttemptIn(["starting", "running"]),
         hasUnpairedRunInterruptRequest: () =>
           projectionStore
@@ -490,6 +501,11 @@ export const layer: Layer.Layer<
         return;
       }
       captureStartingRun(run);
+      yield* attentionGuard.assertAdmission({ threadId: input.threadId, runId });
+      const originalResume = yield* attentionGuard.originalResume({
+        threadId: input.threadId,
+        runId,
+      });
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
       const providerThread = projection.providerThreads.find(
@@ -561,6 +577,39 @@ export const layer: Layer.Layer<
           runId,
           cause: `Run ${runId} is missing its execution projection state.`,
         });
+      }
+      if (originalResume !== undefined) {
+        const mismatch = new WorkbenchAttentionGuard.WorkbenchAttentionGuardError({
+          threadId: input.threadId,
+          reason: "resume-mismatch",
+        });
+        if (
+          nativeForkTransfer !== undefined ||
+          projection.thread.projectId !== originalResume.projectId ||
+          projection.thread.worktreePath !== originalResume.worktreePath ||
+          projection.thread.branch !== originalResume.branch ||
+          run.providerInstanceId !== originalResume.providerInstanceId ||
+          providerThread.id !== originalResume.providerThreadId ||
+          providerThread.providerInstanceId !== originalResume.providerInstanceId ||
+          providerThread.nativeThreadRef?.driver !== originalResume.nativeDriver ||
+          providerThread.nativeThreadRef.nativeId !== originalResume.nativeThreadId
+        )
+          return yield* mismatch;
+        if (
+          (yield* fileSystem.realPath(originalResume.worktreePath)) !==
+            originalResume.worktreeRealPath ||
+          (yield* gitWorkflow.currentBranch(originalResume.worktreePath)) !== originalResume.branch
+        )
+          return yield* mismatch;
+        const headPath = yield* gitWorkflow.headPath(originalResume.worktreePath);
+        if (headPath === null) return yield* mismatch;
+        const gitDirectory = path.dirname(headPath);
+        const commonFile = path.join(gitDirectory, "commondir");
+        const commonDirectory = (yield* fileSystem.exists(commonFile))
+          ? path.resolve(gitDirectory, (yield* fileSystem.readFileString(commonFile)).trim())
+          : gitDirectory;
+        if ((yield* fileSystem.realPath(commonDirectory)) !== originalResume.gitCommonDir)
+          return yield* mismatch;
       }
       const manualResume =
         run.manualContinuationOfRunId !== undefined && attempt.reason !== "steering_restart";
@@ -693,7 +742,9 @@ export const layer: Layer.Layer<
           return;
         }
       }
-      const recreateResult = yield* Effect.result(restoreMissingWorktree(projection.thread));
+      const recreateResult = yield* Effect.result(
+        originalResume === undefined ? restoreMissingWorktree(projection.thread) : Effect.void,
+      );
       if (recreateResult._tag === "Failure") {
         if (input.willRetry === true) return yield* recreateResult.failure;
         yield* settleStartFailure({
@@ -1398,6 +1449,11 @@ export const layer: Layer.Layer<
           return loaded;
         }
         if (providerThread.nativeThreadRef === null) {
+          if (originalResume !== undefined)
+            return yield* new WorkbenchAttentionGuard.WorkbenchAttentionGuardError({
+              threadId: input.threadId,
+              reason: "resume-mismatch",
+            });
           // Pass the stored provider row for adoption; adapter-minted duplicates make activeProviderThreadId flap.
           return yield* loadFromProvider(
             session.ensureThread({
@@ -1441,6 +1497,17 @@ export const layer: Layer.Layer<
               }),
         );
         if (resumed._tag === "Success") {
+          if (
+            originalResume !== undefined &&
+            (resumed.success.id !== originalResume.providerThreadId ||
+              resumed.success.providerInstanceId !== originalResume.providerInstanceId ||
+              resumed.success.nativeThreadRef?.driver !== originalResume.nativeDriver ||
+              resumed.success.nativeThreadRef.nativeId !== originalResume.nativeThreadId)
+          )
+            return yield* new WorkbenchAttentionGuard.WorkbenchAttentionGuardError({
+              threadId: input.threadId,
+              reason: "resume-mismatch",
+            });
           const context = handoffContextForThread(resumed.success);
           context.budget = yield* Effect.cached(context.budget);
           resumedHandoffContext = context;
@@ -1495,6 +1562,12 @@ export const layer: Layer.Layer<
         resumedHandoffContext = undefined;
         resumedRetryHandoff = undefined;
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
+        if (originalResume !== undefined)
+          return yield* new WorkbenchAttentionGuard.WorkbenchAttentionGuardError({
+            threadId: input.threadId,
+            reason: "resume-mismatch",
+            ...(resumed._tag === "Failure" ? { cause: resumed.failure } : {}),
+          });
         // Another client is still writing to the native thread. A fresh
         // session here would silently split the conversation from it.
         if (
@@ -1817,6 +1890,7 @@ export const layer: Layer.Layer<
       });
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
+          yield* attentionGuard.assertAdmission({ threadId: input.threadId, runId });
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff.handoffs],
             deferInline: compact || goalCommand,
@@ -1874,7 +1948,7 @@ export const layer: Layer.Layer<
                     ? {}
                     : { inlineContextLength: text.length - userText.length }),
                 });
-          yield* operation.pipe(
+          yield* attentionGuard.withAdmission({ threadId: input.threadId, runId }, operation).pipe(
             // Clear pending handoff markers for refused prompts so the next turn retains the native session.
             Effect.tapError((error) =>
               refusedBeforePrompt(error)
@@ -2056,13 +2130,15 @@ export const layer: Layer.Layer<
           );
         },
         (effect, input) =>
-          effect.pipe(
-            Effect.mapError((cause) =>
-              isProviderTurnStartError(cause)
-                ? cause
-                : new ProviderTurnStartError({ runId: input.runId, cause }),
+          attentionGuard
+            .withAdmission({ threadId: input.threadId, runId: input.runId }, effect)
+            .pipe(
+              Effect.mapError((cause) =>
+                isProviderTurnStartError(cause)
+                  ? cause
+                  : new ProviderTurnStartError({ runId: input.runId, cause }),
+              ),
             ),
-          ),
       ),
       failStartingRun: Effect.fn("ProviderTurnStartService.failStartingRun")(
         function* ({ threadId, runId, attemptId, rootNodeId }) {

@@ -37,7 +37,7 @@ type BindingRow = {
 type EntryRow = WorkItems.WorkItemRow & {
   enqueue_sequence: number;
   priority: number;
-  queue_state: "queued" | "occupied" | "finished";
+  queue_state: "queued" | "occupied" | "finished" | "paused";
   claim_id: string | null;
   wake_generation: number;
   work_state: WorkbenchQueueSnapshot["items"][number]["workState"];
@@ -76,7 +76,11 @@ export class WorkbenchQueue extends Context.Service<
       taskId: ScheduledTaskId,
       businessDeliveryId?: string,
     ) => Effect.Effect<
-      { readonly workItemId: string; readonly claimId: string } | null,
+      {
+        readonly workItemId: string;
+        readonly claimId: string;
+        readonly attentionEpoch: number;
+      } | null,
       WorkbenchQueueError
     >;
     readonly dispatched: (workItemId: string) => Effect.Effect<void, WorkbenchQueueError>;
@@ -167,6 +171,8 @@ const make = Effect.gen(function* () {
           businessDeliveryId: row.business_delivery_id,
           dispatcherThreadId: row.dispatcher_thread_id as ThreadId,
           priority: row.priority,
+          workItemVersion: row.version,
+          latestEventSequence: row.matter_id === null ? 1 : row.latest_event_sequence,
           enqueueSequence: row.enqueue_sequence,
           queueState: row.queue_state,
           claimId: row.claim_id,
@@ -255,14 +261,26 @@ const make = Effect.gen(function* () {
   );
   const observeEntry = Effect.fn("WorkbenchQueue.observeEntry")(
     function* (row: EntryRow) {
+      if (row.attention_hold === 1) return;
       const item = yield* items.observe(row);
       if (row.matter_id !== null) {
-        const preparation =
+        const observedRun =
           item.runId === null || item.workThreadId === null
-            ? false
+            ? undefined
             : (yield* threads.getThreadRecords(ThreadId.make(item.workThreadId), ["runs"], {
                 runIds: [RunId.make(item.runId)],
-              })).runs[0]?.status === "preparing";
+              })).runs[0];
+        const preparation = observedRun?.status === "preparing";
+        const executing =
+          observedRun !== undefined &&
+          ["preparing", "starting", "running", "waiting", "queued"].includes(observedRun.status);
+        const held =
+          !executing &&
+          item.workThreadId !== null &&
+          item.runId !== null &&
+          (yield* threads.delegatedTaskResultPending(ThreadId.make(item.workThreadId), undefined, [
+            RunId.make(item.runId),
+          ]));
         yield* sql.withTransaction(
           Effect.gen(function* () {
             const [current] =
@@ -309,6 +327,9 @@ const make = Effect.gen(function* () {
             const settled =
               !uncertain &&
               !needs &&
+              !executing &&
+              !held &&
+              item.state !== "blocked" &&
               active.length === 0 &&
               current.processed_through_sequence === current.latest_event_sequence &&
               ["awaiting_delivery", "completed"].includes(current.business_state);
@@ -508,7 +529,7 @@ const make = Effect.gen(function* () {
               const waiting = yield* sql<{
                 work_item_id: string;
               }>`SELECT e.work_item_id FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id
-          WHERE e.queue_id=${queueId} AND e.state='queued' AND w.task_id IN ${sql.in(eligible)} ORDER BY e.priority DESC,e.enqueue_sequence LIMIT ${free}`;
+          WHERE e.queue_id=${queueId} AND e.state='queued' AND (w.attention_hold=0 OR EXISTS(SELECT 1 FROM workbench_attention_items a WHERE a.work_item_id=w.id AND a.phase='requeue_pending')) AND w.task_id IN ${sql.in(eligible)} ORDER BY e.priority DESC,e.enqueue_sequence LIMIT ${free}`;
               for (const row of waiting) {
                 if (free-- <= 0) break;
                 yield* sql`UPDATE workbench_queue_entries SET state='occupied',claim_id='queue-claim:' || work_item_id || CASE WHEN wake_generation=0 THEN '' ELSE ':' || wake_generation END,blocked_reason='awaiting_dispatcher',wake_sent=0,
@@ -581,13 +602,19 @@ const make = Effect.gen(function* () {
       const [selected] = yield* sql<{
         work_item_id: string;
         claim_id: string;
-      }>`SELECT e.work_item_id,e.claim_id FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id
+        attention_epoch: number;
+      }>`SELECT e.work_item_id,e.claim_id,w.attention_epoch FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id
       WHERE e.queue_id=${binding.queue_id} AND w.task_id=${taskId} AND w.task_created_at=${binding.task_created_at} AND w.project_id=${binding.project_id} AND w.dispatcher_thread_id=${binding.dispatcher_thread_id}
+      AND (w.attention_hold=0 OR EXISTS(SELECT 1 FROM workbench_attention_items a WHERE a.work_item_id=w.id AND a.phase IN ('requeue_pending','resuming')))
       AND ${businessDeliveryId === undefined ? sql`e.state='occupied' AND e.needs_dispatch=1` : sql`(w.business_delivery_id=${businessDeliveryId} OR EXISTS(SELECT 1 FROM workbench_work_item_events m WHERE m.work_item_id=w.id AND m.business_delivery_id=${businessDeliveryId})) AND e.state IN ('occupied','finished')`}
       ORDER BY e.priority DESC,e.enqueue_sequence LIMIT 1`;
       return selected === undefined
         ? null
-        : { workItemId: selected.work_item_id, claimId: selected.claim_id };
+        : {
+            workItemId: selected.work_item_id,
+            claimId: selected.claim_id,
+            attentionEpoch: selected.attention_epoch,
+          };
     },
     Effect.catchTags({
       SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
@@ -595,11 +622,12 @@ const make = Effect.gen(function* () {
   );
   const dispatched = Effect.fn("WorkbenchQueue.dispatched")(
     function* (workItemId: string) {
+      yield* sql`UPDATE workbench_queue_entries SET needs_dispatch=0,wake_sent=1 WHERE work_item_id=${workItemId} AND state='occupied' AND EXISTS(SELECT 1 FROM workbench_work_items w WHERE w.id=${workItemId} AND w.attention_hold=1)`;
       yield* sql`UPDATE workbench_queue_entries SET
         needs_dispatch=CASE WHEN EXISTS(SELECT 1 FROM workbench_work_items w WHERE w.id=${workItemId} AND w.matter_id IS NOT NULL AND w.latest_event_sequence>w.dispatched_through_sequence) THEN 1 ELSE 0 END,
         wake_sent=CASE WHEN EXISTS(SELECT 1 FROM workbench_work_items w WHERE w.id=${workItemId} AND w.matter_id IS NOT NULL AND w.latest_event_sequence>w.dispatched_through_sequence) THEN 0 ELSE wake_sent END,
         wake_generation=wake_generation+CASE WHEN EXISTS(SELECT 1 FROM workbench_work_items w WHERE w.id=${workItemId} AND w.matter_id IS NOT NULL AND w.latest_event_sequence>w.dispatched_through_sequence) THEN 1 ELSE 0 END,
-        blocked_reason=NULL WHERE work_item_id=${workItemId} AND state='occupied'`;
+        blocked_reason=NULL WHERE work_item_id=${workItemId} AND state='occupied' AND EXISTS(SELECT 1 FROM workbench_work_items w WHERE w.id=${workItemId} AND w.attention_hold=0)`;
     },
     Effect.catchTags({
       SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),

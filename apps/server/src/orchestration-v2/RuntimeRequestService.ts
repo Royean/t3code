@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -67,12 +68,15 @@ export class RuntimeRequestServiceV2 extends Context.Service<
 export const layer: Layer.Layer<
   RuntimeRequestServiceV2,
   never,
-  ProjectionStore.ProjectionStoreV2 | ProviderSessionManager.ProviderSessionManagerV2
+  | ProjectionStore.ProjectionStoreV2
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | WorkbenchAttentionGuard.WorkbenchAttentionGuard
 > = Layer.effect(
   RuntimeRequestServiceV2,
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
 
     return RuntimeRequestServiceV2.of({
       respond: Effect.fn("RuntimeRequestService.respond")(
@@ -115,12 +119,15 @@ export const layer: Layer.Layer<
               requestId: input.requestId,
             });
           }
-          yield* session.value.respondToRuntimeRequest({
-            requestId: input.requestId,
-            ...(input.decision === undefined ? {} : { decision: input.decision }),
-            ...(input.feedback === undefined ? {} : { feedback: input.feedback }),
-            ...(input.answers === undefined ? {} : { answers: input.answers }),
-          });
+          yield* attentionGuard.withAdmission(
+            { threadId: input.threadId },
+            session.value.respondToRuntimeRequest({
+              requestId: input.requestId,
+              ...(input.decision === undefined ? {} : { decision: input.decision }),
+              ...(input.feedback === undefined ? {} : { feedback: input.feedback }),
+              ...(input.answers === undefined ? {} : { answers: input.answers }),
+            }),
+          );
         },
         (effect, input) =>
           effect.pipe(

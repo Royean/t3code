@@ -48,6 +48,7 @@ import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryServic
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 import { layerThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -172,6 +173,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 );
 
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(
     Layer.mergeAll(
       layerContextHandoffServiceProvided,
@@ -188,11 +190,13 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
 );
 
 const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(
     Layer.mergeAll(layerEventSink, ProjectionStore.layer, layerProviderSessionManagerProvided),
   ),
 );
 const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
 const layerCheckpointRollbackServiceProvided = CheckpointRollbackService.layer.pipe(
@@ -349,6 +353,7 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
   ),
 );
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(
     Layer.mergeAll(
       layerRunFinalizationServiceProvided,
@@ -391,6 +396,9 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
 );
 
 export const layer = Layer.mergeAll(
+  EffectOutbox.layer,
+  WorkbenchAttentionGuard.layer,
+  layerRunExecutionServiceProvided,
   layerCommandOutputHubProvided,
   layerOrchestratorProvided,
   layerMcpAppRequestsProvided,

@@ -18,12 +18,16 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as Etag from "effect/http/Etag";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+import * as Attention from "./WorkbenchAttention.ts";
+import * as AttentionHttp from "./workbenchAttentionHttp.ts";
 import * as WorkItems from "./WorkbenchQueue.ts";
 import * as ExecutionsHttp from "./workbenchQueueHttp.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { failEnvironmentAuthInvalid } from "../auth/http.ts";
 
-class TestApi extends HttpApi.make("environment").add(EnvironmentHttpApi.groups.workbenchQueue) {}
+class TestApi extends HttpApi.make("environment")
+  .add(EnvironmentHttpApi.groups.workbenchQueue)
+  .add(EnvironmentHttpApi.groups.workbenchAttention) {}
 
 it.effect("requires both scopes before queue reads or control mutations", () =>
   Effect.gen(function* () {
@@ -64,9 +68,72 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         if (failure !== undefined) return yield* failure;
         return snapshot;
       });
+    const attention = {
+      id: "attention",
+      workItemId: "one",
+      taskId: "task",
+      taskCreatedAt: "2026-11-26T00:00:00.000Z",
+      version: 1,
+      phase: "awaiting_user",
+      reason: {
+        code: "manual",
+        summary: "Needs a repair",
+        requiredAction: "Repair and record the result",
+      },
+      priority: 1,
+      slotState: "released",
+      checkpoint: { status: "ready", capturedAt: "2026-11-26T00:00:00.000Z" },
+      resolution: { summary: null, recordedAt: null },
+      canRequeue: false,
+      blockedReason: null,
+      dispatcherThreadId: "thread",
+      workThreadId: "child",
+      sourceRunId: "run",
+      resumeRunId: null,
+      createdAt: "2026-11-26T00:00:00.000Z",
+      updatedAt: "2026-11-26T00:00:00.000Z",
+    } as const;
+    const attentionSnapshot = {
+      trackingId: snapshot.trackingId,
+      queueId: snapshot.queueId,
+      controllerId: snapshot.controllerId,
+      projectId: snapshot.projectId,
+      attentions: [attention],
+      nextCursor: null,
+    };
+    const attentionResult = (kind: "pause" | "record" | "requeue") => ({
+      trackingId: snapshot.trackingId,
+      queueId: snapshot.queueId,
+      controllerId: snapshot.controllerId,
+      projectId: snapshot.projectId,
+      attention,
+      operation: { clientRequestId: "request", kind, state: "pending" as const },
+      queue: snapshot,
+    });
+    const attentionRead = () =>
+      Effect.gen(function* () {
+        calls++;
+        if (failure) return yield* failure;
+        return attentionSnapshot as never;
+      });
+    const attentionWrite = (kind: "pause" | "record" | "requeue") => () =>
+      Effect.gen(function* () {
+        calls++;
+        if (failure) return yield* failure;
+        return attentionResult(kind) as never;
+      });
     const web = HttpRouter.toWebHandler(
       HttpApiBuilder.layer(TestApi).pipe(
         Layer.provide(ExecutionsHttp.layer),
+        Layer.provide(AttentionHttp.layer),
+        Layer.provide(
+          Layer.mock(Attention.WorkbenchAttention)({
+            get: attentionRead,
+            pause: attentionWrite("pause"),
+            record: attentionWrite("record"),
+            requeue: attentionWrite("requeue"),
+          }),
+        ),
         Layer.provide(
           Layer.mock(WorkItems.WorkbenchQueue)({
             get: result,
@@ -136,6 +203,38 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         body: JSON.stringify({ ...receipt, expectedTrackingId: "epoch", matter: null }),
       }),
     );
+    requests.push(
+      new Request(
+        "http://env.local/api/workbench/queues/queue/attention?controllerId=controller&projectId=project&expectedTrackingId=epoch",
+      ),
+    );
+    for (const action of ["pause", "record", "requeue"]) {
+      requests.push(
+        new Request(
+          `http://env.local/api/workbench/queues/queue/attention/${action === "pause" ? "one" : "attention"}/${action}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              controllerId: "controller",
+              projectId: "project",
+              expectedTrackingId: "epoch",
+              clientRequestId: "request",
+              expectedVersion: 1,
+              expectedWorkItemVersion: 1,
+              expectedLatestEventSequence: 1,
+              reason: {
+                code: "manual",
+                summary: "Needs a repair",
+                requiredAction: "Repair and record the result",
+              },
+              result: "Repaired",
+              priority: 1,
+            }),
+          },
+        ),
+      );
+    }
     for (const request of requests) {
       expect((yield* Effect.promise(() => web.handler(request.clone()))).status).toBe(401);
       for (const scope of ["orchestration:read", "orchestration:operate"]) {
@@ -156,11 +255,17 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       const response = yield* Effect.promise(() => web.handler(allowed));
       expect(response.status).toBe(200);
       expect(yield* Effect.promise(() => response.json())).toEqual({
-        ...(request.url.endsWith("/delivery-intents") ? receipt : snapshot),
+        ...(request.url.includes("/attention")
+          ? request.method === "GET"
+            ? attentionSnapshot
+            : attentionResult(request.url.split("/").at(-1) as "pause" | "record" | "requeue")
+          : request.url.endsWith("/delivery-intents")
+            ? receipt
+            : snapshot),
         environmentId: "env-test",
       });
     }
-    expect(calls).toBe(5);
+    expect(calls).toBe(9);
     failure = Object.defineProperty(new WorkbenchQueueError({ reason: "unavailable" }), "cause", {
       value: new Error("private SQL connection credential"),
     });

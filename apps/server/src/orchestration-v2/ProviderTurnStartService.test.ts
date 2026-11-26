@@ -79,6 +79,8 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as AttentionGuardTestkit from "./WorkbenchAttentionGuard.testkit.ts";
+import * as AttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -94,6 +96,7 @@ const normalize = (target: string) => {
 };
 const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
   Layer.mergeAll(
+    AttentionGuardTestkit.layer,
     Path.layer,
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
@@ -445,6 +448,7 @@ it.each([
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  readonly strictResume?: boolean;
   readonly manualContinuation?: boolean;
   readonly nativeResumeUnsupported?: boolean;
   readonly steeringRestart?: boolean;
@@ -920,7 +924,11 @@ function makeLocalCommandHarness(input: {
       ],
     };
   }
-  if ("historyReadFailureAfterFallback" in input || "resumeFailure" in input) {
+  if (
+    "historyReadFailureAfterFallback" in input ||
+    "resumeFailure" in input ||
+    input.strictResume
+  ) {
     const nativeThreadRef = {
       driver: providerThread.driver,
       nativeId: "native-resume-thread",
@@ -1318,6 +1326,30 @@ function makeLocalCommandHarness(input: {
         IdAllocator.layer,
         Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({}),
         layerWorktreeLocation(input.worktreesDir),
+        ...(input.strictResume
+          ? [
+              Layer.mock(AttentionGuard.WorkbenchAttentionGuard)({
+                assertAdmission: () => Effect.void,
+                withAdmission: (_input, effect) => effect,
+                originalResume: () =>
+                  Effect.succeed({
+                    id: "strict-resume",
+                    workItemId: "item",
+                    attentionEpoch: 1,
+                    projectId: projection.thread.projectId,
+                    providerInstanceId: newInstanceId,
+                    providerThreadId,
+                    nativeDriver: providerThread.driver,
+                    nativeThreadId: "native-resume-thread",
+                    worktreePath: input.worktreePath!,
+                    worktreeRealPath: input.worktreePath!,
+                    branch: "feature/restore",
+                    gitCommonDir: `${input.worktreePath}/.git`,
+                    requestJson: "{}",
+                  }),
+              }),
+            ]
+          : []),
         input.fileSystem === undefined
           ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
           : Layer.succeed(FileSystem.FileSystem, input.fileSystem),
@@ -1325,6 +1357,8 @@ function makeLocalCommandHarness(input: {
           ? Layer.mock(GitWorkflow.GitWorkflowService)({
               pruneWorktrees: () => Effect.void,
               listLocalBranchNames: () => Effect.succeed(["feature/restore"]),
+              currentBranch: () => Effect.succeed("feature/restore"),
+              headPath: (cwd) => Effect.succeed(`${cwd}/.git/HEAD`),
               createWorktree,
             })
           : Layer.succeed(GitWorkflow.GitWorkflowService, input.gitWorkflow),
@@ -1422,6 +1456,7 @@ function layerStartEffectWorker(
   control: Partial<ProviderTurnControlService.ProviderTurnControlServiceV2["Service"]> = {},
 ) {
   const executor = EffectWorker.layerExecutor.pipe(
+    Layer.provide(AttentionGuardTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         harness.layer,
@@ -2966,6 +3001,68 @@ effectIt.effect("fails the run instead of replacing a native thread another clie
         failure: { class: "provider_error", message: detail },
       },
     ]);
+  }),
+);
+
+effectIt.effect.each([
+  "missing workspace",
+  "failed native resume",
+  "changed native identity",
+] as const)("keeps the original Attention context when recovery encounters %s", (boundary) =>
+  Effect.gen(function* () {
+    const worktreePath = `${managedWorktreesDir}/project/strict-resume`;
+    const harness = makeLocalCommandHarness({
+      text: "Continue after human recovery",
+      strictResume: true,
+      worktreePath,
+      fileSystem: FileSystem.makeNoop({
+        exists: () => Effect.succeed(false),
+        realPath: (target) =>
+          boundary === "missing workspace" && target === worktreePath
+            ? Effect.fail(
+                PlatformError.systemError({
+                  _tag: "NotFound",
+                  module: "FileSystem",
+                  method: "realPath",
+                  pathOrDescriptor: target,
+                }),
+              )
+            : Effect.succeed(target),
+      }),
+      resumeFailure: new ProviderAdapter.ProviderAdapterResumeThreadError({
+        driver: ProviderDriverKind.make("codex"),
+        providerSessionId: ProviderSessionId.make("new-provider-session"),
+        providerThreadId: ProviderThreadId.make("new-provider-thread"),
+        cause: "native context unavailable",
+      }),
+    });
+    if (boundary === "changed native identity") {
+      const original = harness.projection().providerThreads[0]!;
+      harness.open.mockReturnValue(
+        Effect.succeed({
+          driver: original.driver,
+          providerSession: { capabilities: CodexProviderCapabilitiesV2 },
+          resumeThread: () =>
+            Effect.succeed({
+              ...original,
+              nativeThreadRef: {
+                driver: original.driver,
+                nativeId: "replacement-native",
+                strength: "strong",
+              },
+            }),
+        } as never),
+      );
+    }
+    const error = yield* harness.start.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.createWorktree).not.toHaveBeenCalled();
+    expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
+      "native-resume-thread",
+    );
+    expect(harness.projection().contextHandoffs).toEqual([]);
   }),
 );
 

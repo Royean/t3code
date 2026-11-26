@@ -364,7 +364,11 @@ const layerTest = Layer.mergeAll(
   Layer.provide(layerPlatformTest),
 );
 
-const layerLegacyImportTest = Layer.merge(RuntimeLayer.layer, layerProjectionReplayTest).pipe(
+const layerLegacyImportTest = Layer.mergeAll(
+  RuntimeLayer.layer,
+  layerProjectionReplayTest,
+  RuntimeLayer.layerEventSink,
+).pipe(
   Layer.provide(McpSessionRegistryTestkit.layer),
   Layer.provide(McpProviderSessions.layer),
   Layer.provideMerge(SqlitePersistence.layerMemory),
@@ -376,6 +380,85 @@ const layerLegacyImportTest = Layer.merge(RuntimeLayer.layer, layerProjectionRep
   Layer.provide(layerProjectServiceTest),
   Layer.provide(layerPlatformTest),
 );
+
+it.layer(layerLegacyImportTest)("Attention admission", (it) => {
+  it.effect("keeps queued work fenced when an accepted old resume receipt is replayed", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("attention-old-receipt");
+      const projectId = ProjectId.make("attention-old-receipt-project");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("attention:create"),
+        threadId,
+        projectId,
+        title: "Attention fence",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const oldResume = {
+        type: "queue.resume" as const,
+        commandId: CommandId.make("attention:old-resume"),
+        threadId,
+      };
+      yield* orchestrator.dispatch(oldResume);
+      const message = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("attention:message"),
+        threadId,
+        messageId: MessageId.make("attention:message"),
+        text: "Queued work",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" as const },
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+      };
+      yield* orchestrator.dispatch(message);
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("attention:queued"),
+            type: "run.updated",
+            threadId,
+            occurredAt: yield* DateTime.now,
+            payload: { ...run, status: "queued", queueHeld: false, queuePosition: 1 },
+          },
+        ],
+      });
+      yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,work_thread_id,attention_hold,attention_epoch,created_at,updated_at)
+      VALUES('attention-old-receipt-item','task','2026-11-26',${projectId},'event','dispatcher','{}',${threadId},1,1,'2026-11-26','2026-11-26')`;
+      yield* orchestrator.dispatch(oldResume);
+      const refused = yield* orchestrator
+        .dispatch({
+          ...message,
+          commandId: CommandId.make("attention:bypass"),
+          messageId: MessageId.make("attention:bypass"),
+        })
+        .pipe(Effect.flip);
+      assert.equal(refused._tag, "OrchestratorDispatchError");
+      const picked = yield* orchestrator
+        .dispatch({
+          type: "queued-run.start",
+          commandId: CommandId.make("attention:pick"),
+          threadId,
+          runId: run.id,
+        })
+        .pipe(Effect.flip);
+      assert.equal(picked._tag, "OrchestratorDispatchError");
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.runs.length, 1);
+      assert.equal(projection.runs[0]?.status, "queued");
+    }),
+  );
+});
 
 const layerScheduledTasksTest = ScheduledTaskService.layer.pipe(
   Layer.provide(

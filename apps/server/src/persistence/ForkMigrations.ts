@@ -13,6 +13,7 @@ import WorkbenchWorkItems from "./ForkMigrations/005_WorkbenchWorkItems.ts";
 import WorkbenchQueue from "./ForkMigrations/006_WorkbenchQueue.ts";
 
 import WorkbenchMatters from "./ForkMigrations/007_WorkbenchMatters.ts";
+import WorkbenchAttention from "./ForkMigrations/008_WorkbenchAttention.ts";
 
 const TABLE = "t3_fork_migrations";
 const run = Migrator.make({});
@@ -50,7 +51,8 @@ export const hasPendingForkMigrations = Effect.gen(function* () {
     !applied.has("4:ScheduledTaskExecutions") ||
     !applied.has("5:WorkbenchWorkItems") ||
     !applied.has("6:WorkbenchQueue") ||
-    !applied.has("7:WorkbenchMatters")
+    !applied.has("7:WorkbenchMatters") ||
+    !applied.has("8:WorkbenchAttention")
   );
 });
 
@@ -65,6 +67,7 @@ export const runForkMigrations = () =>
       "5_WorkbenchWorkItems": WorkbenchWorkItems,
       "6_WorkbenchQueue": WorkbenchQueue,
       "7_WorkbenchMatters": WorkbenchMatters,
+      "8_WorkbenchAttention": WorkbenchAttention,
     }),
   });
 

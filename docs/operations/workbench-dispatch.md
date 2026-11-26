@@ -49,3 +49,18 @@ a new claim. Business completion has no model or ordinary UI shortcut: an intern
 operation fences the current version and event watermark before a subsequent event may open a new
 cycle. Automatic cleanup retains active cycles, unpreserved handoffs and recovery dependencies,
 rechecks them before removal, and keeps the corresponding checkpoint history.
+
+Attention lists use `GET /api/workbench/queues/:queueId/attention` with the same controller,
+project and tracking identity. Native pending questions and approvals appear as observations:
+they keep their execution slot and remain answerable in the original thread. Observation does
+not stop work or claim that a recovery checkpoint is ready. A live pending request also blocks
+manual pause until it has been handled; Attention does not answer requests on the user's behalf.
+
+For other work, `attention/:workItemId/pause` durably fences execution, confirms that native
+work has stopped, then saves the original workspace and context in private local storage before
+releasing its slot. `attention/:attentionId/record` saves the handling result and priority without
+starting work. Explicit `requeue` enters the queue; its receipt is not confirmation of restoration.
+The original thread, branch, worktree and native conversation must still be available. Missing
+workspaces or provider context remain blocked, and re-entry preserves the user's repairs instead
+of restoring an older checkpoint over them. Retry each mutation with its original client request
+id. A changed version or changed request body requires reading the current state first.

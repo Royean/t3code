@@ -30,6 +30,7 @@ import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 
@@ -102,6 +103,7 @@ export const layerExecutor: Layer.Layer<
   | ThreadManagementService.ThreadManagementService
   | ProjectionStore.ProjectionStoreV2
   | ServerSettings.ServerSettingsService
+  | WorkbenchAttentionGuard.WorkbenchAttentionGuard
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -117,6 +119,7 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
     const startRun = (
       effect: EffectOutbox.OrchestrationEffectV2,
       runId: RunId,
@@ -154,6 +157,45 @@ export const layerExecutor: Layer.Layer<
             ),
         ),
       );
+    const fenceExecution = <A, E, R>(
+      execution: Effect.Effect<A, E, R>,
+      effect: EffectOutbox.OrchestrationEffectV2,
+      _options?: Parameters<OrchestrationEffectExecutorV2Shape["execute"]>[1],
+    ) => {
+      if (
+        ![
+          "provider-runtime.continue",
+          "provider-turn.start",
+          "provider-turn.restart",
+          "provider-turn.steer",
+          "runtime-request.respond",
+          "provider-session.apply-model-selection",
+        ].includes(effect.request.type)
+      )
+        return execution;
+      const request = effect.request;
+      return attentionGuard
+        .withAdmission(
+          {
+            threadId: effect.threadId,
+            expectedEpoch: effect.attentionEpoch ?? null,
+            ...("runId" in request ? { runId: request.runId } : {}),
+            ...("messageId" in request ? { messageId: request.messageId } : {}),
+          },
+          execution,
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isOrchestrationEffectExecutionError(cause)
+              ? cause
+              : new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: effect.request.type,
+                  cause,
+                }),
+          ),
+        );
+    };
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
@@ -713,7 +755,7 @@ export const layerExecutor: Layer.Layer<
                 ),
               );
         }
-      }),
+      }, fenceExecution),
     });
   }),
 );

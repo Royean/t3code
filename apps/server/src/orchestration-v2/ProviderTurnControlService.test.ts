@@ -28,6 +28,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as AttentionGuardTestkit from "./WorkbenchAttentionGuard.testkit.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -307,6 +308,7 @@ it.effect(
         }),
       );
       const layerControl = ProviderTurnControlService.layer.pipe(
+        Layer.provide(AttentionGuardTestkit.layer),
         Layer.provide(
           Layer.mergeAll(
             layerProjection,

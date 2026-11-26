@@ -23,6 +23,7 @@ import * as RunFinalization from "./RunFinalizationService.ts";
 import * as RuntimeRequests from "./RuntimeRequestService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitles from "./ThreadTitleRegenerationService.ts";
+import * as AttentionGuardTestkit from "./WorkbenchAttentionGuard.testkit.ts";
 
 it.effect.each([
   ["starts the next turn after a post-capture Git status failure", false],
@@ -86,6 +87,7 @@ it.effect.each([
     ),
   );
   const executor = EffectWorker.layerExecutor.pipe(
+    Layer.provide(AttentionGuardTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         finalization,

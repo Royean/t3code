@@ -38,6 +38,7 @@ import { Tool } from "effect/ai";
 import * as McpSchema from "effect/ai/McpSchema";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
+import { renderAttentionResumeBrief } from "../../apps/server/src/scheduledTasks/workbenchAttentionBrief.ts";
 import { renderWorkbenchBatchBrief } from "../../apps/server/src/scheduledTasks/workbenchBrief.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
@@ -346,6 +347,7 @@ export const McpToolUseCase = Schema.Struct({
   /** Empty to resume a top-level thread without side-chat context after its last tool result. */
   prompt: Schema.String,
   /** Uses the current service-generated child brief, not a copied prompt in case data. */
+  workbenchAttentionReport: Schema.optional(Schema.String),
   workbenchBrief: Schema.optional(
     Schema.Struct({
       eventJson: Schema.String,
@@ -1042,15 +1044,17 @@ const loadTools = (tools: Array<ApiTool>, id: string, found: ReadonlyArray<ApiTo
 };
 
 const casePrompt = (testCase: McpToolUseCase) =>
-  testCase.workbenchBrief === undefined
-    ? testCase.prompt
-    : renderWorkbenchBatchBrief({
-        eventJson: testCase.workbenchBrief.eventJson,
-        followup: testCase.workbenchBrief.followup,
-        ...(testCase.workbenchBrief.previous === undefined
-          ? {}
-          : { previous: testCase.workbenchBrief.previous }),
-      });
+  testCase.workbenchAttentionReport !== undefined
+    ? renderAttentionResumeBrief(testCase.workbenchAttentionReport)
+    : testCase.workbenchBrief === undefined
+      ? testCase.prompt
+      : renderWorkbenchBatchBrief({
+          eventJson: testCase.workbenchBrief.eventJson,
+          followup: testCase.workbenchBrief.followup,
+          ...(testCase.workbenchBrief.previous === undefined
+            ? {}
+            : { previous: testCase.workbenchBrief.previous }),
+        });
 
 /** Messages for a case: reminders, context, prior turns with real tool blocks, then the prompt. */
 export const buildMessages = (sample: Sample) => {

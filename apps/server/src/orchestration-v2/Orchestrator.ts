@@ -104,6 +104,8 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
@@ -1530,6 +1532,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
+  const attentionGuard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -2376,6 +2379,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly userStarted?: boolean;
       },
     ) {
+      const admitted = yield* attentionGuard
+        .assertAdmission({
+          threadId,
+          ...(options?.queuedRunId === undefined ? {} : { runId: options.queuedRunId }),
+        })
+        .pipe(
+          Effect.as(true),
+          Effect.catchTags({ WorkbenchAttentionGuardError: () => Effect.succeed(false) }),
+        );
+      if (!admitted) return;
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
       let projection = yield* readCommandProjection(threadId);
       if (
@@ -15529,6 +15542,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return yield* replayCommandReceipt(command, existingReceipt.value);
     }
 
+    yield* attentionGuard.assertCommand(command).pipe(mapDispatchError(command));
+
     // Recheck under the lock; the user may have raised modes since sender preflight.
     const limit = yield* DispatchModeLimit;
     if (limit !== undefined) {
@@ -16575,6 +16590,8 @@ export const layer: Layer.Layer<
   | RuntimePolicyV2
   | ServerSettings.ServerSettingsService
   | ThreadForkServiceV2
+  | SqlClient.SqlClient
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
+  Layer.provide(WorkbenchAttentionGuard.layer),
   Layer.provide(ThreadCommandExecutor.layer),
 );

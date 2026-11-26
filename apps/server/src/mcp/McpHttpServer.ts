@@ -63,6 +63,7 @@ import { WorkbenchToolkit } from "./toolkits/workbench/tools.ts";
 import * as WorkbenchHandlers from "./toolkits/workbench/handlers.ts";
 import * as WorkbenchGuard from "../scheduledTasks/WorkbenchQueueGuard.ts";
 import * as WorkbenchQueue from "../scheduledTasks/WorkbenchQueue.ts";
+import * as WorkbenchAttention from "../scheduledTasks/WorkbenchAttention.ts";
 import * as WorkbenchDispatch from "../scheduledTasks/WorkbenchDispatch.ts";
 import * as WorkbenchWorkItems from "../scheduledTasks/WorkbenchWorkItems.ts";
 import { EventOrchestrationToolkit } from "./toolkits/eventOrchestration/tools.ts";
@@ -1484,6 +1485,12 @@ export const layer = layerMcpTransport(
     Layer.provide(WorkbenchGuard.layer),
     Layer.provide(
       WorkbenchDispatch.layer.pipe(
+        Layer.provide(
+          WorkbenchAttention.layer.pipe(
+            Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkbenchWorkItems.layer))),
+            Layer.provide(WorkbenchWorkItems.layer),
+          ),
+        ),
         Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkbenchWorkItems.layer))),
         Layer.provide(WorkbenchWorkItems.layer),
         Layer.provide(OrchestratorMcpService.layer),

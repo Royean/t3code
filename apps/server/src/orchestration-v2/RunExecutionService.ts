@@ -27,6 +27,7 @@ import {
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -676,6 +677,8 @@ type RunBaselineInput = Pick<
 >;
 
 export interface RunExecutionServiceV2Shape {
+  /** Fence new thread admissions before awaiting startup and event-consumer cleanup. */
+  readonly awaitThreadQuiescent: (threadId: ThreadId) => Effect.Effect<void>;
   readonly startRootRun: (
     input: RunExecutionServiceV2StartRootRunInput,
   ) => Effect.Effect<void, RunExecutionServiceV2Error>;
@@ -718,6 +721,28 @@ export const layer: Layer.Layer<
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const turnAnalytics = yield* ProviderUsageAnalytics.ProviderTurnAnalytics;
     const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const executions = new Map<ThreadId, Set<Deferred.Deferred<void>>>();
+    const registerExecution = (threadId: ThreadId) =>
+      Effect.sync(() => {
+        const finished = Deferred.makeUnsafe<void>();
+        const pending = executions.get(threadId) ?? new Set<Deferred.Deferred<void>>();
+        pending.add(finished);
+        executions.set(threadId, pending);
+        return Effect.sync(() => {
+          pending.delete(finished);
+          if (pending.size === 0) executions.delete(threadId);
+          Deferred.doneUnsafe(finished, Effect.void);
+        });
+      });
+    const trackStartup = <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+      input: RunExecutionServiceV2StartRootRunInput,
+    ) =>
+      Effect.acquireUseRelease(
+        registerExecution(input.run.threadId),
+        () => effect,
+        (finished) => finished,
+      );
 
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
@@ -1069,6 +1094,17 @@ export const layer: Layer.Layer<
     });
 
     return RunExecutionServiceV2.of({
+      awaitThreadQuiescent: Effect.fn("RunExecutionService.awaitThreadQuiescent")(
+        function* (threadId) {
+          // A startup can hand over to its detached consumer while this wait is suspended.
+          // Every pass waits on lifecycle signals; no clock or provider polling is involved.
+          let pending = executions.get(threadId);
+          while (pending !== undefined && pending.size > 0) {
+            yield* Effect.forEach([...pending], Deferred.await, { discard: true });
+            pending = executions.get(threadId);
+          }
+        },
+      ),
       forkBaseline: (input) =>
         captureRunBaseline(input).pipe(
           Effect.forkChild({ startImmediately: true }),
@@ -1972,7 +2008,7 @@ export const layer: Layer.Layer<
           yield* trackChildLifecycle(event, deliveredEvent !== null);
           yield* scheduleIdleFlush;
         });
-        const providerEventFiber = yield* eventSink
+        const consumeProviderEvents = eventSink
           .consumeProviderEvents(
             eventSubscription.events.pipe(
               Stream.merge(Stream.fromQueue(idleFlushTicks), { haltStrategy: "left" }),
@@ -2187,8 +2223,17 @@ export const layer: Layer.Layer<
             ),
             Effect.ensuring(endPreviewActivity),
             Effect.ensuring(eventSubscription.close),
-            Effect.forkDetach,
           );
+        const providerEventFiber = yield* Effect.uninterruptibleMask((restore) =>
+          registerExecution(input.run.threadId).pipe(
+            Effect.flatMap((finished) =>
+              restore(consumeProviderEvents).pipe(
+                Effect.ensuring(finished),
+                Effect.forkDetach({ startImmediately: true }),
+              ),
+            ),
+          ),
+        );
 
         // A provider turn is a sign that the session is still alive. Keep
         // its already-issued MCP credential valid even when the agent goes
@@ -2254,7 +2299,10 @@ export const layer: Layer.Layer<
         const { message: _message, ...resumeInput } = turnInput;
         const startTurn =
           input.resume === true
-            ? (input.session.resumeTurn?.({ ...resumeInput, messageId: input.message.messageId }) ??
+            ? (input.session.resumeTurn?.({
+                ...resumeInput,
+                messageId: input.message.messageId,
+              }) ??
               Effect.fail(
                 new ProviderAdapter.ProviderAdapterTurnStartError({
                   driver: input.session.driver,
@@ -2340,7 +2388,7 @@ export const layer: Layer.Layer<
             ),
           ),
         );
-      }),
+      }, trackStartup),
     } satisfies RunExecutionServiceV2Shape);
   }),
 );

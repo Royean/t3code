@@ -43,6 +43,7 @@ import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as AttentionGuardTestkit from "./WorkbenchAttentionGuard.testkit.ts";
 
 const threadId = ThreadId.make("thread:effect-worker-restart");
 const oldSessionId = ProviderSessionId.make("provider-session:effect-worker-restart:old");
@@ -170,6 +171,7 @@ function layerExecutorFor(input: {
     ),
   );
   return EffectWorker.layerExecutor.pipe(
+    Layer.provide(AttentionGuardTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
