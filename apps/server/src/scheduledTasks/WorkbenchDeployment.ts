@@ -7,6 +7,7 @@ import {
   type WorkbenchDeployment as DeploymentRecord,
   type WorkbenchDeploymentPayload,
   type WorkbenchDeploymentOperation,
+  type WorkbenchDeploymentTarget,
   type WorkbenchDeploymentResult,
   type WorkbenchDeploymentReason,
   type WorkbenchAttentionScope,
@@ -411,28 +412,16 @@ const make = Effect.gen(function* () {
       });
       return;
     }
-    const observation = yield* adapter.observe(profile);
-    if (d.target && observation.target.revision < d.target.revision)
-      return yield* new Adapter.ReleaseAdapterError({
-        reason: "state_unknown",
-        stage: "target_revision",
-      });
-    yield* save({ ...observation, observedAt: yield* now });
-    const target = observation.target,
-      version = observation.versionObservation.basis;
-    const baseline =
-      target.state === "consistent" &&
-      same(target.basis, p.baseline.basis) &&
-      same(version, p.baseline.basis);
-    const [rollbackAction] =
-      yield* sql`SELECT operation_id FROM workbench_deployment_actions WHERE deployment_id=${d.id} AND kind='rollback'`;
-    if (
-      d.rollbackOperation ||
-      rollbackAction ||
-      d.state === "rolling_back" ||
-      d.state === "rollback_unknown"
+    const attributable = (target: WorkbenchDeploymentTarget) =>
+      deploy.result?.writtenRevision !== null &&
+      deploy.result?.writtenRevision !== undefined &&
+      target.lastOperationId === deploy.id &&
+      target.revision === deploy.result.writtenRevision;
+    const reconcileRollback = Effect.fn("WorkbenchDeployment.reconcileRollback")(function* (
+      before: WorkbenchDeploymentTarget,
     ) {
-      const rollback = yield* operation("rollback", !physicallySettled);
+      yield* save({ state: "rolling_back", reasons: ["deployment_failed"] });
+      const rollback = yield* operation("rollback", !physicallySettled && attributable(before));
       if (!terminal(rollback)) {
         yield* save({
           state: rollback.state === "unknown" ? "rollback_unknown" : "rolling_back",
@@ -441,61 +430,11 @@ const make = Effect.gen(function* () {
         return;
       }
       const final = yield* adapter.observe(profile);
-      if (final.target.revision < target.revision)
+      if (final.target.revision < before.revision)
         return yield* new Adapter.ReleaseAdapterError({
           reason: "state_unknown",
           stage: "rollback_revision",
         });
-      yield* save({ ...final, observedAt: yield* now });
-      const restored =
-        rollback.state === "succeeded" &&
-        rollback.result?.effect === "changed" &&
-        rollback.result.writtenRevision !== null &&
-        rollback.result.writtenRevision > 0 &&
-        final.target.state === "consistent" &&
-        final.target.lastOperationId === rollback.id &&
-        final.target.revision === rollback.result.writtenRevision &&
-        same(final.target.basis, p.baseline.basis) &&
-        same(final.versionObservation.basis, p.baseline.basis);
-      yield* save({
-        state: restored ? "rolled_back" : "attention",
-        reasons: restored ? [] : ["rollback_failed"],
-      });
-      return;
-    }
-    const desired =
-      target.state === "consistent" && same(target.basis, p.desired) && same(version, p.desired);
-    const own =
-      deploy.result?.writtenRevision !== null &&
-      deploy.result?.writtenRevision !== undefined &&
-      target.lastOperationId === deploy.id &&
-      target.revision === deploy.result.writtenRevision;
-    if (
-      deploy.state === "succeeded" &&
-      desired &&
-      (deploy.result?.effect === "changed"
-        ? own
-        : deploy.result?.effect === "unchanged" &&
-          same(p.desired, p.baseline.basis) &&
-          target.revision === p.baseline.revision)
-    ) {
-      yield* save({ state: "deployed", reasons: [] });
-      return;
-    }
-    if (
-      deploy.result?.effect === "unchanged" &&
-      deploy.result.writtenRevision === null &&
-      baseline &&
-      target.revision === p.baseline.revision
-    ) {
-      yield* save({ state: "failed_unchanged", reasons: ["deployment_failed"] });
-      return;
-    }
-    if (!alreadyDeployed && own) {
-      yield* save({ state: "rolling_back", reasons: ["deployment_failed"] });
-      const rollback = yield* operation("rollback", !physicallySettled);
-      if (!terminal(rollback)) return;
-      const final = yield* adapter.observe(profile);
       const restored =
         rollback.state === "succeeded" &&
         rollback.result?.effect === "changed" &&
@@ -512,20 +451,91 @@ const make = Effect.gen(function* () {
         state: restored ? "rolled_back" : "attention",
         reasons: restored ? [] : ["rollback_failed"],
       });
+    });
+    const target = yield* adapter.readTarget(profile);
+    if (d.target && target.revision < d.target.revision)
+      return yield* new Adapter.ReleaseAdapterError({
+        reason: "state_unknown",
+        stage: "target_revision",
+      });
+    yield* save({ target, observedAt: yield* now });
+    const [rollbackAction] =
+      yield* sql`SELECT operation_id FROM workbench_deployment_actions WHERE deployment_id=${d.id} AND kind='rollback'`;
+    if (
+      d.rollbackOperation ||
+      rollbackAction ||
+      d.state === "rolling_back" ||
+      d.state === "rollback_unknown"
+    ) {
+      yield* reconcileRollback(target);
+      return;
+    }
+    if (
+      !alreadyDeployed &&
+      attributable(target) &&
+      (deploy.state === "failed" ||
+        deploy.result?.effect === "partial" ||
+        target.state !== "consistent" ||
+        !same(target.basis, p.desired))
+    ) {
+      yield* reconcileRollback(target);
+      return;
+    }
+    const observation = yield* adapter.observe(profile);
+    if (observation.target.revision < target.revision)
+      return yield* new Adapter.ReleaseAdapterError({
+        reason: "state_unknown",
+        stage: "target_revision",
+      });
+    yield* save({ ...observation, observedAt: yield* now });
+    const verifiedTarget = observation.target,
+      version = observation.versionObservation.basis;
+    const baseline =
+      verifiedTarget.state === "consistent" &&
+      same(verifiedTarget.basis, p.baseline.basis) &&
+      same(version, p.baseline.basis);
+    const desired =
+      verifiedTarget.state === "consistent" &&
+      same(verifiedTarget.basis, p.desired) &&
+      same(version, p.desired);
+    const own = attributable(verifiedTarget);
+    if (
+      deploy.state === "succeeded" &&
+      desired &&
+      (deploy.result?.effect === "changed"
+        ? own
+        : deploy.result?.effect === "unchanged" &&
+          same(p.desired, p.baseline.basis) &&
+          verifiedTarget.revision === p.baseline.revision)
+    ) {
+      yield* save({ state: "deployed", reasons: [] });
+      return;
+    }
+    if (
+      deploy.result?.effect === "unchanged" &&
+      deploy.result.writtenRevision === null &&
+      baseline &&
+      verifiedTarget.revision === p.baseline.revision
+    ) {
+      yield* save({ state: "failed_unchanged", reasons: ["deployment_failed"] });
+      return;
+    }
+    if (!alreadyDeployed && own) {
+      yield* reconcileRollback(verifiedTarget);
       return;
     }
     yield* save({ state: "attention", reasons: ["target_changed_unrelated"] });
   });
   const sync = Effect.gen(function* () {
     const rows =
-      yield* sql<Row>`SELECT * FROM workbench_deployments WHERE state != 'rejected' ORDER BY created_at,id`;
+      yield* sql<Row>`SELECT * FROM workbench_deployments WHERE state NOT IN ('rejected','rolled_back','failed_unchanged') ORDER BY created_at,id`;
     for (const candidate of rows)
       yield* locks.withLock(
         candidate.id,
         Effect.gen(function* () {
           const [row] =
             yield* sql<Row>`SELECT * FROM workbench_deployments WHERE id=${candidate.id}`;
-          if (!row || row.state === "rejected") return;
+          if (!row || ["rejected", "rolled_back", "failed_unchanged"].includes(row.state)) return;
           yield* step(row).pipe(
             Effect.catch((cause) =>
               Effect.gen(function* () {

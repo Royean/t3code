@@ -1643,3 +1643,82 @@ it.live(
       expect(a.writes()).toBe(0);
     }).pipe(Effect.provide(layer)),
 );
+
+it.live.each(["http500", "disconnect", "invalid_json"] as const)(
+  "restores an attributable terminal partial deployment when its version endpoint fails with %s",
+  (fault) =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      a.setMode("partial");
+      a.setVersionFault(fault);
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(d.state).toBe("rolled_back");
+      expect(d.rollbackOperation?.id).toBe("rollback-operation");
+      expect(d.versionObservation?.basis).toEqual(a.baseline);
+      expect(d.target?.basis).toEqual(a.baseline);
+      expect(a.bytes()).toBe("prior-artifact");
+      expect(a.writes()).toBe(2);
+    }).pipe(Effect.provide(layer)),
+);
+it.live("keeps restoration unverified until the independent version endpoint recovers", () =>
+  Effect.gen(function* () {
+    const { a, input } = yield* approvedDeploymentFixture,
+      deployments = yield* Deployment.WorkbenchDeployment,
+      gate = a.gateNext("after_apply");
+    a.setMode("partial");
+    yield* deployments.admit("queue", input);
+    yield* gate.reached;
+    a.setVersionFault("http500", false);
+    gate.release();
+    yield* gate.completed;
+    yield* deployments.sync;
+    const unknown = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+    expect(unknown.state).toBe("rollback_unknown");
+    expect(unknown.rollbackOperation?.state).toBe("succeeded");
+    expect(a.bytes()).toBe("prior-artifact");
+    expect(a.writes()).toBe(2);
+    a.setVersionFault(null);
+    yield* deployments.sync;
+    expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment.state).toBe(
+      "rolled_back",
+    );
+    expect(a.writes()).toBe(2);
+  }).pipe(Effect.provide(layer)),
+);
+it.live.each(["before", "partial"] as const)(
+  "stops background material and adapter I/O after verified %s recovery",
+  (mode) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      let byteReads = 0;
+      const monitoredFs = {
+        ...fs,
+        readFile: Effect.fn("releaseFixture.materialRead")(function* (path: string) {
+          byteReads++;
+          return yield* fs.readFile(path);
+        }),
+      };
+      yield* Effect.gen(function* () {
+        const { a, input } = yield* approvedDeploymentFixture,
+          deployments = yield* Deployment.WorkbenchDeployment;
+        a.setMode(mode);
+        yield* deployments.admit("queue", input);
+        yield* deployments.sync;
+        const completed = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+        expect(completed.state).toBe(mode === "before" ? "failed_unchanged" : "rolled_back");
+        const reads = byteReads,
+          requests = a.requests();
+        yield* deployments.sync;
+        const later = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+        expect(later).toEqual(completed);
+        expect(byteReads).toBe(reads);
+        expect(a.requests()).toBe(requests);
+      }).pipe(
+        Effect.provide(Deployment.layer.pipe(Layer.provideMerge(Release.layer))),
+        Effect.provideService(FileSystem.FileSystem, monitoredFs),
+      );
+    }).pipe(Effect.provide(dependencies)),
+);

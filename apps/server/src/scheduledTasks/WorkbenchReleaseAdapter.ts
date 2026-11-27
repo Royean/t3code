@@ -174,6 +174,9 @@ export class WorkbenchReleaseAdapter extends Context.Service<
       artifact: Uint8Array,
       rollback: Uint8Array,
     ) => Effect.Effect<void, ReleaseAdapterError>;
+    readonly readTarget: (
+      profile: WorkbenchReleaseHostProfile,
+    ) => Effect.Effect<WorkbenchDeploymentTarget, ReleaseAdapterError>;
     readonly observe: (
       profile: WorkbenchReleaseHostProfile,
     ) => Effect.Effect<Observation, ReleaseAdapterError>;
@@ -573,10 +576,15 @@ const make = Effect.gen(function* () {
     )
       return yield* new ReleaseAdapterError({ reason: "preflight_failed", stage: "verify" });
   });
+  const readTarget = Effect.fn("WorkbenchReleaseAdapter.readTarget")(function* (
+    profile: WorkbenchReleaseHostProfile,
+  ) {
+    return (yield* inspectAdapter(profile)).target;
+  });
   const observe = Effect.fn("WorkbenchReleaseAdapter.observe")(function* (
     profile: WorkbenchReleaseHostProfile,
   ) {
-    const inspected = yield* inspectAdapter(profile),
+    const target = yield* readTarget(profile),
       basis = yield* rpc(
         WorkbenchDeploymentBasis,
         profile.policy.target.origin,
@@ -586,7 +594,7 @@ const make = Effect.gen(function* () {
     if (!basis || basis.serviceId !== profile.policy.target.serviceId)
       return yield* new ReleaseAdapterError({ reason: "target_mismatch", stage: "target" });
     return {
-      target: inspected.target,
+      target,
       versionObservation: { basis, observedAt: DateTime.formatIso(yield* DateTime.now) },
     };
   });
@@ -689,6 +697,7 @@ const make = Effect.gen(function* () {
     verify,
     stage,
     observe,
+    readTarget,
     readOperation,
     putOperation,
     readClaim: Effect.fn("WorkbenchReleaseAdapter.readClaim")((p, r, t) =>

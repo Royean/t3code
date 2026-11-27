@@ -65,7 +65,10 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     loseClaim = false,
     loseRollbackResponse = false,
     operationReads = true,
-    adapterAvailable = true;
+    adapterAvailable = true,
+    requestCount = 0,
+    versionFault: "http500" | "disconnect" | "invalid_json" | null = null,
+    versionFaultOnlyCandidate = true;
   type Gate = {
     point: "before_apply" | "after_apply" | "after_claim";
     arrive: () => void;
@@ -189,10 +192,24 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     return Buffer.concat(parts);
   };
   const server = NodeHttp.createServer(async (req, res) => {
+    requestCount++;
     try {
       const url = new URL(req.url!, "http://fixture"),
         route = url.pathname;
-      if (route === "/version") return json(res, 200, currentBasis());
+      if (route === "/version") {
+        if (
+          versionFault &&
+          (!versionFaultOnlyCandidate || currentBasis().artifactSha256 !== baseline.artifactSha256)
+        ) {
+          if (versionFault === "disconnect") return res.destroy();
+          if (versionFault === "invalid_json") {
+            res.writeHead(200, { "content-type": "application/json" });
+            return res.end("not-json");
+          }
+          return error(res, 500, "unavailable");
+        }
+        return json(res, 200, currentBasis());
+      }
       if (route === "/.well-known/workbench-release-coordinator")
         return json(res, 200, { schemaVersion: 1, configured: true, id: keyId, origin, publicKey });
       if (route.startsWith("/api/release-coordinator/v1/claims/")) {
@@ -530,6 +547,11 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       db.close();
       db = new NodeSqlite.DatabaseSync(path.join(dir, "independent-adapter.sqlite"));
       store.database = db;
+    },
+    requests: () => requestCount,
+    setVersionFault: (fault: typeof versionFault, onlyCandidate = true) => {
+      versionFault = fault;
+      versionFaultOnlyCandidate = onlyCandidate;
     },
     setAdapterAvailable: (value: boolean) => {
       adapterAvailable = value;
