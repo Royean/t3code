@@ -29,6 +29,7 @@ import * as WorkItems from "./WorkbenchWorkItems.ts";
 import { renderWorkbenchBatchBrief } from "./workbenchBrief.ts";
 import * as Lifecycle from "./workbenchLifecycle.ts";
 import { derive } from "@t3tools/provider-core/server/IdAllocator";
+import { ensureRepairGeneration } from "./workbenchRepairGeneration.ts";
 
 const decodeRequest = Schema.decodeEffect(Schema.fromJsonString(OrchestratorMcpDelegateTaskInput));
 const encodeRequest = Schema.encodeEffect(Schema.fromJsonString(OrchestratorMcpDelegateTaskInput));
@@ -247,6 +248,10 @@ const make = Effect.gen(function* () {
               Effect.mapError(unavailable),
             );
             // A lost response is reconciled from the durable receipt, never retried under a new id.
+            yield* ensureRepairGeneration(selected.id).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.mapError(unavailable),
+            );
             yield* delegate
               .delegateTask({ ...scope, requestNamespace: namespace }, request, base)
               .pipe(
@@ -298,6 +303,9 @@ const make = Effect.gen(function* () {
                 })
                 .pipe(Effect.mapError(unavailable));
               if (actual.stdout.trim() !== workItem.branch) return yield* unavailable();
+              yield* sql`UPDATE workbench_repair_generations SET phase='watching',reason=NULL,version=version+1,updated_at=${DateTime.formatIso(yield* DateTime.now)} WHERE work_item_id=${selected.id} AND superseded_at IS NULL AND phase='succeeded'`.pipe(
+                Effect.mapError(unavailable),
+              );
               yield* threads
                 .sendToThread({
                   projectId: task.projectId,

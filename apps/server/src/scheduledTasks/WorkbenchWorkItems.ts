@@ -31,10 +31,16 @@ const decodeMatter = Schema.decodeUnknownEffect(Schema.fromJsonString(WorkbenchM
 function batchRuns(
   child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "nodes" | "runtimeRequests">,
   rootId: string,
+  repairs: ReadonlyArray<{ source_run_id: string; run_id: string }> = [],
 ) {
   const owned = new Set([rootId]);
   for (let grew = true; grew;) {
     grew = false;
+    for (const repair of repairs)
+      if (owned.has(repair.source_run_id) && !owned.has(repair.run_id)) {
+        owned.add(repair.run_id);
+        grew = true;
+      }
     for (const run of child.runs)
       if (
         run.restartContinuationOfRunId !== undefined &&
@@ -170,6 +176,10 @@ const make = Effect.gen(function* () {
   const observeBatches = Effect.fn("WorkbenchWorkItems.observeBatches")(function* (
     row: WorkItemRow,
   ) {
+    const repairs = yield* sql<{
+      source_run_id: string;
+      run_id: string;
+    }>`SELECT source_run_id,run_id FROM workbench_repair_attempts WHERE work_item_id=${row.id} AND charged=1 AND run_id IS NOT NULL`;
     const batches =
       yield* sql<Lifecycle.BatchRow>`SELECT * FROM workbench_work_batches WHERE work_item_id=${row.id} ORDER BY from_sequence`.pipe(
         Effect.mapError(ledgerError),
@@ -229,7 +239,7 @@ const make = Effect.gen(function* () {
               ),
             ),
           ]
-            .flatMap((root) => batchRuns(child, root.id))
+            .flatMap((root) => batchRuns(child, root.id, repairs))
             .map((candidate) => [candidate.id, candidate]),
         ).values(),
       ];
@@ -395,9 +405,13 @@ const make = Effect.gen(function* () {
           ),
         ),
       ];
+      const repairs = yield* sql<{
+        source_run_id: string;
+        run_id: string;
+      }>`SELECT source_run_id,run_id FROM workbench_repair_attempts WHERE work_item_id=${row.id} AND charged=1 AND run_id IS NOT NULL`;
       const runs = [
         ...new Map(
-          roots.flatMap((root) => batchRuns(child, root.id)).map((run) => [run.id, run]),
+          roots.flatMap((root) => batchRuns(child, root.id, repairs)).map((run) => [run.id, run]),
         ).values(),
       ].toSorted((a, b) => b.ordinal - a.ordinal);
       const run = runs[0];
@@ -640,6 +654,8 @@ const make = Effect.gen(function* () {
         WHERE id=${input.workItemId} AND version=${input.expectedVersion} AND latest_event_sequence=${input.expectedLatestEventSequence}
         AND processed_through_sequence=${input.processedThroughSequence} AND processed_through_sequence=latest_event_sequence AND business_state='awaiting_delivery'
         AND recovery_ref IS NULL AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${input.workItemId} AND a.state IN ('recorded','queued','submitted','unknown')) AND NOT EXISTS(SELECT 1 FROM workbench_work_batches b WHERE b.work_item_id=${input.workItemId} AND b.state!='completed')
+        AND (NOT EXISTS(SELECT 1 FROM workbench_queue_bindings q WHERE q.task_id=workbench_work_items.task_id AND q.task_created_at=workbench_work_items.task_created_at)
+          OR EXISTS(SELECT 1 FROM workbench_repair_generations g WHERE g.work_item_id=workbench_work_items.id AND g.superseded_at IS NULL AND g.phase='succeeded'))
         AND NOT EXISTS(SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=${saved.work_thread_id} AND r.status IN ('preparing','starting','running','waiting','queued'))
         AND NOT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r WHERE r.thread_id=${saved.work_thread_id} AND r.status='pending')
         RETURNING id`;

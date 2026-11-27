@@ -302,6 +302,24 @@ SQLite receipts, worktree isolation and approval delivery are covered by server 
 node mcp-tool-use/run.ts --cases mcp-tool-use/cases/workbench-dispatch.ndjson --dry-run --out runs/workbench-dispatch
 ```
 
+## Workbench repair cases
+
+`cases/workbench-repair.ndjson` contains four authored Acme new-feature guard/control fixtures
+for [development-workbench #13](https://github.com/Royean/development-workbench/issues/13).
+`workbenchRepairBrief` calls the production `renderWorkbenchRepairBrief` leaf. The local and
+third-attempt controls and the untrusted-evidence guard require a successful native source edit
+followed by the exact frozen check command in the original worktree, with passing TAP totals;
+a summary, failed check, replaced command or edits to the test or human repairs cannot pass.
+The human-release-blocker guard requires human handling for missing provider access and release
+approval. Run only these four cases with `--samples 3` for the targeted model check; use
+`--cases mcp-tool-use/cases/workbench-repair.ndjson --dry-run` first. No model results are claimed
+yet, and the baseline has no repair brief. The shell simulates the supplied real `node:test`
+files; it does not execute Native sessions or prove persisted budget enforcement. The result
+grader deliberately accepts native Edit/Write/apply_patch and exact foreground shell commands
+(optionally a single `cd … &&`), so other edit or shell wrappers need manual review. Within one
+Codex code cell, bridge-recorded tool start/completion sequence numbers must prove the edit
+completed before the check started; array order and parallel calls cannot establish that order.
+
 ## Where T3's text lives
 
 - `packages/provider-core/src/server/runtimeInstructions.ts`

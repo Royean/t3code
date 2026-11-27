@@ -29,7 +29,7 @@ it.effect("retains database failures when queue reads or authorization fail", ()
     const parent = ThreadId.make("thread:queue-failure");
     const projectId = ProjectId.make("project:queue-failure");
     yield* sql`INSERT INTO workbench_queues VALUES('queue','controller',${projectId})`;
-    yield* sql`INSERT INTO workbench_queue_bindings VALUES('task','2026-11-26T00:00:00.000Z','queue',${projectId},${parent})`;
+    yield* sql`INSERT INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id) VALUES('task','2026-11-26T00:00:00.000Z','queue',${projectId},${parent})`;
     yield* sql`DROP TABLE workbench_queue_entries`;
     const failure = yield* queue
       .get("queue", { controllerId: "controller", projectId })

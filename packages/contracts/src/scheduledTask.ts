@@ -576,10 +576,20 @@ export const WorkbenchQueueScope = Schema.Struct({
   projectId: ProjectId,
 });
 export type WorkbenchQueueScope = typeof WorkbenchQueueScope.Type;
+export const WorkbenchRepairPolicy = Schema.Struct({
+  checks: Schema.Array(
+    Schema.Struct({
+      scriptId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+      definitionHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+    }),
+  ).check(Schema.isMaxLength(10)),
+});
+export type WorkbenchRepairPolicy = typeof WorkbenchRepairPolicy.Type;
 export const WorkbenchQueueBindInput = Schema.Struct({
   ...WorkbenchQueueScope.fields,
   taskId: ScheduledTaskId,
   dispatcherThreadId: ThreadId,
+  repairPolicy: Schema.optional(WorkbenchRepairPolicy),
 });
 export type WorkbenchQueueBindInput = typeof WorkbenchQueueBindInput.Type;
 export const WorkbenchDeliveryIntentInput = Schema.Struct({
@@ -637,6 +647,7 @@ export const WorkbenchQueueSnapshot = Schema.Struct({
       taskId: ScheduledTaskId,
       taskCreatedAt: IsoDateTime,
       dispatcherThreadId: ThreadId,
+      repairPolicy: Schema.optional(Schema.NullOr(WorkbenchRepairPolicy)),
     }),
   ),
   items: Schema.Array(
@@ -720,17 +731,24 @@ export const WorkbenchAttentionRecordInput = Schema.Struct({
   expectedVersion: AttentionVersion,
   result: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(16000)),
   priority: WorkbenchQueuePriorityInput.fields.priority,
+  claimedActor: Schema.optional(
+    Schema.Struct({ kind: Schema.Literal("workbench_cookie"), id: AttentionRequestId }),
+  ),
+  expectedRepairGenerationId: Schema.optional(AttentionRequestId),
 });
 export type WorkbenchAttentionRecordInput = typeof WorkbenchAttentionRecordInput.Type;
 export const WorkbenchAttentionRequeueInput = Schema.Struct({
   ...WorkbenchAttentionScope.fields,
   clientRequestId: AttentionRequestId,
   expectedVersion: AttentionVersion,
+  claimedActor: WorkbenchAttentionRecordInput.fields.claimedActor,
+  expectedRepairGenerationId: Schema.optional(AttentionRequestId),
 });
 export type WorkbenchAttentionRequeueInput = typeof WorkbenchAttentionRequeueInput.Type;
 export const WorkbenchAttentionSummary = Schema.Struct({
   id: Schema.String,
   workItemId: Schema.String,
+  repairGenerationId: Schema.optional(Schema.NullOr(Schema.String)),
   taskId: ScheduledTaskId,
   taskCreatedAt: IsoDateTime,
   version: AttentionVersion,
@@ -743,7 +761,15 @@ export const WorkbenchAttentionSummary = Schema.Struct({
     "blocked",
   ]),
   reason: Schema.Struct({
-    code: Schema.Literals(["manual", "user_input", "approval", "external_action", "unknown"]),
+    code: Schema.Literals([
+      "manual",
+      "user_input",
+      "approval",
+      "external_action",
+      "unknown",
+      "repair_budget_exhausted",
+      "repair_blocked",
+    ]),
     summary: AttentionText,
     requiredAction: AttentionAction,
   }),
@@ -802,6 +828,86 @@ export const WorkbenchAttentionMutationResult = Schema.Struct({
   queue: WorkbenchQueueSnapshot,
 });
 export type WorkbenchAttentionMutationResult = typeof WorkbenchAttentionMutationResult.Type;
+
+export const WorkbenchRepairCheckSummary = Schema.Struct({
+  id: Schema.String,
+  checkId: Schema.String,
+  name: Schema.String,
+  exitCode: Schema.Int,
+  itemId: Schema.String,
+  runId: RunId,
+  attemptId: Schema.String,
+  sequence: Schema.Int,
+  completedAt: IsoDateTime,
+  digest: Schema.String,
+});
+export const WorkbenchRepairAttemptSummary = Schema.Struct({
+  id: Schema.String,
+  ordinal: Schema.Int,
+  state: Schema.Literals([
+    "reserved",
+    "accepted",
+    "running",
+    "succeeded",
+    "failed",
+    "blocked",
+    "unknown",
+  ]),
+  commandId: Schema.String,
+  messageId: Schema.String,
+  runId: Schema.NullOr(RunId),
+  nativeAttemptId: Schema.NullOr(Schema.String),
+  createdAt: IsoDateTime,
+  acceptedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  checks: Schema.Array(WorkbenchRepairCheckSummary),
+});
+export const WorkbenchRepairSummary = Schema.Struct({
+  id: Schema.String,
+  workItemId: Schema.String,
+  taskId: ScheduledTaskId,
+  taskCreatedAt: IsoDateTime,
+  dispatcherThreadId: ThreadId,
+  workThreadId: Schema.NullOr(ThreadId),
+  generation: Schema.Int,
+  version: Schema.Int,
+  limit: Schema.Literal(3),
+  used: Schema.Int,
+  phase: Schema.Literals(["watching", "repairing", "succeeded", "awaiting_user", "superseded"]),
+  reason: Schema.NullOr(
+    Schema.Literals([
+      "check_failed",
+      "budget_exhausted",
+      "policy_missing",
+      "policy_changed",
+      "evidence_unavailable",
+      "provider_failed",
+      "user_input",
+      "approval",
+      "external_action",
+      "context_unavailable",
+      "state_unknown",
+    ]),
+  ),
+  sourceRunId: Schema.NullOr(RunId),
+  attentionId: Schema.NullOr(Schema.String),
+  policy: Schema.NullOr(WorkbenchRepairPolicy),
+  checks: Schema.Array(WorkbenchRepairCheckSummary),
+  attempts: Schema.Array(WorkbenchRepairAttemptSummary),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkbenchRepairSummary = typeof WorkbenchRepairSummary.Type;
+export const WorkbenchRepairsSnapshot = Schema.Struct({
+  environmentId: Schema.String,
+  trackingId: Schema.String,
+  queueId: Schema.String,
+  controllerId: Schema.String,
+  projectId: ProjectId,
+  repairs: Schema.Array(WorkbenchRepairSummary),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+export type WorkbenchRepairsSnapshot = typeof WorkbenchRepairsSnapshot.Type;
 
 const ResponseId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
 const ResponseText = Schema.String.check(Schema.isMaxLength(16000));

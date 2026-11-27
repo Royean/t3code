@@ -197,7 +197,14 @@ const make = Effect.gen(function* () {
     if (!run || !provider) return;
     const [batch] = yield* sql<{
       id: string;
-    }>`SELECT id FROM workbench_work_batches WHERE work_item_id=${w.id} AND (run_id=${run.id} OR accepted_run_id=${run.id}) UNION SELECT json_extract(source_json,'$.batch_id') AS id FROM workbench_runtime_responses WHERE work_item_id=${w.id} AND run_id=${run.id} LIMIT 1`;
+    }>`SELECT id FROM workbench_work_batches WHERE work_item_id=${w.id} AND (run_id=${run.id} OR accepted_run_id=${run.id})
+      UNION SELECT json_extract(source_json,'$.batch_id') AS id FROM workbench_runtime_responses WHERE work_item_id=${w.id} AND run_id=${run.id}
+      UNION SELECT (SELECT b.id FROM workbench_work_batches b WHERE b.work_item_id=a.work_item_id AND (b.run_id=a.source_run_id OR b.accepted_run_id=a.source_run_id) LIMIT 1) AS id
+      FROM workbench_repair_attempts a JOIN workbench_repair_generations g ON g.id=a.generation_id JOIN workbench_queue_entries e ON e.work_item_id=a.work_item_id AND e.queue_id=a.queue_id
+      WHERE a.work_item_id=${w.id} AND a.run_id=${run.id} AND a.charged=1 AND a.state IN ('accepted','running') AND a.ordinal<=g.used AND g.superseded_at IS NULL
+      AND g.work_item_id=a.work_item_id AND g.queue_id=a.queue_id AND (g.phase='repairing' OR (g.phase='awaiting_user' AND g.reason IN ('user_input','approval')))
+      AND g.task_id=${w.task_id} AND g.task_created_at=${w.task_created_at} AND g.project_id=${w.project_id} AND g.dispatcher_thread_id=${w.dispatcher_thread_id}
+      AND e.state='occupied' AND e.claim_id=a.claim_id AND e.wake_generation=a.wake_generation AND a.attention_epoch=${w.attention_epoch} LIMIT 1`;
     if (!batch && ![w.run_id, w.accepted_run_id].includes(run.id)) return;
     const [raw] = yield* sql<{
       payload_json: string;

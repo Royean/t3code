@@ -180,6 +180,7 @@ export const layerExecutor: Layer.Layer<
             threadId: effect.threadId,
             commandId: effect.commandId,
             expectedEpoch: effect.attentionEpoch ?? null,
+            effectType: request.type,
             ...("runId" in request ? { runId: request.runId } : {}),
             ...("messageId" in request ? { messageId: request.messageId } : {}),
           },

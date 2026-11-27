@@ -15764,6 +15764,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: commandThreadId(command),
         commandType: command.type,
         ...(command.type === "runtime-request.respond" ? { responseCommand: command } : {}),
+        executionCommand: command,
         acceptedAt,
         events:
           cancelledTask === undefined

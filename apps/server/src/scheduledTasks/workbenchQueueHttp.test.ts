@@ -7,6 +7,7 @@ import {
   EnvironmentAuthenticatedPrincipal,
   EnvironmentHttpApi,
   EnvironmentId,
+  ProjectId,
   WorkbenchQueueError,
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
@@ -20,6 +21,8 @@ import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as Responses from "./WorkbenchResponses.ts";
 import * as ResponsesHttp from "./workbenchResponsesHttp.ts";
+import * as Repairs from "./WorkbenchRepairs.ts";
+import * as RepairsHttp from "./workbenchRepairsHttp.ts";
 import { digest } from "./workbenchLifecycle.ts";
 import * as Attention from "./WorkbenchAttention.ts";
 import * as AttentionHttp from "./workbenchAttentionHttp.ts";
@@ -31,11 +34,13 @@ import { failEnvironmentAuthInvalid } from "../auth/http.ts";
 class TestApi extends HttpApi.make("environment")
   .add(EnvironmentHttpApi.groups.workbenchQueue)
   .add(EnvironmentHttpApi.groups.workbenchAttention)
+  .add(EnvironmentHttpApi.groups.workbenchRepairs)
   .add(EnvironmentHttpApi.groups.workbenchResponses) {}
 
 it.effect("requires both scopes before queue reads or control mutations", () =>
   Effect.gen(function* () {
     let calls = 0;
+    const attentionAuditIds: string[] = [];
     let failure: WorkbenchQueueError | undefined;
     const snapshot = {
       trackingId: "epoch",
@@ -127,6 +132,18 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         return attentionResult(kind) as never;
       });
     let nativeAuditId: string | undefined;
+    const repairSnapshot = {
+      trackingId: "epoch",
+      queueId: "queue",
+      controllerId: "controller",
+      projectId: ProjectId.make("project"),
+      repairs: [],
+      nextCursor: null,
+    };
+    const repairRead = () => {
+      calls++;
+      return failure === undefined ? Effect.succeed(repairSnapshot) : Effect.fail(failure);
+    };
     const responseSnapshot = {
       trackingId: "epoch",
       queueId: "queue",
@@ -168,6 +185,8 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         Layer.provide(ExecutionsHttp.layer),
         Layer.provide(AttentionHttp.layer),
         Layer.provide(ResponsesHttp.layer),
+        Layer.provide(RepairsHttp.layer),
+        Layer.provide(Layer.mock(Repairs.WorkbenchRepairs)({ list: repairRead })),
         Layer.provide(
           Layer.mock(Responses.WorkbenchResponses)({
             list: () => responseRead(true),
@@ -182,8 +201,14 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
           Layer.mock(Attention.WorkbenchAttention)({
             get: attentionRead,
             pause: attentionWrite("pause"),
-            record: attentionWrite("record"),
-            requeue: attentionWrite("requeue"),
+            record: (_q, _id, _input, principal) => {
+              attentionAuditIds.push(principal!);
+              return attentionWrite("record")();
+            },
+            requeue: (_q, _id, _input, principal) => {
+              attentionAuditIds.push(principal!);
+              return attentionWrite("requeue")();
+            },
           }),
         ),
         Layer.provide(
@@ -257,6 +282,9 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
     );
     requests.push(
       new Request(
+        "http://env.local/api/workbench/queues/queue/repairs?controllerId=controller&projectId=project&expectedTrackingId=epoch",
+      ),
+      new Request(
         "http://env.local/api/workbench/queues/queue/attention?controllerId=controller&projectId=project&expectedTrackingId=epoch",
       ),
     );
@@ -329,21 +357,24 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       const response = yield* Effect.promise(() => web.handler(allowed));
       expect(response.status).toBe(200);
       expect(yield* Effect.promise(() => response.json())).toEqual({
-        ...(request.url.includes("/requests")
-          ? responseSnapshot
-          : request.url.includes("/responses")
-            ? responseReceipt
-            : request.url.includes("/attention")
-              ? request.method === "GET"
-                ? attentionSnapshot
-                : attentionResult(request.url.split("/").at(-1) as "pause" | "record" | "requeue")
-              : request.url.endsWith("/delivery-intents")
-                ? receipt
-                : snapshot),
+        ...(request.url.includes("/repairs")
+          ? repairSnapshot
+          : request.url.includes("/requests")
+            ? responseSnapshot
+            : request.url.includes("/responses")
+              ? responseReceipt
+              : request.url.includes("/attention")
+                ? request.method === "GET"
+                  ? attentionSnapshot
+                  : attentionResult(request.url.split("/").at(-1) as "pause" | "record" | "requeue")
+                : request.url.endsWith("/delivery-intents")
+                  ? receipt
+                  : snapshot),
         environmentId: "env-test",
       });
     }
-    expect(calls).toBe(12);
+    expect(calls).toBe(13);
+    expect(attentionAuditIds).toEqual([digest("test"), digest("test")]);
     expect(nativeAuditId).toBe(digest("test"));
     expect(nativeAuditId).not.toBe("claimed");
     failure = Object.defineProperty(new WorkbenchQueueError({ reason: "unavailable" }), "cause", {

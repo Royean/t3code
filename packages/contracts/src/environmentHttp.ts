@@ -80,6 +80,7 @@ import {
   WorkbenchAttentionRecordInput,
   WorkbenchAttentionRequeueInput,
   WorkbenchAttentionSnapshot,
+  WorkbenchRepairsSnapshot,
   WorkbenchAttentionMutationResult,
   WorkbenchDeliveryIntentInput,
   WorkbenchDeliveryIntentReceipt,
@@ -1322,6 +1323,19 @@ class EnvironmentWorkbenchResponsesHttpApi extends HttpApiGroup.make("workbenchR
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchRepairsHttpApi extends HttpApiGroup.make("workbenchRepairs").add(
+  HttpApiEndpoint.get("list", "/api/workbench/queues/:queueId/repairs", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchAttentionQuery,
+    success: WorkbenchRepairsSnapshot,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 class EnvironmentWorkbenchAttentionHttpApi extends HttpApiGroup.make("workbenchAttention").add(
   HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/attention", {
     params: { queueId: TrimmedNonEmptyString },
@@ -1379,6 +1393,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentWebhooksHttpApi)
   .add(EnvironmentWorkbenchQueueHttpApi)
   .add(EnvironmentWorkbenchAttentionHttpApi)
+  .add(EnvironmentWorkbenchRepairsHttpApi)
   .add(EnvironmentWorkbenchResponsesHttpApi)
   .add(EnvironmentWorkbenchWorkItemsHttpApi)
   .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

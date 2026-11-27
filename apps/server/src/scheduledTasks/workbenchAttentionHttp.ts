@@ -2,12 +2,14 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  EnvironmentAuthenticatedPrincipal,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import { requireEnvironmentScope } from "../auth/http.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as Attention from "./WorkbenchAttention.ts";
+import { digest } from "./workbenchLifecycle.ts";
 export const layer = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "workbenchAttention",
@@ -43,7 +45,12 @@ export const layer = HttpApiBuilder.group(
         Effect.fnUntraced(function* ({ params, payload }) {
           yield* authorize;
           return {
-            ...(yield* attention.record(params.queueId, params.attentionId, payload)),
+            ...(yield* attention.record(
+              params.queueId,
+              params.attentionId,
+              payload,
+              digest((yield* EnvironmentAuthenticatedPrincipal).sessionId),
+            )),
             environmentId: yield* identity.getEnvironmentId,
           };
         }),
@@ -53,7 +60,12 @@ export const layer = HttpApiBuilder.group(
         Effect.fnUntraced(function* ({ params, payload }) {
           yield* authorize;
           return {
-            ...(yield* attention.requeue(params.queueId, params.attentionId, payload)),
+            ...(yield* attention.requeue(
+              params.queueId,
+              params.attentionId,
+              payload,
+              digest((yield* EnvironmentAuthenticatedPrincipal).sessionId),
+            )),
             environmentId: yield* identity.getEnvironmentId,
           };
         }),

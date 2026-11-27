@@ -4968,7 +4968,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   type: "commandExecution",
                   id: "command-after-provider-retry",
                   command: "pwd",
-                  cwd: "/workspace",
+                  cwd: "/workspace/subproject",
                   processId: "42",
                   source: "unifiedExecStartup",
                   status: "inProgress",
@@ -4993,12 +4993,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   type: "commandExecution",
                   id: "command-after-provider-retry",
                   command: "pwd",
-                  cwd: "/workspace",
+                  cwd: "/workspace/subproject",
                   processId: "42",
                   source: "unifiedExecStartup",
                   status: "completed",
                   commandActions: [{ type: "unknown", command: "pwd" }],
-                  aggregatedOutput: "/workspace\n",
+                  aggregatedOutput: "/workspace/subproject\n",
                   exitCode: 0,
                   durationMs: 10,
                 },
@@ -5054,6 +5054,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.equal(retryItems[2]?.id, retryItems[0]?.id);
       assert.equal(retryItems[2]?.status, "completed");
       assert.equal(retryItems[2]?.title, "Provider recovered");
+      const commandItems = harness.events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "command_execution"
+          ? [event.turnItem]
+          : [],
+      );
+      assert.lengthOf(commandItems, 2);
+      for (const item of commandItems) {
+        assert.include(item, { input: "pwd", cwd: "/workspace/subproject" });
+      }
+      assert.include(commandItems.at(-1), { exitCode: 0, output: "/workspace/subproject\n" });
 
       const recoveredIndex = harness.events.findIndex(
         (event) =>

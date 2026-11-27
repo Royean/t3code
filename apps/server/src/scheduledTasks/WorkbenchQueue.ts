@@ -25,6 +25,10 @@ import { delegatedTaskWorkProgress } from "../orchestration-v2/delegatedTaskWork
 import * as WorkItems from "./WorkbenchWorkItems.ts";
 
 import * as Lifecycle from "./workbenchLifecycle.ts";
+import { decodeRepairPolicy, freezeRepairPolicy } from "./workbenchRepairPolicy.ts";
+import * as Schema from "effect/Schema";
+import { ProjectId } from "@t3tools/contracts";
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 type QueueRow = { id: string; controller_id: string; project_id: string };
 type BindingRow = {
@@ -33,6 +37,7 @@ type BindingRow = {
   queue_id: string;
   project_id: string;
   dispatcher_thread_id: ThreadId;
+  repair_policy_json: string | null;
 };
 type EntryRow = WorkItems.WorkItemRow & {
   enqueue_sequence: number;
@@ -159,11 +164,20 @@ const make = Effect.gen(function* () {
         projectId: scope.projectId,
         concurrency: 2 as const,
         occupied: rows.filter((row) => row.queue_state === "occupied").length,
-        bindings: bindings.map((row) => ({
-          taskId: row.task_id,
-          taskCreatedAt: row.task_created_at,
-          dispatcherThreadId: row.dispatcher_thread_id,
-        })),
+        bindings: yield* Effect.forEach(
+          bindings,
+          Effect.fn("WorkbenchQueue.bindingSummary")(function* (row) {
+            return {
+              taskId: row.task_id,
+              taskCreatedAt: row.task_created_at,
+              dispatcherThreadId: row.dispatcher_thread_id,
+              repairPolicy:
+                row.repair_policy_json === null
+                  ? null
+                  : yield* decodeRepairPolicy(row.repair_policy_json),
+            };
+          }),
+        ),
         items: rows.map((row) => ({
           id: row.id,
           taskId: row.task_id as ScheduledTaskId,
@@ -187,6 +201,7 @@ const make = Effect.gen(function* () {
     },
     Effect.catchTags({
       SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
+      SchemaError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
     }),
   );
   const synchronize = Effect.fn("WorkbenchQueue.synchronize")(function* (queueId: string) {
@@ -232,12 +247,22 @@ const make = Effect.gen(function* () {
             return yield* new WorkbenchQueueError({ reason: "conflict" });
           yield* sql`INSERT OR IGNORE INTO workbench_queues(id,controller_id,project_id) VALUES(${queueId},${input.controllerId},${input.projectId})`;
           yield* sql`INSERT OR IGNORE INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id) VALUES(${task.id},${task.createdAt},${queueId},${task.projectId},${task.threadId})`;
+          if (input.repairPolicy !== undefined) {
+            yield* freezeRepairPolicy(ProjectId.make(task.projectId), input.repairPolicy).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+            const encoded =
+              input.repairPolicy.checks.length === 0 ? null : yield* encodeJson(input.repairPolicy);
+            yield* sql`UPDATE workbench_queue_bindings SET repair_policy_json=${encoded} WHERE task_id=${task.id} AND queue_id=${queueId}`;
+          }
           yield* synchronize(queueId);
         }),
       )
       .pipe(
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
+          SchemaError: (cause) =>
+            Effect.fail(WorkbenchQueueFailure.fromCause("unavailable", cause)),
         }),
       );
     return yield* snapshot(queueId, input);
@@ -266,6 +291,9 @@ const make = Effect.gen(function* () {
         yield* sql`SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${row.id} AND (a.state IN ('recorded','queued','submitted','unknown') OR EXISTS(SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.run_id=a.run_id AND r.thread_id=json_extract(a.source_json,'$.thread_id') AND r.status IN ('preparing','starting','running','waiting','queued'))) LIMIT 1`;
       if (responding.length) return;
       const item = yield* items.observe(row);
+      const verified =
+        yield* sql`SELECT 1 FROM workbench_repair_generations WHERE work_item_id=${row.id} AND superseded_at IS NULL AND phase='succeeded' LIMIT 1`;
+      const repairReady = item.workThreadId === null || verified.length > 0;
       if (row.matter_id !== null) {
         const observedRun =
           item.runId === null || item.workThreadId === null
@@ -328,6 +356,7 @@ const make = Effect.gen(function* () {
               ) ||
               preparation;
             const settled =
+              repairReady &&
               !uncertain &&
               !needs &&
               !executing &&
@@ -344,7 +373,9 @@ const make = Effect.gen(function* () {
                   ? "working"
                   : settled
                     ? "result_available"
-                    : "unknown";
+                    : !repairReady
+                      ? "working"
+                      : "unknown";
             yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${state},needs_dispatch=${needs ? 1 : 0},
               blocked_reason=${item.state === "blocked" ? "approval" : uncertain ? "state_unknown" : needs ? "awaiting_dispatcher" : null},updated_at=${DateTime.formatIso(yield* DateTime.now)}
               WHERE work_item_id=${row.id}`;
@@ -414,9 +445,11 @@ const make = Effect.gen(function* () {
         ));
       const workState =
         task.result !== null ? "result_available" : held ? "working" : taskWorkState;
-      const settled = workState === "result_available";
+      const settled = repairReady && workState === "result_available";
+      const visibleWorkState =
+        !repairReady && workState === "result_available" ? "working" : workState;
       const preparation = childRun.status === "preparing";
-      yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${workState},needs_dispatch=${settled ? 0 : preparation ? 1 : 0},
+      yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${visibleWorkState},needs_dispatch=${settled ? 0 : preparation ? 1 : 0},
       blocked_reason=${item.state === "blocked" ? "approval" : preparation ? "awaiting_dispatcher" : null},updated_at=${DateTime.formatIso(yield* DateTime.now)}
       WHERE work_item_id=${row.id} AND state='occupied' AND claim_id=${row.claim_id} AND wake_generation=${row.wake_generation}
       AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${row.id} AND a.state IN ('recorded','queued','submitted','unknown'))`;

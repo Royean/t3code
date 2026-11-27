@@ -23,6 +23,7 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2DomainEvent,
+  OrchestrationV2Command,
   type OrchestrationV2Run,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2RuntimeRequest,
@@ -50,6 +51,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -120,6 +122,9 @@ const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.4",
 } satisfies ModelSelection;
+const encodeOrchestrationCommand = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2Command),
+);
 const alternateInstanceId = ProviderInstanceId.make("codex_alternate");
 
 const layerVcsDriverRegistryTest = VcsDriverRegistry.layer.pipe(
@@ -383,6 +388,128 @@ const layerLegacyImportTest = Layer.mergeAll(
 );
 
 it.layer(layerLegacyImportTest)("Attention admission", (it) => {
+  it.effect("charges a recorded repair through real dispatch and rejects a fourth raw send", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("repair-dispatch-child");
+      const projectId = ProjectId.make("repair-dispatch-project");
+      const now = yield* DateTime.now;
+      const stamp = DateTime.formatIso(now);
+      const worktreePath = process.cwd();
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("repair-create"),
+        threadId,
+        projectId,
+        title: "Repair dispatch",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: "feature",
+        worktreePath,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("repair-original"),
+        threadId,
+        messageId: MessageId.make("repair-original-message"),
+        text: "Original work",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const source = yield* orchestrator.getThreadProjection(threadId);
+      const original = source.runs[0]!;
+      const provider = source.providerThreads[0]!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("repair-original-completed"),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...original, status: "completed", completedAt: now },
+          },
+          {
+            id: EventId.make("repair-native-context"),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...provider,
+              providerSessionId: ProviderSessionId.make("repair-original-session"),
+              nativeThreadRef: { driver, nativeId: "repair-original-native", strength: "strong" },
+            },
+          },
+        ],
+      });
+      yield* sql`INSERT INTO workbench_queues VALUES('repair-runtime-queue','controller',${projectId})`;
+      yield* sql`INSERT INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id)
+        VALUES('task','2026-11-27','repair-runtime-queue',${projectId},'dispatcher')`;
+      yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,work_thread_id,run_id,branch,worktree_path,created_at,updated_at)
+        VALUES('repair-runtime-item','task','2026-11-27',${projectId},'event','dispatcher','{}',${threadId},${original.id},'feature',${worktreePath},${stamp},${stamp})`;
+      yield* sql`INSERT INTO workbench_queue_entries(work_item_id,queue_id,state,claim_id,created_at,updated_at)
+        VALUES('repair-runtime-item','repair-runtime-queue','occupied','repair-claim',${stamp},${stamp})`;
+      yield* sql`INSERT INTO workbench_repair_generations(id,work_item_id,queue_id,task_id,task_created_at,dispatcher_thread_id,project_id,thread_id,generation,used,phase,source_run_id,created_at,updated_at)
+        VALUES('repair-runtime-generation','repair-runtime-item','repair-runtime-queue','task','2026-11-27','dispatcher',${projectId},${threadId},1,2,'repairing',${original.id},${stamp},${stamp})`;
+      const repair = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("repair-runtime-third"),
+        threadId,
+        messageId: MessageId.make("repair-runtime-third-message"),
+        text: "Repair the failed check",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" as const },
+        createdBy: "agent" as const,
+        creationSource: "server" as const,
+      };
+      const request = yield* encodeOrchestrationCommand(repair);
+      yield* sql`INSERT INTO workbench_repair_attempts(id,generation_id,work_item_id,queue_id,ordinal,state,source_run_id,failure_evidence_json,thread_id,project_id,claim_id,wake_generation,attention_epoch,command_id,message_id,provider_instance_id,provider_thread_id,provider_session_id,native_driver,native_thread_id,worktree_path,worktree_real_path,branch,git_common_dir,model_selection_json,runtime_mode,interaction_mode,request_json,created_at,updated_at)
+        VALUES('repair-runtime-third','repair-runtime-generation','repair-runtime-item','repair-runtime-queue',3,'reserved',${original.id},'[]',${threadId},${projectId},'repair-claim',0,0,${repair.commandId},${repair.messageId},${modelSelection.instanceId},${provider.id},'repair-original-session','codex','repair-original-native',${worktreePath},${worktreePath},'feature','/fixture/.git',${JSON.stringify(modelSelection)},'full-access','default',${request},${stamp},${stamp})`;
+      const accepted = yield* orchestrator.dispatch(repair);
+      assert.isFalse(accepted.replayed ?? false);
+      assert.isTrue((yield* orchestrator.dispatch(repair)).replayed);
+      const repaired = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(repaired.runs.length, 2);
+      assert.equal(repaired.runs.at(-1)?.providerThreadId, provider.id);
+      assert.equal(repaired.thread.worktreePath, worktreePath);
+      assert.deepEqual(yield* sql`SELECT used FROM workbench_repair_generations`, [{ used: 3 }]);
+      assert.deepEqual(yield* sql`SELECT charged,run_id FROM workbench_repair_attempts`, [
+        { charged: 1, run_id: repaired.runs.at(-1)?.id },
+      ]);
+      const [start] = yield* sql<{
+        command_id: string;
+        effect_type: string;
+        attention_epoch: number | null;
+      }>`SELECT command_id,effect_type,attention_epoch FROM orchestration_v2_effect_outbox
+        WHERE thread_id=${threadId} AND json_extract(payload_json,'$.runId')=${repaired.runs.at(-1)!.id}`;
+      assert.isDefined(start);
+      assert.equal(start!.effect_type, "provider-turn.start");
+      const guard = yield* WorkbenchAttentionGuard.WorkbenchAttentionGuard;
+      yield* guard.assertAdmission({
+        threadId,
+        commandId: CommandId.make(start!.command_id),
+        runId: repaired.runs.at(-1)!.id,
+        expectedEpoch: start!.attention_epoch,
+        effectType: start!.effect_type,
+      });
+      const refused = yield* orchestrator
+        .dispatch({
+          ...repair,
+          commandId: CommandId.make("repair-runtime-fourth"),
+          messageId: MessageId.make("fourth-message"),
+        })
+        .pipe(Effect.flip);
+      assert.equal(refused._tag, "OrchestratorDispatchError");
+      assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs.length, 2);
+    }),
+  );
+
   it.effect(
     "refuses an automatic Stop when a live request arrives after planning and before commit",
     () =>

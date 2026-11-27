@@ -163,6 +163,9 @@ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as CodexManagedTokenBroker from "./provider/CodexManagedTokenBroker.ts";
 import * as WorkbenchResponses from "./scheduledTasks/WorkbenchResponses.ts";
 import * as WorkbenchResponsesHttp from "./scheduledTasks/workbenchResponsesHttp.ts";
+import * as WorkbenchRepairs from "./scheduledTasks/WorkbenchRepairs.ts";
+import * as WorkbenchRepairsHttp from "./scheduledTasks/workbenchRepairsHttp.ts";
+import * as WorkbenchRepairReactor from "./scheduledTasks/WorkbenchRepairReactor.ts";
 import * as WorkbenchAttention from "./scheduledTasks/WorkbenchAttention.ts";
 import * as WorkbenchAttentionHttp from "./scheduledTasks/workbenchAttentionHttp.ts";
 import * as WorkbenchQueue from "./scheduledTasks/WorkbenchQueue.ts";
@@ -666,6 +669,19 @@ const layerThreadPullRequestWorker = Layer.effectDiscard(
   ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(Layer.provide(layerPullRequestService));
 
+const layerWorkbenchRepairWorker = Layer.effectDiscard(
+  WorkbenchRepairReactor.WorkbenchRepairReactor.pipe(Effect.flatMap((service) => service.start())),
+).pipe(
+  Layer.provide(WorkbenchRepairReactor.layer),
+  Layer.provide(WorkbenchRepairs.layer),
+  Layer.provide(
+    WorkbenchAttention.layer.pipe(
+      Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkItems.layer))),
+      Layer.provide(WorkItems.layer),
+    ),
+  ),
+);
+
 const layerProviderInstallationRefresh = Layer.effectDiscard(
   Effect.gen(function* () {
     const antigravity = yield* AntigravityInstallation.AntigravityInstallation;
@@ -723,6 +739,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
     Layer.provide(layerServerRestart),
   ),
   layerThreadPullRequestWorker,
+  layerWorkbenchRepairWorker,
   KeepAwake.layer,
   DelegatedTaskAnalytics.layer,
   Layer.effectDiscard(
@@ -877,6 +894,7 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(EventOrchestrationHttp.layer),
       Layer.provide(ScheduledTaskExecutionsHttp.layer),
       Layer.provide(WorkItemsHttp.layer.pipe(Layer.provide(WorkItems.layer))),
+      Layer.provide(WorkbenchRepairsHttp.layer.pipe(Layer.provide(WorkbenchRepairs.layer))),
       Layer.provide(
         WorkbenchQueueHttp.layer.pipe(
           Layer.provide(WorkbenchQueue.layer.pipe(Layer.provide(WorkItems.layer))),

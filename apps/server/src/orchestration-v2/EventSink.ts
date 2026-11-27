@@ -40,6 +40,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
 import * as WorkbenchResponseGuard from "./WorkbenchResponseGuard.ts";
+import * as WorkbenchRepairGuard from "./WorkbenchRepairGuard.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -198,6 +199,7 @@ export interface EventSinkV2Shape {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
     readonly commandType: string;
+    readonly executionCommand?: import("@t3tools/contracts").OrchestrationV2ServerCommand;
     readonly responseCommand?: Extract<
       import("@t3tools/contracts").OrchestrationV2ServerCommand,
       { type: "runtime-request.respond" }
@@ -821,6 +823,10 @@ const layerBase: Layer.Layer<
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
 
+          const repairProof = yield* WorkbenchRepairGuard.assertRepairCommandCommit(input).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+
           // Planning does not lock the source. Once deletion commits, maintenance
           // can remove its checkpoints, so a new fork must not revive that history.
           if (input.commandType === "thread.fork") {
@@ -875,6 +881,14 @@ const layerBase: Layer.Layer<
             );
           }
           const outcomes = yield* applyStoredEvents(storedEvents);
+          if (repairProof?.admissionKind === "repair")
+            yield* WorkbenchRepairGuard.recordRepairCommit({
+              proof: repairProof,
+              events: storedEvents,
+              threadId: input.threadId,
+              acceptedAt: input.acceptedAt,
+              sequence,
+            }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
           yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
             commandId: input.commandId,

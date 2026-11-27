@@ -7,6 +7,7 @@
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
@@ -40,6 +41,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import { renderAttentionResumeBrief } from "../../apps/server/src/scheduledTasks/workbenchAttentionBrief.ts";
 import { renderWorkbenchBatchBrief } from "../../apps/server/src/scheduledTasks/workbenchBrief.ts";
+import { renderWorkbenchRepairBrief } from "../../apps/server/src/scheduledTasks/workbenchRepairBrief.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
 import { advertisedJsonSchema } from "../../apps/server/src/mcp/advertisedJsonSchema.ts";
@@ -148,6 +150,7 @@ type Block = { readonly type: string; readonly [key: string]: unknown };
 type ApiMessage = { readonly role: "user" | "assistant"; readonly content: ReadonlyArray<Block> };
 type ApiTool = { readonly name: string; readonly [key: string]: unknown };
 type Usage = Record<keyof (typeof PRICES)[PricedModel], number>;
+type ToolExecutionOrder = { readonly started: number; completed?: number };
 type Call = {
   readonly step: number;
   readonly tool: string;
@@ -157,6 +160,7 @@ type Call = {
   /** Once answered: whether the agent saw an error, and the result text it saw. */
   failed?: boolean;
   output?: string;
+  readonly execution?: { readonly cellId: string; readonly order: ToolExecutionOrder };
 };
 export type SampleRun = {
   readonly calls: ReadonlyArray<Call>;
@@ -241,6 +245,15 @@ const McpToolUseExpect = Schema.Struct({
   secret: Schema.optional(SecretExpect),
   /** File pills in the final answer resolve against the thread cwd to `world.files` entries. */
   fileLinks: Schema.optional(FileLinksExpect),
+  /** Successful native source correction, then exact foreground checks in the original cwd. */
+  workbenchRepair: Schema.optional(
+    Schema.Struct({
+      cwd: Schema.String,
+      file: Schema.String,
+      content: Schema.String,
+      checks: Schema.Array(Schema.Struct({ command: Schema.String, output: Schema.String })),
+    }),
+  ),
 });
 
 /**
@@ -348,6 +361,22 @@ export const McpToolUseCase = Schema.Struct({
   prompt: Schema.String,
   /** Uses the current service-generated child brief, not a copied prompt in case data. */
   workbenchAttentionReport: Schema.optional(Schema.String),
+  workbenchRepairBrief: Schema.optional(
+    Schema.Struct({
+      ordinal: Schema.Number,
+      checks: Schema.Array(
+        Schema.Struct({ scriptId: Schema.String, name: Schema.String, command: Schema.String }),
+      ),
+      evidence: Schema.Array(
+        Schema.Struct({
+          id: Schema.String,
+          checkId: Schema.String,
+          exitCode: Schema.Number,
+          output: Schema.optionalKey(Schema.String),
+        }),
+      ),
+    }),
+  ),
   workbenchBrief: Schema.optional(
     Schema.Struct({
       eventJson: Schema.String,
@@ -1044,17 +1073,19 @@ const loadTools = (tools: Array<ApiTool>, id: string, found: ReadonlyArray<ApiTo
 };
 
 const casePrompt = (testCase: McpToolUseCase) =>
-  testCase.workbenchAttentionReport !== undefined
-    ? renderAttentionResumeBrief(testCase.workbenchAttentionReport)
-    : testCase.workbenchBrief === undefined
-      ? testCase.prompt
-      : renderWorkbenchBatchBrief({
-          eventJson: testCase.workbenchBrief.eventJson,
-          followup: testCase.workbenchBrief.followup,
-          ...(testCase.workbenchBrief.previous === undefined
-            ? {}
-            : { previous: testCase.workbenchBrief.previous }),
-        });
+  testCase.workbenchRepairBrief !== undefined
+    ? renderWorkbenchRepairBrief(testCase.workbenchRepairBrief)
+    : testCase.workbenchAttentionReport !== undefined
+      ? renderAttentionResumeBrief(testCase.workbenchAttentionReport)
+      : testCase.workbenchBrief === undefined
+        ? testCase.prompt
+        : renderWorkbenchBatchBrief({
+            eventJson: testCase.workbenchBrief.eventJson,
+            followup: testCase.workbenchBrief.followup,
+            ...(testCase.workbenchBrief.previous === undefined
+              ? {}
+              : { previous: testCase.workbenchBrief.previous }),
+          });
 
 /** Messages for a case: reminders, context, prior turns with real tool blocks, then the prompt. */
 export const buildMessages = (sample: Sample) => {
@@ -1886,6 +1917,101 @@ const withPage = (tool: string, input: unknown, files: ReadonlyMap<string, strin
   return { ...input, page };
 };
 
+const gradeWorkbenchRepair = (
+  expect: McpToolUseCase["expect"]["workbenchRepair"],
+  run: SampleRun,
+) => {
+  if (expect === undefined) return [];
+  const edits = run.calls.flatMap((call) => {
+    if (!["Edit", "Write"].includes(call.tool) || !isRecord(call.input)) return [];
+    const { file_path, content, new_string, patch } = call.input;
+    const changes =
+      typeof patch === "string"
+        ? [
+            ...patch.matchAll(
+              /^\*\*\* (Add|Update|Delete) File: (.+)\n([\s\S]*?)(?=^\*\*\* (?:Add|Update|Delete) File: |^\*\*\* End Patch|(?![\s\S]))/gm,
+            ),
+          ].map(([, operation, path = "", body = ""]) => ({
+            path,
+            content: body
+              .split("\n")
+              .flatMap((line) => (line.startsWith("+") ? [line.slice(1)] : []))
+              .join("\n"),
+            deleted: operation === "Delete",
+          }))
+        : typeof file_path === "string"
+          ? [
+              {
+                path: file_path,
+                content: call.tool === "Write" ? content : new_string,
+                deleted: false,
+              },
+            ]
+          : [];
+    return [{ call, changes }];
+  });
+  const allowed = (path: string) =>
+    (path.startsWith("/") || run.cwd !== undefined) &&
+    NodePath.posix.resolve(run.cwd ?? "/", path) === expect.file;
+  const authorized = edits.every(
+    ({ changes }) =>
+      changes.length > 0 && changes.every((change) => allowed(change.path) && !change.deleted),
+  );
+  const corrections = edits.filter(
+    ({ call, changes }) =>
+      call.failed === false &&
+      typeof call.output === "string" &&
+      call.output.length > 0 &&
+      !/^(?:Exit code [1-9]|<tool_use_error>)/.test(call.output ?? "") &&
+      changes.some(
+        (change) =>
+          allowed(change.path) &&
+          typeof change.content === "string" &&
+          new RegExp(expect.content).test(change.content),
+      ),
+  );
+  return [
+    { check: "workbenchRepair authorized source edits", pass: authorized },
+    { check: "workbenchRepair successful correction", pass: corrections.length > 0 },
+    ...expect.checks.map(({ command, output }) => ({
+      check: `workbenchRepair executed ${command}`,
+      pass:
+        run.stopReason === "end_turn" &&
+        run.calls.some((call) => {
+          if (call.tool !== "Bash" || call.failed !== false || !isRecord(call.input)) return false;
+          const input = call.input;
+          const actual = typeof input.command === "string" ? input.command.trim() : "";
+          const cwd = input.workdir ?? input.cwd ?? run.cwd;
+          const configured = actual === command && cwd === expect.cwd;
+          const withCd = [expect.cwd, `'${expect.cwd}'`, `"${expect.cwd}"`].some(
+            (path) => actual === `cd ${path} && ${command}`,
+          );
+          return (
+            (configured || withCd) &&
+            input.run_in_background !== true &&
+            corrections.length > 0 &&
+            edits.every(({ call: edit }) => {
+              if (edit.step < call.step) return true;
+              const before = edit.execution;
+              const after = call.execution;
+              return (
+                edit.step === call.step &&
+                before !== undefined &&
+                after !== undefined &&
+                before.cellId === after.cellId &&
+                before.order.completed !== undefined &&
+                before.order.started < before.order.completed &&
+                before.order.completed < after.order.started
+              );
+            }) &&
+            !/^(?:Exit code [1-9]|<tool_use_error>)/.test(call.output ?? "") &&
+            new RegExp(output).test(call.output ?? "")
+          );
+        }),
+    })),
+  ];
+};
+
 /** `pasted` is the thread's user text (`pastedText`), for request_secret's `value`. */
 export const gradeSample = (
   expect: McpToolUseCase["expect"],
@@ -2001,6 +2127,7 @@ export const gradeSample = (
     ),
   );
   checks.push(...gradeSecret(expect.secret, run, pasted));
+  checks.push(...gradeWorkbenchRepair(expect.workbenchRepair, run));
   return checks;
 };
 
@@ -2050,13 +2177,19 @@ const codexRequest = (base: Base, input: ReadonlyArray<Block>) => ({
 export const executeCodex = async (
   code: string,
   catalog: ReadonlyArray<{ name: string; description: string }>,
-  answer: (name: string, input: unknown) => Promise<unknown>,
+  answer: (name: string, input: unknown, order: ToolExecutionOrder) => Promise<unknown>,
   saved: Record<string, unknown> = {},
 ) => {
-  const pending: Array<{ name: string; input: string; resolve: (value: string) => void }> = [];
+  let sequence = 0;
+  const pending: Array<{
+    name: string;
+    input: string;
+    resolve: (value: string) => void;
+    order: ToolExecutionOrder;
+  }> = [];
   const bridge = Object.setPrototypeOf(
     (name: string, input: string, resolve: (value: string) => void) =>
-      pending.push({ name, input, resolve }),
+      pending.push({ name, input, resolve, order: { started: ++sequence } }),
     null,
   );
   const context = NodeVM.createContext(
@@ -2079,7 +2212,8 @@ export const executeCodex = async (
     if (count === 128) throw new Error("Code cell exceeded 128 tool calls.");
     const job = pending.shift();
     if (!job) throw new Error("Code cell stalled without a tool call.");
-    const result = await answer(job.name, JSON.parse(job.input));
+    const result = await answer(job.name, JSON.parse(job.input), job.order);
+    job.order.completed = ++sequence;
     context.__resolve = job.resolve;
     context.__result = JSON.stringify(result ?? null);
     run("__resolve(__result); delete globalThis.__resolve; delete globalThis.__result;");
@@ -2295,13 +2429,23 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
         if (!input) {
           return settle(own, yield* answerToolCall(sample, config, use));
         }
-        const answer = (name: string, args: unknown, record = true) => {
+        const answer = (
+          name: string,
+          args: unknown,
+          record = true,
+          execution?: Call["execution"],
+        ) => {
           const tool = normalizeToolName(name);
           const normalized = normalizeToolInput(name, args);
           // A code cell's calls are recorded here; a direct function call already was.
           let recorded = own;
           if (record) {
-            recorded = { step, tool, input: normalized };
+            recorded = {
+              step,
+              tool,
+              input: normalized,
+              ...(execution === undefined ? {} : { execution }),
+            };
             calls.push(recorded);
           }
           const call = { ...use, name, input: normalized };
@@ -2334,7 +2478,7 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
                 ? await executeCodex(
                     valueText(use.input),
                     codexCatalog(base),
-                    answer,
+                    (name, args, order) => answer(name, args, true, { cellId: use.id, order }),
                     sample.codeStore,
                   )
                 : await answer(use.name, use.input, false);

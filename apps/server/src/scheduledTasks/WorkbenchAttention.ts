@@ -31,6 +31,11 @@ import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Checkpoints from "../checkpointing/CheckpointStore.ts";
+import {
+  attachRepairAttention,
+  recordRepairAttention,
+  requeueRepairGeneration,
+} from "./workbenchRepairHuman.ts";
 import * as AttentionGuard from "../orchestration-v2/WorkbenchAttentionGuard.ts";
 import * as Engine from "../orchestration-v2/Orchestrator.ts";
 import * as Outbox from "../orchestration-v2/EffectOutbox.ts";
@@ -52,6 +57,7 @@ type AttentionRow = {
   id: string;
   queue_id: string;
   work_item_id: string;
+  repair_generation_id: string | null;
   version: number;
   phase: Phase;
   reason_json: string;
@@ -173,15 +179,21 @@ export class WorkbenchAttention extends Context.Service<
       workItemId: string,
       input: WorkbenchAttentionPauseInput,
     ) => Effect.Effect<Mutation, WorkbenchQueueError>;
+    readonly pauseSystem: (
+      workItemId: string,
+      generationId: string,
+    ) => Effect.Effect<void, WorkbenchQueueError>;
     readonly record: (
       queueId: string,
       id: string,
       input: WorkbenchAttentionRecordInput,
+      principalId?: string,
     ) => Effect.Effect<Mutation, WorkbenchQueueError>;
     readonly requeue: (
       queueId: string,
       id: string,
       input: WorkbenchAttentionRequeueInput,
+      principalId?: string,
     ) => Effect.Effect<Mutation, WorkbenchQueueError>;
     readonly reconcile: (
       queueId: string,
@@ -252,6 +264,7 @@ const make = Effect.gen(function* () {
     return {
       id: row.id,
       workItemId: w.id,
+      repairGenerationId: row.repair_generation_id,
       taskId: w.task_id as never,
       taskCreatedAt: w.task_created_at,
       version: row.version,
@@ -575,6 +588,9 @@ const make = Effect.gen(function* () {
       runtimeMode: projection.thread.runtimeMode,
       interactionMode: projection.thread.interactionMode,
       progress: {
+        repair:
+          yield* sql`SELECT g.id AS generationId,g.used,g.reason,(SELECT json_group_array(e.id) FROM workbench_repair_evidence e WHERE e.generation_id=g.id) AS evidenceIds
+          FROM workbench_repair_generations g WHERE g.id=${a.repair_generation_id}`,
         beforePause: yield* decodeJson(a.pre_pause_json),
         afterQuiescence: yield* encodeProjection(projection),
         workItem: {
@@ -874,6 +890,7 @@ const make = Effect.gen(function* () {
             const stamp = yield* now;
             yield* sql`UPDATE workbench_attention_items SET phase='awaiting_user',point_id=${`point:${a.id}:paused`},source_run_id=${manifest.sourceRunId},checkpoint_status='ready',captured_at=${stamp},blocked_reason=NULL,version=version+1,updated_at=${stamp} WHERE id=${a.id} AND epoch=${a.epoch}`;
             yield* sql`UPDATE workbench_queue_entries SET state='paused',claim_id=NULL,needs_dispatch=0,wake_sent=1,work_state='unknown',blocked_reason='attention',updated_at=${stamp} WHERE work_item_id=${w.id} AND state IN ('occupied','queued','finished','paused')`;
+            yield* sql`UPDATE workbench_repair_attempts SET state='blocked',completed_at=${stamp},updated_at=${stamp} WHERE generation_id=${a.repair_generation_id} AND state IN ('reserved','accepted','running','unknown')`;
             yield* sql`UPDATE workbench_attention_operations SET state='applied',updated_at=${stamp} WHERE attention_id=${a.id} AND kind='pause'`;
           }),
         );
@@ -900,7 +917,11 @@ const make = Effect.gen(function* () {
     );
   });
   const pause = Effect.fn("WorkbenchAttention.pause")(
-    function* (queueId: string, workItemId: string, input: WorkbenchAttentionPauseInput) {
+    function* (
+      queueId: string,
+      workItemId: string,
+      input: Omit<WorkbenchAttentionPauseInput, "reason"> & { reason: Summary["reason"] },
+    ) {
       yield* authorize(queueId, input);
       const checked = yield* operation(queueId, input, "pause", workItemId);
       if (checked.prior)
@@ -943,6 +964,7 @@ const make = Effect.gen(function* () {
               VALUES(${id},${queueId},${w.id},'blocked',${yield* encodeReason(input.reason)},${beforePause},1,${before.runtimeRequests.find((request) => request.status === "pending")?.id ?? null},${entry.priority},'pending_runtime_request',${w.run_id},${`command:${id}:pause`},${entry.claim_id},${entry.wake_generation},${w.attention_epoch},${stamp},${stamp})`;
             }
             yield* sql`INSERT INTO workbench_attention_operations(queue_id,client_request_id,attention_id,kind,payload_sha,state,created_at,updated_at,payload_json) VALUES(${queueId},${input.clientRequestId},${id},'pause',${checked.sha},'blocked',${stamp},${stamp},${yield* encodeJson(input)})`;
+            yield* attachRepairAttention(id, w.id);
           }),
         );
         return yield* result(queueId, input, input.clientRequestId).pipe(
@@ -979,6 +1001,7 @@ const make = Effect.gen(function* () {
     VALUES(${id},${queueId},${w.id},'pausing',${yield* encodeReason(input.reason)},${beforePause},${entry.priority},${`command:${id}:pause`},${entry.claim_id},${entry.wake_generation},${current.attention_epoch},${stamp},${stamp})`;
           yield* sql`UPDATE workbench_queue_entries SET needs_dispatch=0,blocked_reason='attention',updated_at=${stamp} WHERE work_item_id=${w.id}`;
           yield* sql`INSERT INTO workbench_attention_operations(queue_id,client_request_id,attention_id,kind,payload_sha,state,created_at,updated_at) VALUES(${queueId},${input.clientRequestId},${id},'pause',${checked.sha},'pending',${stamp},${stamp})`;
+          yield* attachRepairAttention(id, w.id);
         }),
       );
       const answer = yield* result(queueId, input, input.clientRequestId).pipe(
@@ -987,10 +1010,16 @@ const make = Effect.gen(function* () {
       yield* schedule(id);
       return answer;
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
   const record = Effect.fn("WorkbenchAttention.record")(
-    function* (queueId: string, id: string, input: WorkbenchAttentionRecordInput) {
+    function* (
+      queueId: string,
+      id: string,
+      input: WorkbenchAttentionRecordInput,
+      principalId?: string,
+    ) {
       yield* authorize(queueId, input);
       const checked = yield* operation(queueId, input, "record", id);
       if (checked.prior)
@@ -1012,16 +1041,23 @@ const make = Effect.gen(function* () {
           if (!changed) return yield* stale();
           yield* sql`UPDATE workbench_queue_entries SET priority=${input.priority},updated_at=${stamp} WHERE work_item_id=${changed.work_item_id}`;
           yield* sql`INSERT INTO workbench_attention_operations(queue_id,client_request_id,attention_id,kind,payload_sha,state,created_at,updated_at) VALUES(${queueId},${input.clientRequestId},${id},'record',${checked.sha},'applied',${stamp},${stamp})`;
+          yield* recordRepairAttention(queueId, id, input, principalId);
         }),
       );
       return yield* result(queueId, input, input.clientRequestId).pipe(
         Effect.mapError(Failure.from),
       );
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
   const requeue = Effect.fn("WorkbenchAttention.requeue")(
-    function* (queueId: string, id: string, input: WorkbenchAttentionRequeueInput) {
+    function* (
+      queueId: string,
+      id: string,
+      input: WorkbenchAttentionRequeueInput,
+      principalId?: string,
+    ) {
       yield* authorize(queueId, input);
       const checked = yield* operation(queueId, input, "requeue", id);
       if (checked.prior) {
@@ -1044,6 +1080,7 @@ const make = Effect.gen(function* () {
           if (!changed) return yield* stale();
           yield* sql`INSERT INTO workbench_attention_operations(queue_id,client_request_id,attention_id,kind,payload_sha,state,created_at,updated_at,payload_json)
     VALUES(${queueId},${input.clientRequestId},${id},'requeue',${checked.sha},'pending',${stamp},${stamp},${yield* encodeJson(input)})`;
+          yield* requeueRepairGeneration(queueId, id, input, principalId);
         }),
       );
       const answer = yield* result(queueId, input, input.clientRequestId).pipe(
@@ -1052,6 +1089,7 @@ const make = Effect.gen(function* () {
       yield* schedule(id);
       return answer;
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
   const resumeClaim = Effect.fn("WorkbenchAttention.resumeClaim")(
@@ -1097,6 +1135,7 @@ const make = Effect.gen(function* () {
       );
       yield* reconcileOne(a.id);
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
   const reconcile = Effect.fn("WorkbenchAttention.reconcile")(
@@ -1108,6 +1147,7 @@ const make = Effect.gen(function* () {
       }>`SELECT id FROM workbench_attention_items WHERE queue_id=${queueId} AND phase IN ('pausing','resuming','blocked','requeue_pending')`;
       for (const row of rows) yield* reconcileOne(row.id);
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
   const get = Effect.fn("WorkbenchAttention.get")(
@@ -1131,8 +1171,64 @@ const make = Effect.gen(function* () {
         nextCursor: rows.length > 100 ? page.at(-1)!.id : null,
       };
     },
+    Effect.provideService(SqlClient.SqlClient, sql),
     Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
   );
-  return WorkbenchAttention.of({ get, pause, record, requeue, reconcile, resumeClaim });
+  const pauseSystem = Effect.fn("WorkbenchAttention.pauseSystem")(
+    function* (workItemId: string, generationId: string) {
+      const [g] = yield* sql<{
+        queue_id: string;
+        controller_id: string;
+        project_id: string;
+        tracking_id: string;
+        version: number;
+        latest_sequence: number;
+        reason: string | null;
+        source_run_id: string | null;
+      }>`SELECT g.queue_id,q.controller_id,g.project_id,m.tracking_id,w.version,CASE WHEN w.matter_id IS NULL THEN 1 ELSE w.latest_event_sequence END AS latest_sequence,g.reason,g.source_run_id
+      FROM workbench_repair_generations g JOIN workbench_work_items w ON w.id=g.work_item_id JOIN workbench_queues q ON q.id=g.queue_id,scheduled_task_execution_metadata m
+      WHERE g.id=${generationId} AND g.work_item_id=${workItemId} AND g.superseded_at IS NULL AND g.phase='awaiting_user' AND m.singleton=1`;
+      if (!g) return yield* stale();
+      const [pending] = yield* sql<{
+        runtime_request_id: string;
+      }>`SELECT runtime_request_id FROM orchestration_v2_projection_runtime_requests WHERE thread_id=(SELECT work_thread_id FROM workbench_work_items WHERE id=${workItemId}) AND status='pending' AND kind IN ('user_input','command','file-change','file-read','permission','mcp-elicitation') ORDER BY created_at LIMIT 1`;
+      const clientRequestId = `repair-pause:${digest(yield* encodeJson([generationId, g.reason, pending?.runtime_request_id ?? g.source_run_id]))}`;
+      const [prior] = yield* sql<{
+        attention_id: string;
+      }>`SELECT attention_id FROM workbench_attention_operations WHERE queue_id=${g.queue_id} AND client_request_id=${clientRequestId} AND kind='pause'`;
+      if (prior) {
+        yield* schedule(prior.attention_id);
+        return;
+      }
+      yield* pause(g.queue_id, workItemId, {
+        controllerId: g.controller_id,
+        projectId: g.project_id as never,
+        expectedTrackingId: g.tracking_id,
+        clientRequestId,
+        expectedWorkItemVersion: g.version,
+        expectedLatestEventSequence: g.latest_sequence,
+        reason: {
+          code: g.reason === "budget_exhausted" ? "repair_budget_exhausted" : "repair_blocked",
+          summary:
+            g.reason === "budget_exhausted"
+              ? "Three automatic repair attempts were used."
+              : "The work item requires human attention before automatic repair can continue.",
+          requiredAction:
+            "Review the saved check evidence and original thread, handle the cause, record the result, then explicitly requeue the work item.",
+        },
+      });
+    },
+    Effect.provideService(SqlClient.SqlClient, sql),
+    Effect.mapError((cause) => (isQueueError(cause) ? cause : Failure.from(cause))),
+  );
+  return WorkbenchAttention.of({
+    get,
+    pause,
+    pauseSystem,
+    record,
+    requeue,
+    reconcile,
+    resumeClaim,
+  });
 });
 export const layer = Layer.effect(WorkbenchAttention, make);

@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Responses from "./WorkbenchResponseGuard.ts";
+import * as Repairs from "./WorkbenchRepairGuard.ts";
 
 export class WorkbenchAttentionGuardError extends Schema.TaggedError<WorkbenchAttentionGuardError>()(
   "WorkbenchAttentionGuardError",
@@ -26,6 +27,7 @@ export class WorkbenchAttentionGuardError extends Schema.TaggedError<WorkbenchAt
       "unavailable",
       "runtime-request-pending",
       "response-mismatch",
+      "repair-mismatch",
     ]),
     runtimeRequestId: Schema.optional(RuntimeRequestId),
     cause: Schema.optional(Schema.Defect()),
@@ -42,6 +44,7 @@ export interface Admission {
   readonly messageId?: MessageId;
   readonly runId?: RunId;
   readonly expectedEpoch?: number | null;
+  readonly effectType?: string;
 }
 
 export interface OriginalResume {
@@ -108,6 +111,8 @@ type ResumeRow = {
 };
 
 const encodeCommand = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2Command));
+const repairFailure = (threadId: ThreadId) => (cause: unknown) =>
+  new WorkbenchAttentionGuardError({ threadId, reason: "repair-mismatch", cause });
 
 /** SQL-only: command commit repeats this check in its write transaction before accepting Stop. */
 export const assertAutomaticPauseStop = Effect.fn(
@@ -193,11 +198,17 @@ const make = Effect.gen(function* () {
           SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=i.thread_id
           AND r.run_id=${input.runId ?? null} AND json_extract(r.payload_json,'$.userMessageId')=i.message_id))))
       LIMIT 1`;
-      if (row === undefined)
+      if (row === undefined) {
+        const repair = yield* Repairs.originalRepair(input).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError(repairFailure(input.threadId)),
+        );
+        if (repair !== undefined) return repair;
         return yield* Responses.originalResponse(input).pipe(
           Effect.provideService(SqlClient.SqlClient, sql),
           Effect.mapError(responseFailure(input.threadId)),
         );
+      }
       if (
         row.current_epoch !== row.attention_epoch ||
         row.binding_valid !== 1 ||
@@ -244,8 +255,18 @@ const make = Effect.gen(function* () {
 
   const assertAdmission = Effect.fn("WorkbenchAttentionGuard.assertAdmission")(
     function* (input: Admission) {
+      yield* Repairs.assertRepairDescendant(input.threadId).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(repairFailure(input.threadId)),
+      );
+      const repair = yield* Repairs.repairAdmission(input).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(repairFailure(input.threadId)),
+      );
       const rows = yield* sql<{ attention_hold: number; attention_epoch: number }>`
-      SELECT attention_hold,attention_epoch FROM workbench_work_items WHERE work_thread_id=${input.threadId}`;
+      SELECT w.attention_hold,w.attention_epoch FROM workbench_work_items w
+        LEFT JOIN workbench_repair_generations g ON g.work_item_id=w.id AND g.superseded_at IS NULL
+        WHERE COALESCE(w.work_thread_id,g.thread_id)=${input.threadId}`;
       for (const row of rows) {
         if (
           input.expectedEpoch !== undefined &&
@@ -260,16 +281,18 @@ const make = Effect.gen(function* () {
           Effect.provideService(SqlClient.SqlClient, sql),
           Effect.mapError(responseFailure(input.threadId)),
         );
-        if (
-          row.attention_hold === 1 &&
-          response === undefined &&
-          (yield* originalResume(input)) === undefined
-        ) {
+        const resume = repair === undefined ? yield* originalResume(input) : undefined;
+        if (row.attention_hold === 1 && response === undefined && resume === undefined) {
           return yield* new WorkbenchAttentionGuardError({
             threadId: input.threadId,
             reason: "held",
           });
         }
+        if (repair === undefined && response === undefined && resume === undefined)
+          yield* Repairs.assertUnregisteredAdmission(input).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.mapError(repairFailure(input.threadId)),
+          );
       }
     },
     (effect, input) =>
@@ -327,10 +350,17 @@ const make = Effect.gen(function* () {
     if (!canExecute) return;
     const input: Admission = {
       threadId,
-      commandId: command.commandId,
+      ...(command.type === "delegated_task.request" ? {} : { commandId: command.commandId }),
       ...(command.type === "message.dispatch" ? { messageId: command.messageId } : {}),
+      ...(command.type === "delegated_task.request" ? { runId: command.parentRunId } : {}),
+      ...("runId" in command ? { runId: command.runId } : {}),
     };
     yield* assertAdmission(input);
+    const repairCommand = yield* Repairs.assertRepairCommand(command).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.mapError(repairFailure(threadId)),
+    );
+    if (repairCommand?.admissionKind === "delegate") return;
     if (
       (yield* Responses.responseAdmission(input).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
@@ -341,6 +371,7 @@ const make = Effect.gen(function* () {
     const resume = yield* originalResume(input);
     if (
       resume !== undefined &&
+      command.type !== "delegated_task.request" &&
       (command.type !== "message.dispatch" ||
         (yield* encodeCommand(command).pipe(
           Effect.mapError(

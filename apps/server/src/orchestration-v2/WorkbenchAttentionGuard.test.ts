@@ -44,7 +44,8 @@ const command = {
 const seed = Effect.fn("WorkbenchAttentionGuard.test.seed")(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`INSERT INTO workbench_queues VALUES('queue','controller','project')`;
-  yield* sql`INSERT INTO workbench_queue_bindings VALUES('task','2026-11-26','queue','project','dispatcher')`;
+  yield* sql`INSERT INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id)
+    VALUES('task','2026-11-26','queue','project','dispatcher')`;
   yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,work_thread_id,created_at,updated_at)
     VALUES('item','task','2026-11-26','project','event','dispatcher','{}',${threadId},'2026-11-26','2026-11-26')`;
   yield* sql`INSERT INTO workbench_queue_entries(work_item_id,queue_id,state,claim_id,created_at,updated_at)
@@ -168,6 +169,43 @@ it.effect(
       expect((yield* guard.assertCommand(command).pipe(Effect.flip)).cause).toMatchObject({
         reason: "claim-stale",
       });
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["superseded", "uncharged", "claim", "epoch", "wake", "finished"] as const)(
+  "admits a current repair's native answer but rejects its stale %s provenance",
+  (drift) =>
+    Effect.gen(function* () {
+      const recorded = yield* seedResponse();
+      const sql = yield* SqlClient.SqlClient;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      yield* sql`UPDATE workbench_work_items SET run_id='original-work',accepted_run_id='original-work' WHERE id='item'`;
+      yield* sql`INSERT INTO workbench_repair_generations(id,work_item_id,queue_id,task_id,task_created_at,dispatcher_thread_id,project_id,thread_id,generation,used,phase,reason,source_run_id,created_at,updated_at)
+      VALUES('response-generation','item','queue','task','2026-11-26','dispatcher','project',${threadId},1,1,'awaiting_user','user_input','original-work','2026-11-27','2026-11-27')`;
+      yield* sql`INSERT INTO workbench_repair_attempts(id,generation_id,work_item_id,queue_id,ordinal,charged,state,source_run_id,failure_evidence_json,thread_id,project_id,claim_id,wake_generation,attention_epoch,command_id,message_id,run_id,provider_instance_id,provider_thread_id,provider_session_id,native_driver,native_thread_id,worktree_path,worktree_real_path,branch,git_common_dir,model_selection_json,runtime_mode,interaction_mode,request_json,created_at,updated_at)
+      VALUES('response-repair','response-generation','item','queue',1,1,'accepted','original-work','[]',${threadId},'project','claim',0,0,'repair-command','repair-message','source-run','provider','provider-thread','session','codex','native-thread','/workspace','/workspace','feature','/repo/.git','{"model":"model"}','full-access','default','{}','2026-11-27','2026-11-27')`;
+      const native = { ...recorded, commandId: CommandId.make("repair-original-ui-answer") };
+      yield* guard.assertCommand(native);
+      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='resolved',payload_json=json_set(payload_json,'$.status','resolved','$.decision','accept') WHERE runtime_request_id=${native.requestId}`;
+      yield* guard.assertResponseExecution({
+        threadId,
+        commandId: native.commandId,
+        requestId: native.requestId,
+        providerSessionId: "session",
+        decision: "accept",
+      });
+      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='pending',payload_json=json_remove(json_set(payload_json,'$.status','pending'),'$.decision') WHERE runtime_request_id=${native.requestId}`;
+      if (drift === "superseded")
+        yield* sql`UPDATE workbench_repair_generations SET superseded_at='2026-11-27'`;
+      if (drift === "uncharged") yield* sql`UPDATE workbench_repair_attempts SET charged=0`;
+      if (drift === "claim") yield* sql`UPDATE workbench_queue_entries SET claim_id='other-claim'`;
+      if (drift === "epoch") yield* sql`UPDATE workbench_work_items SET attention_epoch=1`;
+      if (drift === "wake") yield* sql`UPDATE workbench_queue_entries SET wake_generation=1`;
+      if (drift === "finished") yield* sql`UPDATE workbench_repair_attempts SET state='succeeded'`;
+      expect((yield* guard.assertCommand(native).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "claim-stale",
+      });
+      expect(yield* sql`SELECT used FROM workbench_repair_generations`).toEqual([{ used: 1 }]);
     }).pipe(Effect.provide(layer)),
 );
 

@@ -113,7 +113,16 @@ const assertNativeResponse = Effect.fn("WorkbenchResponseGuard.assertNativeRespo
         SELECT 1 FROM workbench_work_batches batch WHERE batch.work_item_id=w.id
           AND (batch.run_id=n.run_id OR batch.accepted_run_id=n.run_id)) OR EXISTS(
         SELECT 1 FROM workbench_runtime_responses response WHERE response.work_item_id=w.id
-          AND response.run_id=n.run_id AND json_extract(response.source_json,'$.cycle_number')=w.cycle_number))`;
+          AND response.run_id=n.run_id AND json_extract(response.source_json,'$.cycle_number')=w.cycle_number) OR EXISTS(
+        SELECT 1 FROM workbench_repair_attempts a JOIN workbench_repair_generations g ON g.id=a.generation_id
+          WHERE a.work_item_id=w.id AND a.thread_id=w.work_thread_id AND a.run_id=n.run_id
+            AND a.charged=1 AND a.state IN ('accepted','running') AND a.ordinal<=g.used
+            AND g.work_item_id=w.id AND g.superseded_at IS NULL AND g.thread_id=w.work_thread_id
+            AND g.task_id=w.task_id AND g.task_created_at=w.task_created_at AND g.project_id=w.project_id
+            AND g.dispatcher_thread_id=w.dispatcher_thread_id AND g.queue_id=e.queue_id
+            AND a.queue_id=e.queue_id AND a.project_id=w.project_id AND a.claim_id=e.claim_id
+            AND a.attention_epoch=w.attention_epoch AND a.wake_generation=e.wake_generation
+            AND (g.phase='repairing' OR (g.phase='awaiting_user' AND g.reason IN ('user_input','approval')))))`;
   if (allowed === undefined) return yield* fail("claim-stale");
 });
 

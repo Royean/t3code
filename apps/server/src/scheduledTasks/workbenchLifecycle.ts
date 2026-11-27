@@ -292,7 +292,8 @@ export const retainedBusinessThreads = Effect.fn("WorkbenchWorkItems.retainedBus
     const sql = yield* SqlClient.SqlClient;
     const rows =
       yield* sql<WorkspaceBinding>`SELECT * FROM workbench_work_items WHERE (matter_id IS NOT NULL OR EXISTS(SELECT 1 FROM workbench_attention_items a WHERE a.work_item_id=workbench_work_items.id AND a.phase!='resolved')) AND
-    (business_state!='completed' OR handoff_ref IS NULL OR preserved_ref IS NULL OR recovery_ref IS NOT NULL OR latest_event_sequence!=processed_through_sequence)`;
+    (business_state!='completed' OR handoff_ref IS NULL OR preserved_ref IS NULL OR recovery_ref IS NOT NULL OR latest_event_sequence!=processed_through_sequence)
+    OR EXISTS(SELECT 1 FROM workbench_repair_generations g WHERE g.work_item_id=workbench_work_items.id AND g.thread_id IS NOT NULL)`;
     return rows.flatMap((row) =>
       row.work_thread_id !== null
         ? [row.work_thread_id]

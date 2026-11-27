@@ -37,6 +37,36 @@ const decodeOrchestrationV2ProviderCapabilities = Schema.decodeUnknownSync(
 );
 
 describe("orchestration V2 contracts", () => {
+  it("preserves command cwd on the wire and in stored items without inventing it for older items", () => {
+    const stored = {
+      id: "command",
+      type: "command_execution",
+      threadId: "thread-1",
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "completed",
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: DateTime.formatIso(now),
+      input: "npm test",
+      exitCode: 1,
+      output: "Test failed\n",
+    };
+    const sendOverWire = Schema.encodeSync(Schema.toCodecJson(OrchestrationV2TurnItem));
+    for (const source of [stored, { ...stored, cwd: "/workspace/subproject" }]) {
+      const item = decodeOrchestrationV2TurnItemJson(source);
+      for (const encoded of [encodeOrchestrationV2TurnItemJson(item), sendOverWire(item)]) {
+        expect(encoded).toEqual(source);
+      }
+    }
+  });
+
   it("decodes thread event types from a newer server as skippable items", () => {
     const decodeWireItems = Schema.decodeUnknownSync(
       Schema.toCodecJson(Schema.Array(OrchestrationV2RpcSchemas.subscribeThread.output)),
