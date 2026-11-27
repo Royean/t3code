@@ -4979,6 +4979,20 @@ it.live(
         yield* finish(batch.runId!);
         yield* finishDelegations;
         const ready = (yield* items.get(taskId, "four")).workItems[0]!;
+        const releaseGuard = yield* Effect.acquireUseRelease(
+          sql`INSERT INTO workbench_release_obligations(work_item_id,task_created_at,cycle_number,preparation_id,created_at) SELECT id,task_created_at,cycle_number,'release-prepare',updated_at FROM workbench_work_items WHERE id=${ready.id}`,
+          () =>
+            items
+              .complete({
+                ...completion,
+                expectedVersion: ready.version,
+                expectedLatestEventSequence: 4,
+                processedThroughSequence: 4,
+              })
+              .pipe(Effect.result),
+          () => sql`DELETE FROM workbench_release_obligations WHERE work_item_id=${ready.id}`,
+        );
+        assert.equal(releaseGuard._tag, "Failure");
         const complete = yield* items.complete({
           ...completion,
           expectedVersion: ready.version,

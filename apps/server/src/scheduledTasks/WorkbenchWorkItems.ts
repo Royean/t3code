@@ -8,6 +8,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type WorkbenchWorkItem,
   type WorkbenchWorkItemsResult,
+  type WorkbenchDeployment,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -22,11 +23,65 @@ import { ledgerError } from "./executionLedger.ts";
 import * as GitDriver from "../vcs/GitVcsDriver.ts";
 import * as Relations from "./WorkbenchChildRelations.ts";
 import * as Lifecycle from "./workbenchLifecycle.ts";
+import { canonicalReleaseJson, releaseDigest } from "./workbenchReleaseProfile.ts";
 import {
   delegatedTaskAwaitsWork,
   delegatedTaskResultRun,
 } from "../orchestration-v2/RestartBackgroundNote.ts";
 const decodeMatter = Schema.decodeUnknownEffect(Schema.fromJsonString(WorkbenchMatter));
+
+export const completeAcceptedDelivery = Effect.fn("WorkbenchWorkItems.completeAcceptedDelivery")(
+  function* (previous: WorkbenchDeployment, next: WorkbenchDeployment) {
+    const sql = yield* SqlClient.SqlClient,
+      b = previous.binding,
+      m = next.merge,
+      r = next.delivery;
+    const refused = () =>
+      new ScheduledTaskError({ message: "Accepted delivery changed before atomic completion." });
+    if (
+      next.state !== "delivered" ||
+      !r ||
+      !m ||
+      m.state !== "completed" ||
+      !m.result ||
+      m.failure ||
+      m.recovery ||
+      m.claim.state !== "committed" ||
+      previous.acceptance?.state !== "passed" ||
+      m.input.acceptanceDigest !== releaseDigest(previous.acceptance) ||
+      m.result.commitSha !== next.desired.sourceSha ||
+      r.mergeDigest !== releaseDigest(m) ||
+      r.workItemVersionBefore !== b.workItemVersion ||
+      r.workItemVersionAfter !== b.workItemVersion + 1 ||
+      r.latestEventSequence !== b.latestEventSequence ||
+      r.processedThroughSequence !== b.processedThroughSequence ||
+      b.latestEventSequence !== b.processedThroughSequence
+    )
+      return yield* refused();
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const active =
+          yield* sql`WITH RECURSIVE related(thread_id) AS (SELECT ${b.workThreadId} UNION SELECT s.child_thread_id FROM orchestration_v2_projection_subagents s JOIN related x ON s.thread_id=x.thread_id WHERE s.child_thread_id IS NOT NULL)
+      SELECT 1 FROM orchestration_v2_projection_runs WHERE thread_id IN (SELECT thread_id FROM related) AND status IN ('preparing','starting','running','waiting','queued')
+      UNION SELECT 1 FROM orchestration_v2_projection_runtime_requests WHERE thread_id IN (SELECT thread_id FROM related) AND status='pending'
+      UNION SELECT 1 FROM orchestration_v2_projection_subagents WHERE thread_id IN (SELECT thread_id FROM related) AND (status IN ('pending','running','waiting') OR completion_delivery_state IN ('pending','claimed'))
+      UNION SELECT 1 FROM orchestration_v2_projection_provider_threads WHERE thread_id IN (SELECT thread_id FROM related) AND json_array_length(json_extract(payload_json,'$.pendingBackgroundTasks'))>0 LIMIT 1`;
+        if (active.length) return yield* refused();
+        const changed =
+          yield* sql`UPDATE workbench_work_items SET business_state='completed',completed_at=${r.completedAt},version=version+1,handoff_ref=${r.handoffRef},preserved_ref=${r.preservedRef} WHERE id=${b.workItemId} AND task_id=${b.taskId} AND task_created_at=${b.taskCreatedAt} AND project_id=${b.projectId} AND dispatcher_thread_id=${b.dispatcherThreadId} AND work_thread_id=${b.workThreadId} AND cycle_number=${b.cycleNumber} AND version=${b.workItemVersion} AND latest_event_sequence=${b.latestEventSequence} AND processed_through_sequence=${b.processedThroughSequence} AND business_state='awaiting_delivery' AND attention_hold=0 AND recovery_ref IS NULL
+      AND EXISTS(SELECT 1 FROM workbench_release_obligations o WHERE o.work_item_id=${b.workItemId} AND o.task_created_at=${b.taskCreatedAt} AND o.cycle_number=${b.cycleNumber})
+      AND NOT EXISTS(SELECT 1 FROM workbench_work_batches WHERE work_item_id=${b.workItemId} AND state!='completed')
+      AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses WHERE work_item_id=${b.workItemId} AND state IN ('recorded','queued','submitted','unknown')) RETURNING id`;
+        if (changed.length !== 1) return yield* refused();
+        yield* sql`INSERT INTO workbench_delivery_receipts(deployment_id,work_item_id,receipt_json,created_at) VALUES(${next.id},${b.workItemId},${canonicalReleaseJson(r)},${r.completedAt})`;
+        const saved =
+          yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state='delivered',updated_at=${next.updatedAt} WHERE id=${previous.id} AND deployment_json=${canonicalReleaseJson(previous)} RETURNING id`;
+        if (saved.length !== 1) return yield* refused();
+      }),
+    );
+  },
+  Effect.mapError(ledgerError),
+);
 
 function batchRuns(
   child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "nodes" | "runtimeRequests">,
@@ -606,6 +661,11 @@ const make = Effect.gen(function* () {
     const [saved] =
       yield* sql<WorkItemRow>`SELECT * FROM workbench_work_items WHERE id=${input.workItemId}`;
     if (
+      (yield* sql`SELECT 1 FROM workbench_release_obligations WHERE work_item_id=${input.workItemId}`)
+        .length
+    )
+      return yield* refusal();
+    if (
       !saved ||
       saved.matter_id === null ||
       saved.work_thread_id === null ||
@@ -653,7 +713,7 @@ const make = Effect.gen(function* () {
         handoff_ref=${input.handoffRef},preserved_ref=${input.preservedRef}
         WHERE id=${input.workItemId} AND version=${input.expectedVersion} AND latest_event_sequence=${input.expectedLatestEventSequence}
         AND processed_through_sequence=${input.processedThroughSequence} AND processed_through_sequence=latest_event_sequence AND business_state='awaiting_delivery'
-        AND recovery_ref IS NULL AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${input.workItemId} AND a.state IN ('recorded','queued','submitted','unknown')) AND NOT EXISTS(SELECT 1 FROM workbench_work_batches b WHERE b.work_item_id=${input.workItemId} AND b.state!='completed')
+        AND recovery_ref IS NULL AND NOT EXISTS(SELECT 1 FROM workbench_release_obligations o WHERE o.work_item_id=${input.workItemId}) AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${input.workItemId} AND a.state IN ('recorded','queued','submitted','unknown')) AND NOT EXISTS(SELECT 1 FROM workbench_work_batches b WHERE b.work_item_id=${input.workItemId} AND b.state!='completed')
         AND (NOT EXISTS(SELECT 1 FROM workbench_queue_bindings q WHERE q.task_id=workbench_work_items.task_id AND q.task_created_at=workbench_work_items.task_created_at)
           OR EXISTS(SELECT 1 FROM workbench_repair_generations g WHERE g.work_item_id=workbench_work_items.id AND g.superseded_at IS NULL AND g.phase='succeeded'))
         AND NOT EXISTS(SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=${saved.work_thread_id} AND r.status IN ('preparing','starting','running','waiting','queued'))

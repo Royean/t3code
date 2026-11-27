@@ -1,3 +1,4 @@
+import * as WorkbenchReleaseRefs from "./scheduledTasks/WorkbenchReleaseRefs.ts";
 import * as WorkbenchDeployment from "./scheduledTasks/WorkbenchDeployment.ts";
 import * as WorkbenchDeploymentHttp from "./scheduledTasks/workbenchDeploymentHttp.ts";
 import * as WorkbenchReleaseAdapter from "./scheduledTasks/WorkbenchReleaseAdapter.ts";
@@ -909,11 +910,17 @@ const layerMakeRoutes = Layer.mergeAll(
           WorkbenchReleaseHttp.layer.pipe(
             Layer.provide(WorkbenchRelease.layer),
             Layer.provide(WorkbenchReleaseAdapter.layer),
+            Layer.provide(
+              WorkbenchReleaseRefs.layer.pipe(Layer.provide(layerSourceControlProviderRegistry)),
+            ),
           ),
           WorkbenchDeploymentHttp.layer.pipe(
             Layer.provide(WorkbenchDeployment.layer),
             Layer.provide(WorkbenchRelease.layer),
             Layer.provide(WorkbenchReleaseAdapter.layer),
+            Layer.provide(
+              WorkbenchReleaseRefs.layer.pipe(Layer.provide(layerSourceControlProviderRegistry)),
+            ),
           ),
         ),
       ),

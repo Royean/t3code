@@ -2,11 +2,18 @@ import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { HttpBody, HttpClient, HttpClientRequest } from "effect/http";
 
 import { GH_PROCESS_CONCURRENCY } from "./GitHubCredentials.ts";
+
+/** A protected exact ref write must never be replayed at a redirect destination. */
+export const NoRedirects = Context.Reference<boolean>(
+  "@t3tools/source-control-github/server/GitHubHttpClient/NoRedirects",
+  { defaultValue: () => false },
+);
 
 export const layer = Layer.effect(
   HttpClient.HttpClient,
@@ -50,6 +57,7 @@ export const layer = Layer.effect(
           );
           const location = response.headers.location;
           if (
+            (yield* NoRedirects) ||
             ![301, 302, 303, 307, 308].includes(response.status) ||
             !location ||
             redirects >= 10

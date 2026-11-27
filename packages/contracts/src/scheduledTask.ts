@@ -4,6 +4,7 @@ import {
   WorkbenchDeploymentPlan,
   WorkbenchDeploymentEvidence,
 } from "./workbenchDeployment.ts";
+import { WorkbenchMergePlan, WorkbenchMergeEvidence } from "./workbenchMerge.ts";
 import * as Schema from "effect/Schema";
 
 import {
@@ -1170,6 +1171,7 @@ export const WorkbenchReleaseObservation = Schema.Struct({
   consecutiveSuccesses: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
 });
 export const WorkbenchReleasePolicy = Schema.Struct({
+  merge: Schema.optional(WorkbenchMergePlan),
   main: ReleaseMain,
   target: ReleaseTarget,
   deployment: Schema.optional(WorkbenchDeploymentHostPolicy),
@@ -1198,6 +1200,7 @@ export const WorkbenchReleaseProfileFile = Schema.Struct({
   profiles: Schema.Array(WorkbenchReleaseHostProfile).check(Schema.isMaxLength(100)),
 });
 export const WorkbenchPublicReleaseProfile = Schema.Struct({
+  mergePlan: Schema.optional(WorkbenchMergePlan),
   deploymentPlan: Schema.optional(WorkbenchDeploymentPlan),
   id: ReleaseId,
   version: ReleasePositive,
@@ -1304,6 +1307,7 @@ export const WorkbenchReleaseReceipt = Schema.Struct({
 });
 export type WorkbenchReleaseReceipt = typeof WorkbenchReleaseReceipt.Type;
 export const WorkbenchReleaseEvidence = Schema.Struct({
+  merge: Schema.optional(WorkbenchMergeEvidence),
   verification: Schema.optional(WorkbenchEvidenceVerification),
   deployment: Schema.optional(WorkbenchDeploymentEvidence),
   schemaVersion: Schema.Literal(1),

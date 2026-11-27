@@ -78,3 +78,4 @@ export * from "./settingsSecretValue.ts";
 export * from "./clientRpcPermissions.ts";
 
 export * from "./workbenchDeployment.ts";
+export * from "./workbenchMerge.ts";

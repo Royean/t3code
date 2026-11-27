@@ -8,6 +8,8 @@ import {
   WorkbenchDeploymentSigned,
   WorkbenchDeploymentBasis,
   WorkbenchDeploymentReason,
+  WorkbenchMergePermit,
+  type WorkbenchMergeClaimInput,
   type WorkbenchDeploymentHostPolicy,
   type WorkbenchDeploymentPlan,
   type WorkbenchDeploymentPreflightInput,
@@ -92,6 +94,32 @@ export function verifyDeploymentSignature(
         : signed.committedAt !== null && signed.committedAt >= signed.payload.createdAt) &&
       Buffer.from(signature, "base64url").length === 64 &&
       Buffer.from(signature, "base64url").toString("base64url") === signature &&
+      NodeCrypto.verify(
+        null,
+        Buffer.from(releaseDigest(unsigned), "utf8"),
+        policy.coordinator.publicKey,
+        Buffer.from(signature, "base64url"),
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+export function verifyMergePermit(
+  signed: WorkbenchMergePermit,
+  profile: WorkbenchReleaseHostProfile,
+  input: WorkbenchMergeClaimInput,
+) {
+  const policy = profile.policy.deployment;
+  if (!policy) return false;
+  const { signature, ...unsigned } = signed;
+  try {
+    return (
+      signed.kind === "merge_commit" &&
+      signed.keyId === policy.coordinator.id &&
+      signed.authorizationDigest === input.input.authorizationDigest &&
+      same(signed.payload, input) &&
+      deploymentKeyId(policy.coordinator.publicKey) === signed.keyId &&
       NodeCrypto.verify(
         null,
         Buffer.from(releaseDigest(unsigned), "utf8"),
@@ -199,6 +227,12 @@ export class WorkbenchReleaseAdapter extends Context.Service<
       reservation: WorkbenchDeploymentSigned,
       token: string,
     ) => Effect.Effect<Claim, ReleaseAdapterError>;
+    readonly claimMerge: (
+      profile: WorkbenchReleaseHostProfile,
+      reservation: WorkbenchDeploymentSigned,
+      token: string,
+      input: WorkbenchMergeClaimInput,
+    ) => Effect.Effect<WorkbenchMergePermit, ReleaseAdapterError>;
   }
 >()("t3/scheduledTasks/WorkbenchReleaseAdapter") {}
 
@@ -704,6 +738,33 @@ const make = Effect.gen(function* () {
       claimRpc(p, r, t, false),
     ),
     claim: Effect.fn("WorkbenchReleaseAdapter.commitClaim")((p, r, t) => claimRpc(p, r, t, true)),
+    claimMerge: Effect.fn("WorkbenchReleaseAdapter.claimMerge")(
+      function* (profile, reservation, token, input) {
+        const p = policy(profile);
+        if (!p)
+          return yield* new ReleaseAdapterError({
+            reason: "not_configured",
+            stage: "coordinator_merge",
+          });
+        const permit = yield* rpc(
+          WorkbenchMergePermit,
+          p.coordinator.origin,
+          `/api/release-coordinator/v1/claims/${encodeURIComponent(reservation.payload.deploymentId)}/merge`,
+          "coordinator_merge",
+          { token, method: "POST", body: canonicalReleaseJson(input) },
+        );
+        if (
+          !permit ||
+          !verifyMergePermit(permit, profile, input) ||
+          permit.authorizationDigest !== reservation.authorizationDigest
+        )
+          return yield* new ReleaseAdapterError({
+            reason: "permit_invalid",
+            stage: "coordinator_merge",
+          });
+        return permit;
+      },
+    ),
   });
 });
 export const layer = Layer.effect(WorkbenchReleaseAdapter, make);

@@ -4,6 +4,10 @@ import type {
   SourceControlSignInError,
   SourceControlSignInPrompt,
   SourceControlSignInResult,
+  WorkbenchMergePlan,
+  WorkbenchMergeSubject,
+  WorkbenchMergeObservation,
+  WorkbenchMergeRemoteReason,
 } from "@t3tools/contracts";
 import type * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
@@ -28,6 +32,46 @@ export interface SourceControlMediaRequest {
   readonly headers: Readonly<Record<string, string>>;
   /** `owner/name` of the change request the media is in, else of the checkout it was shown in. */
   readonly repository?: string;
+}
+
+export interface ExactReleaseRefsInput {
+  readonly cwd: string;
+  readonly plan: WorkbenchMergePlan;
+  readonly subject: WorkbenchMergeSubject;
+  readonly expectedActorId?: string;
+  readonly expectedPolicyDigest?: string;
+}
+
+export interface ExactReleaseFFInput extends ExactReleaseRefsInput {
+  readonly operationId: string;
+  readonly expectedActorId: string;
+  readonly expectedPolicyDigest: string;
+  /** Native persists its fenced intent only after fresh eligibility, immediately before CAS. */
+  readonly beforeMutation: Effect.Effect<void, ExactReleaseRefsError>;
+}
+
+/** A safe failure without invented repository or authenticated actor observations. */
+export interface ExactReleaseRefsError {
+  readonly _tag: "ExactReleaseRefsError";
+  readonly reason: WorkbenchMergeRemoteReason;
+}
+
+export interface ExactReleaseFFAttempt {
+  readonly kind: "acknowledged" | "observed_matching" | "rejected" | "unknown";
+  readonly sent: boolean;
+  readonly reason: WorkbenchMergeRemoteReason | null;
+  readonly ack: { readonly clientMutationId: string } | null;
+  readonly observation: WorkbenchMergeObservation | null;
+}
+
+/** Only exact protected fast-forward; absence means this driver cannot provide it. */
+export interface ExactReleaseRefs {
+  readonly inspect: (
+    input: ExactReleaseRefsInput,
+  ) => Effect.Effect<WorkbenchMergeObservation, ExactReleaseRefsError>;
+  readonly exactFF: (
+    input: ExactReleaseFFInput,
+  ) => Effect.Effect<ExactReleaseFFAttempt, ExactReleaseRefsError>;
 }
 
 /** The server side of a definition's `credentials.appSignIn`. */
@@ -56,6 +100,7 @@ export interface SourceControlDriverInstance {
   readonly pullRequests: PullRequestProviderApi | null;
   /** Absent for a host whose issues this build cannot read. */
   readonly issues?: IssueTrackerApi;
+  readonly exactReleaseRefs?: ExactReleaseRefs;
   /**
    * Fetches media the definition's `mediaUrl` claimed, with the credential the host serves it
    * to. Null when the fetch went nowhere a response could come from, such as a redirect loop.

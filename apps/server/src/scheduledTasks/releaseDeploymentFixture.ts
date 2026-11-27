@@ -251,6 +251,55 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       }
       if (route === "/.well-known/workbench-release-coordinator")
         return json(res, 200, { schemaVersion: 1, configured: true, id: keyId, origin, publicKey });
+      const mergeClaim = /^\/api\/release-coordinator\/v1\/claims\/([^/]+)\/merge$/.exec(route);
+      if (mergeClaim && req.method === "POST") {
+        const row = db
+          .prepare("SELECT value FROM claims WHERE id=?")
+          .get(decodeURIComponent(mergeClaim[1]!)) as { value: string } | undefined;
+        if (!row) return error(res, 404, "not_found");
+        const claim = JSON.parse(row.value),
+          p = claim.reservation.payload,
+          input = JSON.parse((await body(req)).toString());
+        if (
+          claim.state !== "committed" ||
+          releaseHash((req.headers.authorization ?? "").replace(/^Bearer /, "")) !==
+            p.claimTokenDigest ||
+          input.input?.authorizationDigest !== claim.reservation.authorizationDigest ||
+          input.input?.deploymentId !== p.nativeDeploymentId ||
+          input.input?.subject?.sourceSha !== p.sourceSha ||
+          input.input?.subject?.baseSha !== p.mainSha ||
+          canonicalReleaseJson(input.input.lock) !== canonicalReleaseJson(p.lock) ||
+          releaseDigest(input.input) !== input.inputDigest
+        )
+          return error(res, 403, "forbidden");
+        if (claim.merge) {
+          if (canonicalReleaseJson(claim.merge.input) !== canonicalReleaseJson(input))
+            return error(res, 409, "conflict");
+          return json(res, 200, claim.merge.permit);
+        }
+        const unsigned = {
+          schemaVersion: 1,
+          kind: "merge_commit",
+          keyId,
+          authorizationDigest: claim.reservation.authorizationDigest,
+          payload: input,
+          committedAt: DateTime.toEpochMillis(DateTime.nowUnsafe()),
+        };
+        const permit = {
+          ...unsigned,
+          signature: NodeCrypto.sign(
+            null,
+            Buffer.from(releaseDigest(unsigned), "utf8"),
+            keys.privateKey,
+          ).toString("base64url"),
+        };
+        claim.merge = { input, permit };
+        db.prepare("UPDATE claims SET value=? WHERE id=?").run(
+          JSON.stringify(claim),
+          decodeURIComponent(mergeClaim[1]!),
+        );
+        return json(res, 200, permit);
+      }
       if (route.startsWith("/api/release-coordinator/v1/claims/")) {
         const id = decodeURIComponent(route.split("/").at(-1)!);
         const row = db.prepare("SELECT value FROM claims WHERE id=?").get(id) as

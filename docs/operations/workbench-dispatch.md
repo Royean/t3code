@@ -220,3 +220,44 @@ succeed. Workbench can then show awaiting merge while retaining the service lock
 passed proof alone never merges main or completes the task; merge must apply its own fresh
 fences. The verifier supports at most 20,000 regular tracked entries, 64 MiB per file, a 256 MiB
 archive and an 8 MiB private manifest, without symlinks, submodules or credentials.
+
+## Accepted candidate merge
+
+An administrator can opt a new profile into protected exact fast-forward merge with
+`policy.merge`. It names the canonical GitHub host, `owner/name`, immutable repository ID,
+exact `refs/heads/...` matching `policy.main.ref`, and the complete required check contexts
+with their trusted positive GitHub App IDs. The only strategy is `github_exact_ff`: main moves
+from the original approved base B to the exact deployed candidate C, whose tree is also pinned.
+This plan enters the profile and evidence digests and requires a newly prepared, approved packet.
+Existing profiles or candidates without the sealed plan remain awaiting merge.
+
+The existing GitHub driver must expose all applicable rules and required check identities and
+prove a supported policy with no bypass. Required PR/review or merge-queue workflows, unknown
+rules, hidden bypass settings, unsupported protection and missing candidate objects cause refusal.
+The adapter never substitutes a generic PR merge, queue, rebase, force update, candidate push,
+or a different credential actor. Administrators should inspect the public plan before approval.
+GitHub cannot atomically compare branch rules together with the two commit IDs; the final
+same-credential inspection and protected compare-and-set retain that platform limitation.
+
+After immutable online acceptance passes, Native reruns health then core from the sealed material
+under new durable execution IDs, verifies the original activation through both target sources,
+and obtains a signed machine merge permit from the original Workbench coordinator and held lock.
+It persists intent immediately before the exact protected ref mutation. Lost responses and restarts
+query the original operation subject; main at C with the pinned tree can establish an observed
+postcondition, never an invented provider acknowledgement. Unknown intent with main at B or
+another value holds protection and cannot resend, repeat fresh checks, or infer a failed merge.
+
+Known eligibility failures or definitive mutation rejection retain the passed acceptance and a
+separate immutable merge-failure audit. Recovery uses only the original authorized rollback ID
+and baseline, and still requires an attributable production target plus independent restoration
+proof. A successful Git result survives a later work/source/target fence failure; compensation
+never rewinds main. Failed or uncertain restoration retains human attention and publication
+protection. Native's merge summary preserves the candidate, actual result and failure context.
+
+The first release preparation fixes a cycle delivery obligation, so ordinary internal completion
+cannot bypass release even if the profile changes. Only exact merge and current production proofs
+allow a preserved handoff at C followed by one SQLite transaction recording the delivery receipt,
+completing the original work item and marking Native delivered. Delivered history is terminal and
+performs no further external I/O after restart. Workbench releases only the corresponding held
+publication lock after validating that receipt; provider completion and execution-slot release
+remain separate. No user merge/completion/rollback mutation endpoint is added.

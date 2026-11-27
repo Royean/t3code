@@ -1,0 +1,5 @@
+mutation ExactReleaseFastForward($input: UpdateRefsInput!) {
+  updateRefs(input: $input) {
+    clientMutationId
+  }
+}

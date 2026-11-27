@@ -199,6 +199,8 @@ export const readReleaseProfiles = Effect.fn("WorkbenchReleaseEvidence.readProfi
       o = policy.observation;
     if (
       !validReleaseTarget(policy.target) ||
+      (policy.merge !== undefined &&
+        (!policy.deployment || policy.merge.ref !== policy.main.ref)) ||
       (policy.deployment !== undefined && !validDeploymentPolicy(policy.deployment)) ||
       !safeReleasePath(policy.artifact.relativePath) ||
       !safeReleasePath(policy.rollback.artifactRelativePath) ||
@@ -257,6 +259,7 @@ export const publicReleaseProfile = Effect.fn("WorkbenchReleaseEvidence.publicPr
   });
   const n = p.policy.checks.length;
   return {
+    ...(p.policy.merge ? { mergePlan: p.policy.merge } : {}),
     ...(p.policy.deployment ? { deploymentPlan: publicDeploymentPlan(p.policy.deployment) } : {}),
     id: p.id,
     version: p.version,

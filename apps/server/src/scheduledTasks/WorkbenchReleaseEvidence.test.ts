@@ -1,4 +1,8 @@
 import * as Clock from "effect/Clock";
+import * as Fiber from "effect/Fiber";
+import * as ReleaseRefs from "./WorkbenchReleaseRefs.ts";
+import { mergeFixture } from "./releaseMergeFixture.ts";
+import type { WorkbenchMergePlan } from "@t3tools/contracts";
 import { canonicalReleaseJson, releaseDigest } from "./workbenchReleaseProfile.ts";
 import * as TestClock from "effect/testing/TestClock";
 import * as Scope from "effect/Scope";
@@ -1200,6 +1204,7 @@ const approvedDeploymentFixtureFor = Effect.fn("releaseFixture.approved")(functi
     consecutiveSuccesses: number;
   },
   unchanged = false,
+  merge?: WorkbenchMergePlan,
 ) {
   const f = yield* fixture,
     releases = yield* Release.WorkbenchReleaseEvidence,
@@ -1211,6 +1216,10 @@ const approvedDeploymentFixtureFor = Effect.fn("releaseFixture.approved")(functi
     unchanged ? f.head : (yield* f.git(["rev-parse", "main"])).stdout.trim(),
     unchanged ? { bytes: "candidate", version: `sha256-${releaseHash("candidate")}` } : undefined,
   );
+  if (merge) {
+    yield* f.git(["push", "origin", "HEAD:refs/heads/release-candidate"]);
+    if (unchanged) yield* f.git(["push", "origin", "HEAD:refs/heads/main"]);
+  }
   const profile = {
     ...f.profile,
     version: 2,
@@ -1218,6 +1227,7 @@ const approvedDeploymentFixtureFor = Effect.fn("releaseFixture.approved")(functi
       ...f.profile.policy,
       target: { ...f.profile.policy.target, origin: a.policy.adapter.origin },
       deployment: a.policy,
+      ...(merge ? { merge } : {}),
       observation: observation ?? f.profile.policy.observation,
     },
   };
@@ -1279,6 +1289,427 @@ const approvedDeploymentFixtureFor = Effect.fn("releaseFixture.approved")(functi
   return { f, a, e, input, payload };
 });
 const approvedDeploymentFixture = approvedDeploymentFixtureFor();
+const mergePlan: WorkbenchMergePlan = {
+  schemaVersion: 1,
+  kind: "github_exact_ff",
+  host: "github.fixture.invalid:8443",
+  repository: "fixture/project",
+  repositoryId: "repository=",
+  ref: "refs/heads/main",
+  requiredChecks: [{ context: "release", appId: 1 }],
+};
+it.live(
+  "preparation pins real remote candidate, exact checks and protected merge identity into approved bytes",
+  () =>
+    Effect.gen(function* () {
+      const remote = yield* mergeFixture();
+      yield* Effect.gen(function* () {
+        const { e, f } = yield* approvedDeploymentFixtureFor(undefined, false, mergePlan);
+        expect(e.merge?.planDigest).toBe(releaseDigest(mergePlan));
+        expect(e.merge?.preflight.main?.sha).toBe(
+          (yield* f.git(["rev-parse", "main"])).stdout.trim(),
+        );
+        expect(e.merge?.preflight.candidate).toMatchObject({ sha: f.head, baseAncestor: true });
+        expect(e.merge?.preflight.requiredResults).toMatchObject([
+          { context: "release", appId: 1, headSha: f.head, state: "passed", conclusion: "success" },
+        ]);
+        expect(remote.attempts()).toBe(0);
+      }).pipe(
+        Effect.provide(layer),
+        Effect.provideService(ReleaseRefs.WorkbenchReleaseRefs, remote.service),
+      );
+    }).pipe(Effect.provide(systemDependencies)),
+);
+it.live.each([false, true])(
+  "merges only the accepted exact candidate and atomically completes its original delivery",
+  (unchanged) =>
+    Effect.gen(function* () {
+      const remote = yield* mergeFixture();
+      yield* Effect.gen(function* () {
+        const { f, a, input } = yield* approvedDeploymentFixtureFor(
+            { durationSeconds: 1, intervalSeconds: 1, consecutiveSuccesses: 2 },
+            unchanged,
+            mergePlan,
+          ),
+          deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", input);
+        yield* deployments.sync;
+        yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+        yield* TestClock.adjust("1 second");
+        const accepted = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          input.deploymentId,
+          scope,
+          2,
+        )).deployment.acceptance!;
+        expect(accepted.state).toBe("passed");
+        yield* deployments.sync;
+        const delivered = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+        expect(delivered.state).toBe("delivered");
+        expect(delivered.acceptance).toEqual(accepted);
+        expect(delivered.merge?.result?.commitSha).toBe(f.head);
+        expect(delivered.delivery).toMatchObject({
+          workItemVersionBefore: 1,
+          workItemVersionAfter: 2,
+          latestEventSequence: 1,
+          processedThroughSequence: 1,
+        });
+        expect(
+          (yield* f.git(["ls-remote", "origin", "refs/heads/main"])).stdout.split(/\s/)[0],
+        ).toBe(f.head);
+        expect(
+          (yield* f.sql<{
+            business_state: string;
+          }>`SELECT business_state FROM workbench_work_items WHERE id='item'`)[0]?.business_state,
+        ).toBe("completed");
+        expect(remote.attempts()).toBe(unchanged ? 0 : 1);
+        expect(a.writes()).toBe(unchanged ? 0 : 1);
+        const calls = a.requests();
+        yield* deployments.sync;
+        expect(a.requests()).toBe(calls);
+        expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment).toEqual(
+          delivered,
+        );
+      }).pipe(
+        Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer()))),
+        Effect.provideService(ReleaseRefs.WorkbenchReleaseRefs, remote.service),
+      );
+    }).pipe(Effect.provide(systemDependencies)),
+);
+it.live(
+  "recovers a lost exact-ref response across actual Native SQLite reopen without resending",
+  () =>
+    Effect.gen(function* () {
+      const cfg = yield* Config.ServerConfig,
+        path = yield* Path.Path,
+        remote = yield* mergeFixture();
+      const dbPath = path.join(cfg.stateDir, "issue18-merge-reopen.sqlite");
+      const nativeLayer = Deployment.layer.pipe(
+        Layer.provideMerge(Release.layer),
+        Layer.provideMerge(ReleaseAdapter.layer),
+        Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+        Layer.provideMerge(Layer.succeed(ReleaseRefs.WorkbenchReleaseRefs, remote.service)),
+      );
+      const firstScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const first = yield* Layer.buildWithScope(nativeLayer, firstScope);
+      const prepared = yield* approvedDeploymentFixtureFor(
+        { durationSeconds: 1, intervalSeconds: 1, consecutiveSuccesses: 2 },
+        false,
+        mergePlan,
+      ).pipe(Effect.provide(first));
+      const accepted = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", prepared.input);
+        yield* deployments.sync;
+        yield* deployments.awaitAcceptanceSample("queue", prepared.input.deploymentId, scope, 1);
+        yield* TestClock.adjust("1 second");
+        const accepted = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          2,
+        )).deployment.acceptance!;
+        remote.loseResponse();
+        yield* deployments.sync;
+        const unknown = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(unknown.merge).toMatchObject({
+          state: "unknown",
+          mutation: { state: "unknown" },
+          result: null,
+          recovery: null,
+          failure: null,
+        });
+        expect(remote.attempts()).toBe(1);
+        expect(prepared.a.writes()).toBe(1);
+        return accepted;
+      }).pipe(Effect.provide(first));
+      yield* Scope.close(firstScope, Exit.void);
+      prepared.a.reopenLedger();
+      const reopenedScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(reopenedScope, Exit.void));
+      const reopened = yield* Layer.buildWithScope(nativeLayer, reopenedScope);
+      const delivered = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        const delivered = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(delivered.state).toBe("delivered");
+        expect(delivered.acceptance).toEqual(accepted);
+        expect(delivered.merge?.result).toMatchObject({
+          kind: "observed_matching",
+          commitSha: prepared.f.head,
+          ackDigest: null,
+        });
+        expect(remote.attempts()).toBe(1);
+        expect(prepared.a.writes()).toBe(1);
+        return delivered;
+      }).pipe(Effect.provide(reopened));
+      yield* Scope.close(reopenedScope, Exit.void);
+      prepared.a.setAdapterAvailable(false);
+      const terminalScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(terminalScope, Exit.void));
+      const terminal = yield* Layer.buildWithScope(nativeLayer, terminalScope),
+        calls = prepared.a.requests();
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        expect(
+          (yield* deployments.get("queue", prepared.input.deploymentId, scope)).deployment,
+        ).toEqual(delivered);
+        expect(prepared.a.requests()).toBe(calls);
+        expect(remote.attempts()).toBe(1);
+      }).pipe(Effect.provide(terminal));
+      yield* Scope.close(terminalScope, Exit.void);
+    }).pipe(Effect.provide(systemDependencies.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live(
+  "reopens an interrupted durable intent before ref dispatch and keeps its outcome unknown",
+  () =>
+    Effect.gen(function* () {
+      const cfg = yield* Config.ServerConfig,
+        path = yield* Path.Path,
+        remote = yield* mergeFixture();
+      const nativeLayer = Deployment.layer.pipe(
+        Layer.provideMerge(Release.layer),
+        Layer.provideMerge(ReleaseAdapter.layer),
+        Layer.provideMerge(
+          Sqlite.layerFromPath(path.join(cfg.stateDir, "issue18-before-write.sqlite")),
+        ),
+        Layer.provideMerge(Layer.succeed(ReleaseRefs.WorkbenchReleaseRefs, remote.service)),
+      );
+      const firstScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const first = yield* Layer.buildWithScope(nativeLayer, firstScope);
+      const prepared = yield* approvedDeploymentFixtureFor(
+        { durationSeconds: 1, intervalSeconds: 1, consecutiveSuccesses: 2 },
+        false,
+        mergePlan,
+      ).pipe(Effect.provide(first));
+      const gate = yield* remote.gateNext("after_intent");
+      const frozen = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", prepared.input);
+        yield* deployments.sync;
+        yield* deployments.awaitAcceptanceSample("queue", prepared.input.deploymentId, scope, 1);
+        yield* TestClock.adjust("1 second");
+        yield* deployments.awaitAcceptanceSample("queue", prepared.input.deploymentId, scope, 2);
+        yield* deployments.sync.pipe(Effect.forkIn(firstScope));
+        yield* gate.reached;
+        return (yield* deployments.get("queue", prepared.input.deploymentId, scope)).deployment
+          .merge!;
+      }).pipe(Effect.provide(first));
+      expect(frozen.mutation.state).toBe("intent");
+      yield* Scope.close(firstScope, Exit.void);
+      yield* gate.release;
+      const reopenedScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(reopenedScope, Exit.void));
+      const reopened = yield* Layer.buildWithScope(nativeLayer, reopenedScope),
+        checks = prepared.a.checkCalls();
+      remote.failChecks(true);
+      prepared.a.setCheckFault("health", true);
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        const held = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(held.merge).toMatchObject({
+          state: "unknown",
+          result: null,
+          failure: null,
+          recovery: null,
+        });
+        expect(held.merge?.verification).toEqual(frozen.verification);
+        expect(held.merge?.freshReceipts).toEqual(frozen.freshReceipts);
+        expect(held.rollbackOperation).toBeNull();
+        expect(prepared.a.checkCalls()).toBe(checks);
+        expect(prepared.a.writes()).toBe(1);
+        expect(remote.attempts()).toBe(0);
+        expect(
+          (yield* prepared.f.git(["ls-remote", "origin", "refs/heads/main"])).stdout.split(/\s/)[0],
+        ).toBe(prepared.e.source.main.commitSha);
+      }).pipe(Effect.provide(reopened));
+      yield* Scope.close(reopenedScope, Exit.void);
+    }).pipe(Effect.provide(systemDependencies.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live.each([
+  "checks_failed",
+  "unchanged_checks",
+  "main_race",
+  "rollback_failure",
+  "local_health",
+  "late_work",
+] as const)("retains passed acceptance and original recovery authority for %s", (mode) =>
+  Effect.gen(function* () {
+    const remote = yield* mergeFixture();
+    yield* Effect.gen(function* () {
+      const { f, a, input, e } = yield* approvedDeploymentFixtureFor(
+          { durationSeconds: 1, intervalSeconds: 1, consecutiveSuccesses: 2 },
+          mode === "unchanged_checks",
+          mergePlan,
+        ),
+        deployments = yield* Deployment.WorkbenchDeployment;
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+      yield* TestClock.adjust("1 second");
+      const accepted = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        2,
+      )).deployment.acceptance!;
+      if (mode === "main_race") {
+        const gate = yield* remote.gateNext("after_intent");
+        const running = yield* Effect.forkChild(deployments.sync);
+        yield* gate.reached;
+        const tree = (yield* f.git(["rev-parse", `${f.head}^{tree}`])).stdout.trim();
+        const other = (yield* f.git([
+          "commit-tree",
+          tree,
+          "-p",
+          e.source.main.commitSha,
+          "-m",
+          "concurrent main",
+        ])).stdout.trim();
+        expect(other).toMatch(/^[a-f0-9]{40}$/);
+        expect(other).not.toBe(f.head);
+        expect((yield* f.git(["push", "origin", `${other}:refs/heads/concurrent`])).code).toBe(0);
+        expect(
+          (yield* f.git([
+            "--git-dir",
+            f.path.join(f.dir, "remote.git"),
+            "update-ref",
+            "refs/heads/main",
+            other,
+            e.source.main.commitSha,
+          ])).code,
+        ).toBe(0);
+        expect(
+          (yield* f.git(["ls-remote", "origin", "refs/heads/main"])).stdout.split(/\s/)[0],
+        ).toBe(other);
+        yield* gate.release;
+        yield* Fiber.join(running);
+      } else if (mode === "late_work") {
+        const gate = yield* remote.gateNext("after_apply"),
+          running = yield* Effect.forkChild(deployments.sync);
+        yield* gate.reached;
+        expect(
+          (yield* f.git(["ls-remote", "origin", "refs/heads/main"])).stdout.split(/\s/)[0],
+        ).toBe(f.head);
+        yield* f.sql`UPDATE workbench_work_items SET version=version+1,latest_event_sequence=latest_event_sequence+1 WHERE id='item'`;
+        yield* gate.release;
+        yield* Fiber.join(running);
+      } else {
+        if (mode === "local_health") a.setCheckFault("health", true);
+        else remote.failChecks(true);
+        if (mode === "rollback_failure") a.setMode("rollback_failure");
+        yield* deployments.sync;
+      }
+      const failed = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(failed.acceptance).toEqual(accepted);
+      expect(failed.merge?.state).toBe("failed");
+      expect(failed.merge?.failure?.reason).toBe(
+        mode === "main_race"
+          ? "merge_rejected"
+          : mode === "local_health"
+            ? "health_failed"
+            : mode === "late_work"
+              ? "work_changed"
+              : "checks_failed",
+      );
+      if (mode === "late_work") expect(failed.merge?.result?.commitSha).toBe(f.head);
+      expect(failed.merge?.recovery?.failureDigest).toBe(failed.merge?.failure?.digest);
+      expect(failed.delivery ?? null).toBeNull();
+      yield* deployments.sync;
+      const recovered = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(recovered.state).toBe(
+        mode === "rollback_failure"
+          ? "attention"
+          : mode === "unchanged_checks"
+            ? "failed_unchanged"
+            : "rolled_back",
+      );
+      expect(recovered.acceptance).toEqual(accepted);
+      expect(recovered.rollbackOperation?.id ?? null).toBe(
+        mode === "unchanged_checks" ? null : "rollback-operation",
+      );
+      expect(a.bytes()).toBe(
+        mode === "rollback_failure" || mode === "unchanged_checks" ? "candidate" : "prior-artifact",
+      );
+      if (mode === "unchanged_checks") expect(a.writes()).toBe(0);
+      expect(remote.attempts()).toBe(mode === "main_race" || mode === "late_work" ? 1 : 0);
+      expect(
+        (yield* f.sql<{
+          business_state: string;
+        }>`SELECT business_state FROM workbench_work_items WHERE id='item'`)[0]?.business_state,
+      ).toBe("awaiting_delivery");
+    }).pipe(
+      Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer()))),
+      Effect.provideService(ReleaseRefs.WorkbenchReleaseRefs, remote.service),
+    );
+  }).pipe(Effect.provide(systemDependencies)),
+);
+it.live(
+  "holds an uncertain durable ref intent without rerunning checks or restoring production",
+  () =>
+    Effect.gen(function* () {
+      const remote = yield* mergeFixture();
+      yield* Effect.gen(function* () {
+        const { f, a, input, e } = yield* approvedDeploymentFixtureFor(
+            { durationSeconds: 1, intervalSeconds: 1, consecutiveSuccesses: 2 },
+            false,
+            mergePlan,
+          ),
+          deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", input);
+        yield* deployments.sync;
+        yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+        yield* TestClock.adjust("1 second");
+        const accepted = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          input.deploymentId,
+          scope,
+          2,
+        )).deployment.acceptance!;
+        remote.uncertainWithoutWrite(true);
+        yield* deployments.sync;
+        const unknown = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+        expect(unknown.merge).toMatchObject({
+          state: "unknown",
+          mutation: { state: "unknown" },
+          failure: null,
+          recovery: null,
+          result: null,
+        });
+        const checks = a.checkCalls();
+        remote.failChecks(true);
+        a.setCheckFault("health", true);
+        yield* deployments.sync;
+        yield* deployments.sync;
+        const held = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+        expect(held.merge).toMatchObject({
+          state: "unknown",
+          failure: null,
+          recovery: null,
+          result: null,
+        });
+        expect(held.acceptance).toEqual(accepted);
+        expect(held.merge?.verification).toEqual(unknown.merge?.verification);
+        expect(held.rollbackOperation).toBeNull();
+        expect(a.checkCalls()).toBe(checks);
+        expect(a.writes()).toBe(1);
+        expect(remote.attempts()).toBe(0);
+        expect(
+          (yield* f.git(["ls-remote", "origin", "refs/heads/main"])).stdout.split(/\s/)[0],
+        ).toBe(e.source.main.commitSha);
+      }).pipe(
+        Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer()))),
+        Effect.provideService(ReleaseRefs.WorkbenchReleaseRefs, remote.service),
+      );
+    }).pipe(Effect.provide(systemDependencies)),
+);
 it.live("deploys only a committed approval's sealed bytes and preserves exact retry identity", () =>
   Effect.gen(function* () {
     const { a, input } = yield* approvedDeploymentFixture,

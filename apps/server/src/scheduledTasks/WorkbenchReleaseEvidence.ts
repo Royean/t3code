@@ -1,5 +1,7 @@
 import * as Verification from "./releaseVerification.ts";
-import type { WorkbenchOnlineReceipt } from "@t3tools/contracts";
+import * as ReleaseRefs from "./WorkbenchReleaseRefs.ts";
+import { mergeObservationReason } from "./releaseMergeProof.ts";
+import type { WorkbenchOnlineReceipt, WorkbenchMergeReason } from "@t3tools/contracts";
 import * as Adapter from "./WorkbenchReleaseAdapter.ts";
 import {
   WorkbenchReleaseHostProfile as HostProfileSchema,
@@ -29,6 +31,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -56,6 +59,14 @@ export type ReleaseDeploymentMaterial = {
   artifact: Uint8Array;
   rollback: Uint8Array;
 };
+export class ReleaseMergeMaterialError extends Schema.TaggedError<ReleaseMergeMaterialError>()(
+  "ReleaseMergeMaterialError",
+  { reason: Schema.String, known: Schema.Boolean, cause: Schema.Defect() },
+) {
+  override get message() {
+    return "Release merge material verification failed.";
+  }
+}
 type Scope = typeof WorkbenchAttentionScope.Type;
 type Task = {
   id: string;
@@ -198,6 +209,8 @@ const decodePrepareInput = Schema.decodeEffect(Schema.fromJsonString(WorkbenchRe
 const MAX_ARTIFACT = 64 * 1024 * 1024;
 const MAX_DIFF = 1024 * 1024;
 
+const isReleaseMergeMaterialError = Schema.is(ReleaseMergeMaterialError);
+
 export class WorkbenchReleaseEvidence extends Context.Service<
   WorkbenchReleaseEvidence,
   {
@@ -238,6 +251,18 @@ export class WorkbenchReleaseEvidence extends Context.Service<
       id: string,
       input: WorkbenchReleaseRevalidateInput & Verification.OnlineCheckInput,
     ) => Effect.Effect<WorkbenchOnlineReceipt, Verification.VerificationError>;
+    readonly mergeMaterial: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+      phase: "admission" | "finalization" | "recovery",
+    ) => Effect.Effect<ReleaseDeploymentMaterial & { cwd: string }, ReleaseMergeMaterialError>;
+    readonly preserveMergeSource: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+      ref: string,
+    ) => Effect.Effect<void, ReleaseMergeMaterialError>;
     readonly awaitPrepared: (
       queueId: string,
       id: string,
@@ -255,6 +280,7 @@ const make = Effect.gen(function* () {
     runner = yield* Runner.ProcessRunner,
     adapter = yield* Adapter.WorkbenchReleaseAdapter;
   const verificationExecutor = yield* Verification.make;
+  const releaseRefs = yield* Effect.serviceOption(ReleaseRefs.WorkbenchReleaseRefs);
   const serviceScope = yield* Effect.scope;
   const context = Context.make(FileSystem.FileSystem, fs).pipe(
     Context.add(Path.Path, path),
@@ -1261,6 +1287,34 @@ const make = Effect.gen(function* () {
             ),
           )
       : undefined;
+    const merge = p.policy.merge
+      ? yield* Effect.gen(function* () {
+          if (Option.isNone(releaseRefs)) return yield* problem("preflight_failed");
+          const sourceRemote = yield* remoteDefinition(initial.real, p.policy.main);
+          if (!releaseRefs.value.matchesSource(sourceRemote.url, p.policy.merge!))
+            return yield* problem("binding_changed");
+          const subject = {
+            baseSha: initial.base,
+            sourceSha: initial.head,
+            sourceTreeSha: initial.tree,
+          };
+          const preflight = yield* releaseRefs.value
+            .inspect({ cwd: initial.real, plan: p.policy.merge!, subject })
+            .pipe(Effect.mapError((cause) => causedProblem("source", "preflight_failed", cause)));
+          const reason = mergeObservationReason(p.policy.merge!, subject, preflight);
+          if (reason)
+            return yield* causedProblem(
+              "source",
+              "preflight_failed",
+              new ReleaseRefs.ReleaseRefsError({ reason, stage: "merge_preflight" }),
+            );
+          return {
+            schemaVersion: 1 as const,
+            planDigest: releaseDigest(p.policy.merge),
+            preflight,
+          };
+        })
+      : undefined;
     const finalProfile = yield* profile(input.profileId, input.profileDigest, input.projectId);
     const finalSource = yield* source(queueId, input, finalProfile);
     if (finalSource.base !== initial.base) return yield* problem("base_changed");
@@ -1295,6 +1349,7 @@ const make = Effect.gen(function* () {
       w = initial.task;
     const unsigned = {
       verification,
+      ...(merge ? { merge } : {}),
       ...(deployment ? { deployment } : {}),
       schemaVersion: 1 as const,
       id: `evidence:${releaseHash(id)}`,
@@ -1435,7 +1490,15 @@ const make = Effect.gen(function* () {
             createdAt: now,
             updatedAt: now,
           };
-          yield* sql`INSERT INTO workbench_release_preparations(id,queue_id,controller_id,project_id,tracking_id,work_item_id,input_json,profile_json,snapshot_json,preparation_json,state,created_at,updated_at) VALUES(${input.preparationId},${queueId},${input.controllerId},${input.projectId},${input.expectedTrackingId},${input.workItemId},${canonicalReleaseJson(input)},${canonicalReleaseJson(registered)},${canonicalReleaseJson(initial)},${canonicalReleaseJson(p)},'queued',${now},${now})`;
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const current = yield* task(queueId, input);
+              if (canonicalReleaseJson(current) !== canonicalReleaseJson(w))
+                return yield* new WorkbenchReleaseError({ reason: "stale_state" });
+              yield* sql`INSERT OR IGNORE INTO workbench_release_obligations(work_item_id,task_created_at,cycle_number,preparation_id,created_at) VALUES(${w.id},${w.task_created_at},${w.cycle_number},${input.preparationId},${now})`;
+              yield* sql`INSERT INTO workbench_release_preparations(id,queue_id,controller_id,project_id,tracking_id,work_item_id,input_json,profile_json,snapshot_json,preparation_json,state,created_at,updated_at) VALUES(${input.preparationId},${queueId},${input.controllerId},${input.projectId},${input.expectedTrackingId},${input.workItemId},${canonicalReleaseJson(input)},${canonicalReleaseJson(registered)},${canonicalReleaseJson(initial)},${canonicalReleaseJson(p)},'queued',${now},${now})`;
+            }),
+          );
           const done = yield* Deferred.make<void>();
           jobs.set(input.preparationId, done);
           yield* produce(queueId, input, registered, initial).pipe(
@@ -1571,6 +1634,81 @@ const make = Effect.gen(function* () {
       return yield* new WorkbenchReleaseError({ reason: "conflict" });
     return material;
   });
+  const mergeFailure = (cause: unknown) => {
+    const mapping: Record<string, WorkbenchMergeReason> = {
+      base_changed: "main_changed",
+      base_not_integrated: "main_changed",
+      profile_changed: "profile_changed",
+      profile_missing: "profile_changed",
+      binding_changed: "work_changed",
+      task_not_ready: "work_changed",
+      work_active: "work_changed",
+      source_changed: "source_changed",
+      source_dirty: "source_changed",
+      artifact_changed: "candidate_changed",
+      rollback_mismatch: "candidate_changed",
+    };
+    const reason = isPreparationProblem(cause) ? mapping[cause.reason] : undefined;
+    return new ReleaseMergeMaterialError({
+      reason: reason ?? "state_unknown",
+      known: reason !== undefined,
+      cause,
+    });
+  };
+  const mergeMaterial = Effect.fn("WorkbenchReleaseEvidence.mergeMaterial")(
+    function* (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+      phase: "admission" | "finalization" | "recovery",
+    ) {
+      const material = yield* admittedMaterial(queueId, id, input),
+        row = yield* read(queueId, id, input),
+        original = (yield* decodeJson(row.snapshot_json)) as Source;
+      if (phase === "recovery") return { ...material, cwd: original.real };
+      const prep = yield* decodePrepareInput(row.input_json),
+        registered = yield* profile(prep.profileId, prep.profileDigest, prep.projectId);
+      const observed = yield* source(queueId, prep, registered);
+      if (observed.base !== (phase === "admission" ? original.base : original.head))
+        return yield* problem("base_changed");
+      if (
+        canonicalReleaseJson({ ...observed, base: original.base }) !==
+        canonicalReleaseJson(original)
+      )
+        return yield* problem("source_changed");
+      yield* verificationExecutor.validate(directory(id), material.evidence, registered);
+      const finalProfile = yield* profile(prep.profileId, prep.profileDigest, prep.projectId);
+      yield* localFence(queueId, prep, observed, finalProfile.policy.main);
+      return { ...material, cwd: original.real };
+    },
+    Effect.provide(context),
+    Effect.mapError(mergeFailure),
+  );
+  const preserveMergeSource = Effect.fn("WorkbenchReleaseEvidence.preserveMergeSource")(
+    function* (queueId: string, id: string, input: WorkbenchReleaseRevalidateInput, ref: string) {
+      if (!/^refs\/t3\/workbench-handoffs\/[a-f0-9]{64}$/.test(ref))
+        return yield* problem("binding_changed");
+      const material = yield* mergeMaterial(queueId, id, input, "finalization");
+      const current = yield* git.execute({
+        operation: "release.handoff.read",
+        cwd: material.cwd,
+        args: ["rev-parse", "--verify", ref],
+        allowNonZeroExit: true,
+      });
+      const sha = material.evidence.source.commitSha;
+      if (current.exitCode === 0) {
+        if (current.stdout.trim() !== sha) return yield* problem("source_changed");
+        return;
+      }
+      yield* git.execute({
+        operation: "release.handoff.create",
+        cwd: material.cwd,
+        args: ["update-ref", ref, sha, "0".repeat(sha.length)],
+      });
+    },
+    Effect.provide(context),
+    Effect.mapError((cause) => (isReleaseMergeMaterialError(cause) ? cause : mergeFailure(cause))),
+  );
   const runOnlineCheck = Effect.fn("WorkbenchReleaseEvidence.runOnlineCheck")(function* (
     queueId: string,
     id: string,
@@ -1611,6 +1749,8 @@ const make = Effect.gen(function* () {
     admissionMaterial,
     admittedMaterial,
     runOnlineCheck,
+    mergeMaterial,
+    preserveMergeSource,
   });
 });
 export const layer = Layer.effect(WorkbenchReleaseEvidence, make);

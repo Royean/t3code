@@ -1,50 +1,17 @@
 import * as Schema from "effect/Schema";
 import { ProjectId, ScheduledTaskId, ThreadId } from "./baseSchemas.ts";
+import { workbenchMergeSummary, WorkbenchDeliveryReceipt } from "./workbenchMerge.ts";
 
-const DeploymentIso = Schema.String.check(
-  Schema.isMaxLength(64),
-  Schema.makeFilter((value) => {
-    const m =
-      /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(
-        value,
-      );
-    if (!m || !Number.isFinite(Date.parse(value))) return false;
-    const year = Number(m[1]),
-      month = Number(m[2]),
-      day = Number(m[3]);
-    const days = [
-      31,
-      year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
-      31,
-      30,
-      31,
-      30,
-      31,
-      31,
-      30,
-      31,
-      30,
-      31,
-    ];
-    return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]!;
-  }),
-);
-const Id = Schema.String.check(
-  Schema.isMinLength(1),
-  Schema.isMaxLength(200),
-  Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/),
-);
-const Hash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
-const GitSha = Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/));
-const Count = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
-const Positive = Schema.Int.check(
-  Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-);
-const Text = Schema.String.check(
-  Schema.isMinLength(1),
-  Schema.isMaxLength(1024),
-  Schema.isPattern(/^[^\x00-\x1f\x7f]+$/),
-);
+import {
+  ReleaseIso as DeploymentIso,
+  ReleaseId as Id,
+  ReleaseHash as Hash,
+  ReleaseGitSha as GitSha,
+  ReleaseCount as Count,
+  ReleasePositive as Positive,
+  ReleaseText as Text,
+} from "./workbenchReleasePrimitives.ts";
+
 const Blob = Schema.Struct({
   sha256: Hash,
   bytes: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 64 * 1024 * 1024 })),
@@ -322,6 +289,8 @@ export const WorkbenchOnlineReceipt = Schema.Struct({
   durationMilliseconds: Schema.NullOr(Count),
 });
 export type WorkbenchOnlineReceipt = typeof WorkbenchOnlineReceipt.Type;
+export const WorkbenchMergeSummary = workbenchMergeSummary(WorkbenchOnlineReceipt);
+export type WorkbenchMergeSummary = typeof WorkbenchMergeSummary.Type;
 export const WorkbenchAcceptanceSample = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   id: Id,
@@ -427,6 +396,8 @@ export const WorkbenchAcceptance = Schema.Struct({
 });
 export type WorkbenchAcceptance = typeof WorkbenchAcceptance.Type;
 export const WorkbenchDeployment = Schema.Struct({
+  merge: Schema.optional(Schema.NullOr(WorkbenchMergeSummary)),
+  delivery: Schema.optional(Schema.NullOr(WorkbenchDeliveryReceipt)),
   acceptance: Schema.optional(Schema.NullOr(WorkbenchAcceptance)),
   id: Id,
   authorizationDigest: Hash,
@@ -445,6 +416,7 @@ export const WorkbenchDeployment = Schema.Struct({
     "awaiting_claim",
     "deploying",
     "deployed",
+    "delivered",
     "deploy_unknown",
     "rolling_back",
     "rolled_back",

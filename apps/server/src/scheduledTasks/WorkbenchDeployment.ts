@@ -31,6 +31,7 @@ import {
   publicDeploymentPlan,
 } from "./workbenchReleaseProfile.ts";
 import { logicalReleaseIso } from "./releaseVerification.ts";
+import * as MergeLifecycle from "./releaseMerge.ts";
 
 type Scope = typeof WorkbenchAttentionScope.Type;
 type Row = {
@@ -103,6 +104,7 @@ const make = Effect.gen(function* () {
     locks = yield* KeyedLock.make<string>();
   const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const acceptance = yield* Acceptance.make((id, effect) => locks.withLock(id, effect));
+  const merge = yield* MergeLifecycle.make;
   const decodeInput = Schema.decodeEffect(Schema.fromJsonString(WorkbenchDeploymentAdmitInput));
   const decodeDeployment = Schema.decodeEffect(Schema.fromJsonString(DeploymentSchema));
   const decodeProfile = Schema.decodeEffect(Schema.fromJsonString(WorkbenchReleaseHostProfile));
@@ -389,7 +391,8 @@ const make = Effect.gen(function* () {
     )
       return yield* new Adapter.ReleaseAdapterError({ reason: "permit_invalid", stage: "commit" });
     if (d.claimState !== "committed") yield* save({ claimState: "committed" });
-    const acceptanceFailure = yield* acceptance.failureRequested(d);
+    const releaseFailure =
+      (yield* acceptance.failureRequested(d)) || (yield* merge.failureRequested(d));
     const operation = Effect.fn("WorkbenchDeployment.operation")(function* (
       kind: "deploy" | "rollback",
       allowPut: boolean,
@@ -439,7 +442,7 @@ const make = Effect.gen(function* () {
       yield* save({ state: "rolling_back", reasons: ["deployment_failed"] });
       const rollback = yield* operation(
         "rollback",
-        (!physicallySettled || acceptanceFailure) && attributable(before),
+        (!physicallySettled || releaseFailure) && attributable(before),
       );
       if (!terminal(rollback)) {
         yield* save({
@@ -490,9 +493,9 @@ const make = Effect.gen(function* () {
       return;
     }
     if (
-      (!alreadyDeployed || acceptanceFailure) &&
+      (!alreadyDeployed || releaseFailure) &&
       attributable(target) &&
-      (acceptanceFailure ||
+      (releaseFailure ||
         deploy.state === "failed" ||
         deploy.result?.effect === "partial" ||
         target.state !== "consistent" ||
@@ -513,6 +516,15 @@ const make = Effect.gen(function* () {
     // recovery and real probes must still run; only their successful coverage needs it.
     if (deploy.state === "succeeded" && (d.acceptance || candidateActivation))
       yield* acceptance.schedule(d.id);
+    if (
+      !releaseFailure &&
+      profile.policy.merge &&
+      material.evidence.merge &&
+      d.acceptance?.state === "passed"
+    ) {
+      yield* merge.reconcile(d.id);
+      return;
+    }
     const observation = yield* adapter.observe(profile);
     if (observation.target.revision < target.revision)
       return yield* new Adapter.ReleaseAdapterError({
@@ -532,7 +544,7 @@ const make = Effect.gen(function* () {
       same(version, p.desired);
     const own = attributable(verifiedTarget);
     if (
-      acceptanceFailure &&
+      releaseFailure &&
       deploy.result?.effect === "unchanged" &&
       baseline &&
       verifiedTarget.revision === p.baseline.revision
@@ -541,7 +553,7 @@ const make = Effect.gen(function* () {
       return;
     }
     if (
-      !acceptanceFailure &&
+      !releaseFailure &&
       deploy.state === "succeeded" &&
       desired &&
       (deploy.result?.effect === "changed"
@@ -562,7 +574,7 @@ const make = Effect.gen(function* () {
       yield* save({ state: "failed_unchanged", reasons: ["deployment_failed"] });
       return;
     }
-    if ((!alreadyDeployed || acceptanceFailure) && own) {
+    if ((!alreadyDeployed || releaseFailure) && own) {
       yield* reconcileRollback(verifiedTarget);
       return;
     }
@@ -570,14 +582,18 @@ const make = Effect.gen(function* () {
   });
   const sync = Effect.gen(function* () {
     const rows =
-      yield* sql<Row>`SELECT * FROM workbench_deployments WHERE state NOT IN ('rejected','rolled_back','failed_unchanged') ORDER BY created_at,id`;
+      yield* sql<Row>`SELECT * FROM workbench_deployments WHERE state NOT IN ('rejected','rolled_back','failed_unchanged','delivered') ORDER BY created_at,id`;
     for (const candidate of rows)
       yield* locks.withLock(
         candidate.id,
         Effect.gen(function* () {
           const [row] =
             yield* sql<Row>`SELECT * FROM workbench_deployments WHERE id=${candidate.id}`;
-          if (!row || ["rejected", "rolled_back", "failed_unchanged"].includes(row.state)) return;
+          if (
+            !row ||
+            ["rejected", "rolled_back", "failed_unchanged", "delivered"].includes(row.state)
+          )
+            return;
           yield* step(row).pipe(
             Effect.catch((cause) =>
               Effect.gen(function* () {

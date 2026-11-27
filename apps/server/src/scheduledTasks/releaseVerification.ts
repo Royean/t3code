@@ -85,6 +85,7 @@ export type OnlineCheckInput = {
   runnerEpoch: string;
   candidate: typeof WorkbenchDeploymentBasis.Type;
   activationRevision: number;
+  onStarted?: (clock: { wall: number; mono: bigint }) => Effect.Effect<void, VerificationError>;
 };
 export const clockPair = Effect.gen(function* () {
   const clock = yield* Clock.Clock;
@@ -278,6 +279,7 @@ export const make = Effect.gen(function* () {
       });
       yield* verify();
       const started = yield* clockPair;
+      if (input.onStarted) yield* input.onStarted(started);
       const execution = yield* runner
         .run({
           command: argv[0]!,
