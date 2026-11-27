@@ -30,6 +30,7 @@ import {
   releaseHash,
   publicDeploymentPlan,
 } from "./workbenchReleaseProfile.ts";
+import { logicalReleaseIso } from "./releaseVerification.ts";
 
 type Scope = typeof WorkbenchAttentionScope.Type;
 type Row = {
@@ -296,9 +297,7 @@ const make = Effect.gen(function* () {
         ...d,
         ...patch,
         version: d.version + 1,
-        updatedAt: DateTime.formatIso(
-          DateTime.makeUnsafe(Math.max(Date.parse(currentStamp), Date.parse(d.updatedAt))),
-        ),
+        updatedAt: logicalReleaseIso(d.updatedAt, Date.parse(currentStamp)),
       };
       const changed =
         yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt},settled_state=CASE WHEN settled_state IS NULL AND ${["deployed", "rolled_back", "failed_unchanged"].includes(next.state)} THEN ${next.state} ELSE settled_state END WHERE id=${d.id} AND deployment_json=${canonicalReleaseJson(d)} RETURNING id`;
@@ -502,6 +501,18 @@ const make = Effect.gen(function* () {
       yield* reconcileRollback(target);
       return;
     }
+    const candidateActivation =
+      target.state === "consistent" &&
+      same(target.basis, p.desired) &&
+      (deploy.result?.effect === "changed"
+        ? attributable(target)
+        : deploy.result?.effect === "unchanged" &&
+          same(p.desired, p.baseline.basis) &&
+          target.revision === p.baseline.revision);
+    // The independent endpoint may be broken by the candidate. Durable failure
+    // recovery and real probes must still run; only their successful coverage needs it.
+    if (deploy.state === "succeeded" && (d.acceptance || candidateActivation))
+      yield* acceptance.schedule(d.id);
     const observation = yield* adapter.observe(profile);
     if (observation.target.revision < target.revision)
       return yield* new Adapter.ReleaseAdapterError({
@@ -540,7 +551,6 @@ const make = Effect.gen(function* () {
           verifiedTarget.revision === p.baseline.revision)
     ) {
       yield* save({ state: "deployed", reasons: [] });
-      yield* acceptance.schedule(d.id);
       return;
     }
     if (
@@ -601,11 +611,7 @@ const make = Effect.gen(function* () {
                         ? "unknown"
                         : d.claimState,
                   version: d.version + 1,
-                  updatedAt: DateTime.formatIso(
-                    DateTime.makeUnsafe(
-                      Math.max(Date.parse(observedStamp), Date.parse(d.updatedAt)),
-                    ),
-                  ),
+                  updatedAt: logicalReleaseIso(d.updatedAt, Date.parse(observedStamp)),
                 };
                 yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt} WHERE id=${d.id} AND deployment_json=${latest.deployment_json}`;
               }),
@@ -630,9 +636,7 @@ const make = Effect.gen(function* () {
       state: "deploy_unknown",
       reasons: ["state_unknown"],
       version: d.version + 1,
-      updatedAt: DateTime.formatIso(
-        DateTime.makeUnsafe(Math.max(Date.parse(d.updatedAt), Date.parse(wall))),
-      ),
+      updatedAt: logicalReleaseIso(d.updatedAt, Date.parse(wall)),
     };
     yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt} WHERE id=${d.id} AND deployment_json=${row.deployment_json}`;
   }

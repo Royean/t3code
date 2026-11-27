@@ -94,6 +94,8 @@ export const clockPair = Effect.gen(function* () {
   }));
 });
 export const auditIso = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(millis));
+export const logicalReleaseIso = (previous: string, millis: number) =>
+  auditIso(Math.max(Date.parse(previous), millis));
 
 export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem,

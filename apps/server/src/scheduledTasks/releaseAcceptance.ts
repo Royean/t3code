@@ -1,5 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Each scoped runner needs a fresh opaque epoch even when a test clock restarts.
-import * as NodeCrypto from "node:crypto";
 import {
   WorkbenchDeployment,
   WorkbenchDeploymentAdmitInput,
@@ -15,11 +13,18 @@ import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Random from "effect/Random";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as SqlError from "effect/sql/SqlError";
 import * as Evidence from "./WorkbenchReleaseEvidence.ts";
 import * as Adapter from "./WorkbenchReleaseAdapter.ts";
-import { acceptancePolicy, clockPair, auditIso, VerificationError } from "./releaseVerification.ts";
+import {
+  acceptancePolicy,
+  clockPair,
+  auditIso,
+  logicalReleaseIso,
+  VerificationError,
+} from "./releaseVerification.ts";
 import { canonicalReleaseJson, releaseDigest, releaseHash } from "./workbenchReleaseProfile.ts";
 
 type Lock = <A, E, R>(id: string, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
@@ -45,8 +50,6 @@ const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const isVerificationError = Schema.is(VerificationError);
 const same = (a: unknown, b: unknown) => canonicalReleaseJson(a) === canonicalReleaseJson(b);
 const opaque = (kind: string, value: string) => `${kind}:${releaseHash(value)}`;
-const logicalIso = (previous: string, wall: number) =>
-  auditIso(Math.max(Date.parse(previous), wall));
 const hardStop = (a: WorkbenchAcceptance) =>
   a.state === "passed" ||
   a.state === "failed" ||
@@ -130,7 +133,7 @@ export const make = Effect.fn("ReleaseAcceptance.make")(function* (withLock: Loc
   const started = yield* clockPair,
     epoch = opaque(
       "runner",
-      `${started.wall}:${started.mono}:${yield* Effect.sync(() => NodeCrypto.randomUUID())}`,
+      `${started.wall}:${started.mono}:${yield* Random.nextInt}:${yield* Random.nextInt}:${yield* Random.nextInt}:${yield* Random.nextInt}`,
     );
   const workers = yield* Semaphore.make(2),
     jobs = new Map<string, Deferred.Deferred<void>>();
@@ -182,13 +185,13 @@ export const make = Effect.fn("ReleaseAcceptance.make")(function* (withLock: Loc
     const acceptance: WorkbenchAcceptance = {
       ...a,
       version: (d.acceptance?.version ?? 0) + 1,
-      updatedAt: logicalIso(d.acceptance?.updatedAt ?? d.updatedAt, pair.wall),
+      updatedAt: logicalReleaseIso(d.acceptance?.updatedAt ?? d.updatedAt, pair.wall),
     };
     const next = {
       ...d,
       acceptance,
       version: d.version + 1,
-      updatedAt: logicalIso(d.updatedAt, pair.wall),
+      updatedAt: logicalReleaseIso(d.updatedAt, pair.wall),
     };
     yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -298,8 +301,8 @@ export const make = Effect.fn("ReleaseAcceptance.make")(function* (withLock: Loc
           }),
         },
         failure: null,
-        createdAt: logicalIso(d.updatedAt, p.wall),
-        updatedAt: logicalIso(d.updatedAt, p.wall),
+        createdAt: logicalReleaseIso(d.updatedAt, p.wall),
+        updatedAt: logicalReleaseIso(d.updatedAt, p.wall),
         observedAt: null,
         completedAt: null,
       };
@@ -796,7 +799,7 @@ export const make = Effect.fn("ReleaseAcceptance.make")(function* (withLock: Loc
       ),
       Effect.ensuring(Effect.sync(() => jobs.delete(id))),
       Effect.ensuring(Deferred.succeed(done, undefined)),
-      Effect.forkIn(scope),
+      Effect.forkIn(scope, { startImmediately: true }),
     );
   });
   const awaitSample = Effect.fn("ReleaseAcceptance.awaitSample")(function* (

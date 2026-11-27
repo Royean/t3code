@@ -258,6 +258,14 @@ it.live(
       expect(prepared.state).toBe("ready");
       const evidence = prepared.evidence!;
       expect(evidence.source.commitSha).toBe(f.head);
+      expect(evidence.verification).toMatchObject({
+        schemaVersion: 1,
+        semanticsVersion: 1,
+        sourceTreeSha: evidence.source.treeSha,
+      });
+      expect(evidence.verification?.archive.bytes).toBeGreaterThan(0);
+      expect(evidence.verification?.archive.sha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(evidence.verification?.manifestDigest).toMatch(/^[a-f0-9]{64}$/);
       expect(evidence.artifact.sha256).toBe(releaseHash("candidate"));
       expect(evidence.receipts.map((r) => r.role)).toEqual([
         "build",
@@ -1743,20 +1751,6 @@ it.live.each(["before", "partial"] as const)(
     }).pipe(Effect.provide(dependencies)),
 );
 
-it.live("seals verification source and exact definitions in new approved evidence", () =>
-  Effect.gen(function* () {
-    const { e } = yield* approvedDeploymentFixture;
-    expect(e.verification).toMatchObject({
-      schemaVersion: 1,
-      semanticsVersion: 1,
-      sourceTreeSha: e.source.treeSha,
-    });
-    expect(e.verification?.archive.bytes).toBeGreaterThan(0);
-    expect(e.verification?.archive.sha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(e.verification?.manifestDigest).toMatch(/^[a-f0-9]{64}$/);
-  }).pipe(Effect.provide(layer)),
-);
-
 it.live(
   "executes frozen health and core against the actual online target after the source project drifts",
   () =>
@@ -2287,12 +2281,18 @@ it.live(
       yield* Scope.close(firstScope, Exit.void);
       target.release();
       yield* target.completed;
+      prepared.a.setVersionFault("http500", true);
       const reopenedScope = yield* Scope.make();
       yield* Effect.addFinalizer(() => Scope.close(reopenedScope, Exit.void));
       const reopened = yield* Layer.buildWithScope(nativeLayer, reopenedScope);
       yield* Effect.gen(function* () {
         const deployments = yield* Deployment.WorkbenchDeployment;
         yield* deployments.sync;
+        yield* deployments.admit("queue", prepared.input);
+        expect(
+          (yield* deployments.get("queue", prepared.input.deploymentId, scope)).deployment
+            .acceptance?.state,
+        ).toBe("failed");
         const finalized = (yield* deployments.awaitAcceptanceSample(
           "queue",
           prepared.input.deploymentId,
@@ -2324,13 +2324,18 @@ it.live.each(["candidate", "always"] as const)(
     Effect.gen(function* () {
       const { a, input } = yield* approvedDeploymentFixture,
         deployments = yield* Deployment.WorkbenchDeployment,
-        gate = a.gateNext("core_check");
+        gate = a.gateNext("after_apply");
       a.setCheckFault("core", true);
       yield* deployments.admit("queue", input);
       yield* gate.reached;
       a.setVersionFault("http500", fault === "candidate");
       gate.release();
       yield* gate.completed;
+      yield* deployments.sync;
+      yield* deployments.admit("queue", input);
+      expect(
+        (yield* deployments.get("queue", input.deploymentId, scope)).deployment.acceptance,
+      ).toBeDefined();
       const failed = (yield* deployments.awaitAcceptanceSample(
         "queue",
         input.deploymentId,
