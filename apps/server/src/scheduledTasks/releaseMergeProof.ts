@@ -23,10 +23,11 @@ export function mergeObservationReason(
   )
     return "identity_mismatch";
   if (pinned && observed.actor.id !== pinned.actor.id) return "actor_changed";
+  if (observed.protection.state === "unavailable") return "unavailable";
+  if (observed.protection.state === "unsupported") return "unsupported";
+  if (!observed.protection.policyDigest) return "invalid_response";
   if (pinned && observed.protection.policyDigest !== pinned.protection.policyDigest)
     return "policy_changed";
-  if (observed.protection.state !== "supported" || !observed.protection.policyDigest)
-    return observed.protection.state === "unavailable" ? "unavailable" : "unsupported";
   if (!observed.candidate) return "candidate_unavailable";
   if (
     observed.candidate.sha !== subject.sourceSha ||

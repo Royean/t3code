@@ -29,7 +29,7 @@ import { ExactReleaseRefsGraphQLGroup } from "./exactReleaseRefs.graphql.ts";
 
 class ExactReleaseRefsError extends Schema.TaggedError<ExactReleaseRefsError>()(
   "ExactReleaseRefsError",
-  { reason: WorkbenchMergeRemoteReason },
+  { reason: WorkbenchMergeRemoteReason, cause: Schema.optional(Schema.Defect()) },
 ) {}
 const fail = (reason: WorkbenchMergeRemoteReason) => new ExactReleaseRefsError({ reason });
 const ProviderId = Schema.String.check(
@@ -171,13 +171,18 @@ export const make = Effect.gen(function* () {
   ).pipe(Effect.provide(GitHubGraphQlClient.layer));
   const hash = (value: unknown) =>
     crypto.digestHex(Digest.sha256, new TextEncoder().encode(stableStringify(value)));
-  const safeError = (error: unknown) => (isRefsError(error) ? error : fail("unavailable"));
+  const safeError = (error: unknown) =>
+    isRefsError(error) ? error : new ExactReleaseRefsError({ reason: "unavailable", cause: error });
 
   const validate = Effect.fn("GitHubExactReleaseRefs.validate")(function* (
     input: ExactReleaseRefsInput,
   ) {
-    yield* decodePlan(input.plan).pipe(Effect.mapError(() => fail("identity_mismatch")));
-    yield* decodeSubject(input.subject).pipe(Effect.mapError(() => fail("candidate_changed")));
+    yield* decodePlan(input.plan).pipe(
+      Effect.mapError((cause) => new ExactReleaseRefsError({ reason: "identity_mismatch", cause })),
+    );
+    yield* decodeSubject(input.subject).pipe(
+      Effect.mapError((cause) => new ExactReleaseRefsError({ reason: "candidate_changed", cause })),
+    );
   });
 
   const inspectAs = Effect.fn("GitHubExactReleaseRefs.inspect")(function* (
@@ -201,7 +206,9 @@ export const make = Effect.gen(function* () {
             response.truncated || response.invalidUtf8
               ? Effect.fail(fail("invalid_response"))
               : Schema.decodeEffect(Schema.fromJsonString(schema))(response.body).pipe(
-                  Effect.mapError(() => fail("invalid_response")),
+                  Effect.mapError(
+                    (cause) => new ExactReleaseRefsError({ reason: "invalid_response", cause }),
+                  ),
                 ),
           ),
         );
@@ -212,8 +219,12 @@ export const make = Effect.gen(function* () {
       repository.html_url.toLowerCase() !== `https://${plan.host}/${plan.repository}`.toLowerCase()
     )
       return yield* fail("identity_mismatch");
-    yield* decodeProviderId(actor.accountId).pipe(Effect.mapError(() => fail("identity_mismatch")));
-    yield* decodeProviderId(actor.viewer).pipe(Effect.mapError(() => fail("identity_mismatch")));
+    yield* decodeProviderId(actor.accountId).pipe(
+      Effect.mapError((cause) => new ExactReleaseRefsError({ reason: "identity_mismatch", cause })),
+    );
+    yield* decodeProviderId(actor.viewer).pipe(
+      Effect.mapError((cause) => new ExactReleaseRefsError({ reason: "identity_mismatch", cause })),
+    );
     const ref = yield* read(
       `${root}/git/ref/${plan.ref.slice("refs/".length).split("/").map(encodeURIComponent).join("/")}`,
       Ref,
@@ -295,7 +306,9 @@ export const make = Effect.gen(function* () {
           Schema.Record(Schema.String, Schema.Unknown),
         );
         const legacy = yield* decodeProtection(legacyRaw).pipe(
-          Effect.mapError(() => fail("invalid_response")),
+          Effect.mapError(
+            (cause) => new ExactReleaseRefsError({ reason: "invalid_response", cause }),
+          ),
         );
         const rules: Array<typeof Rule.Type> = [];
         for (let page = 1; ; page++) {
@@ -319,7 +332,9 @@ export const make = Effect.gen(function* () {
         );
         const rulesets = yield* Effect.forEach(rawRulesets, (raw, index) =>
           decodeRuleset(raw).pipe(
-            Effect.mapError(() => fail("invalid_response")),
+            Effect.mapError(
+              (cause) => new ExactReleaseRefsError({ reason: "invalid_response", cause }),
+            ),
             Effect.filterOrFail(
               (set) => set.id === rulesetIds[index],
               () => fail("invalid_response"),
@@ -467,7 +482,7 @@ export const make = Effect.gen(function* () {
       observedAt: DateTime.formatIso(yield* DateTime.now),
     } as const;
     return yield* decodeObservation(observation).pipe(
-      Effect.mapError(() => fail("invalid_response")),
+      Effect.mapError((cause) => new ExactReleaseRefsError({ reason: "invalid_response", cause })),
     );
   });
 
@@ -514,7 +529,13 @@ export const make = Effect.gen(function* () {
     );
   const exactFF: ExactReleaseRefs["exactFF"] = (input: ExactReleaseFFInput) =>
     validate(input).pipe(
-      Effect.andThen(decodePins(input).pipe(Effect.mapError(() => fail("identity_mismatch")))),
+      Effect.andThen(
+        decodePins(input).pipe(
+          Effect.mapError(
+            (cause) => new ExactReleaseRefsError({ reason: "identity_mismatch", cause }),
+          ),
+        ),
+      ),
       Effect.andThen(
         auth.withVerifiedCredential(
           { cwd: input.cwd, host: input.plan.host, repository: input.plan.repository },

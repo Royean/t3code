@@ -2,6 +2,7 @@ import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
 import * as ReleaseRefs from "./WorkbenchReleaseRefs.ts";
 import { mergeFixture } from "./releaseMergeFixture.ts";
+import { completeAcceptedDelivery } from "./WorkbenchWorkItems.ts";
 import type { WorkbenchMergePlan } from "@t3tools/contracts";
 import { canonicalReleaseJson, releaseDigest } from "./workbenchReleaseProfile.ts";
 import * as TestClock from "effect/testing/TestClock";
@@ -220,6 +221,7 @@ const fixture = Effect.gen(function* () {
   yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES('project','Fixture',${repo},${JSON.stringify(scripts)},${time},${time})`;
   yield* sql`INSERT INTO scheduled_tasks(task_id,title,prompt,enabled,schedule_json,project_id,thread_id,thread_mode,workspace_strategy_json,model_selection_json,runtime_mode,interaction_mode,created_by,creation_source,created_at,updated_at,last_run_status,run_count) VALUES('task','Fixture','Fixture',1,'{"type":"webhook"}','project','dispatcher','continue','{}','{}','full-access','default','user','web',${time},${time},'idle',0)`;
   yield* sql`INSERT INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id) VALUES('task',${time},'queue','project','dispatcher')`;
+  yield* sql`INSERT INTO orchestration_v2_projection_threads(thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES('dispatcher','project','Dispatcher','codex','full-access','default',${time},${time},${JSON.stringify({ projectId: "project" })})`;
   yield* sql`INSERT INTO orchestration_v2_projection_threads(thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES('child','project','Child','codex','full-access','default',${time},${time},${JSON.stringify({ projectId: "project", worktreePath: repo, branch: "candidate" })})`;
   yield* sql`INSERT INTO workbench_work_items(id,task_id,task_created_at,project_id,business_delivery_id,dispatcher_thread_id,event_json,work_thread_id,worktree_path,branch,business_state,version,latest_event_sequence,processed_through_sequence,created_at,updated_at) VALUES('item','task',${time},'project','event','dispatcher','{}','child',${repo},'candidate','awaiting_delivery',1,1,1,${time},${time})`;
   return {
@@ -1370,6 +1372,70 @@ it.live.each([false, true])(
         expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment).toEqual(
           delivered,
         );
+        const { delivery: _delivery, ...before } = delivered;
+        const previous = {
+          ...before,
+          state: "deployed" as const,
+          merge: { ...delivered.merge!, state: "verifying" as const },
+        };
+        const rollback = new Error("Restore the delivery guard fixture");
+        for (const [name, invalidate] of [
+          ["task deleted", f.sql`DELETE FROM scheduled_tasks WHERE task_id='task'`],
+          [
+            "task generation replaced",
+            f.sql`UPDATE scheduled_tasks SET created_at='replacement' WHERE task_id='task'`,
+          ],
+          [
+            "queue binding removed",
+            f.sql`DELETE FROM workbench_queue_bindings WHERE task_id='task'`,
+          ],
+          [
+            "queue controller changed",
+            f.sql`UPDATE workbench_queues SET controller_id='replacement' WHERE id='queue'`,
+          ],
+          [
+            "tracking generation changed",
+            f.sql`UPDATE scheduled_task_execution_metadata SET tracking_id='replacement' WHERE singleton=1`,
+          ],
+          [
+            "project deleted",
+            f.sql`UPDATE projection_projects SET deleted_at='deleted' WHERE project_id='project'`,
+          ],
+          [
+            "child deleted",
+            f.sql`UPDATE orchestration_v2_projection_threads SET deleted_at='deleted' WHERE thread_id='child'`,
+          ],
+          [
+            "dispatcher deleted",
+            f.sql`UPDATE orchestration_v2_projection_threads SET deleted_at='deleted' WHERE thread_id='dispatcher'`,
+          ],
+        ] as const) {
+          yield* f.sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* f.sql`DELETE FROM workbench_delivery_receipts WHERE deployment_id=${delivered.id}`;
+                yield* f.sql`UPDATE workbench_work_items SET business_state='awaiting_delivery',version=1,completed_at=NULL,handoff_ref=NULL,preserved_ref=NULL WHERE id='item'`;
+                yield* f.sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(previous)},state='deployed' WHERE id=${delivered.id}`;
+                yield* invalidate;
+                const result = yield* Effect.result(completeAcceptedDelivery(previous, delivered));
+                expect(result, name).toMatchObject({ _tag: "Failure" });
+                expect(
+                  (yield* f.sql<{
+                    business_state: string;
+                  }>`SELECT business_state FROM workbench_work_items WHERE id='item'`)[0]
+                    ?.business_state,
+                  name,
+                ).toBe("awaiting_delivery");
+                return yield* Effect.fail(rollback);
+              }),
+            )
+            .pipe(
+              Effect.catchIf(
+                (cause) => cause === rollback,
+                () => Effect.void,
+              ),
+            );
+        }
       }).pipe(
         Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer()))),
         Effect.provideService(ReleaseRefs.WorkbenchReleaseRefs, remote.service),

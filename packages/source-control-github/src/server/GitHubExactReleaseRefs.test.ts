@@ -739,7 +739,7 @@ it.effect.each(["expectedActorId", "expectedPolicyDigest"] as const)(
       } as unknown as ExactReleaseFFInput;
       expect(yield* Effect.result(refs.exactFF(input))).toMatchObject({
         _tag: "Failure",
-        failure: { _tag: "ExactReleaseRefsError" },
+        failure: { _tag: "ExactReleaseRefsError", cause: { _tag: "SchemaError" } },
       });
       expect(f.requests.filter((r) => r.path === "/graphql")).toHaveLength(0);
     }).pipe(Effect.scoped),

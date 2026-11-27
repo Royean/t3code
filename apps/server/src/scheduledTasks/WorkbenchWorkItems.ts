@@ -70,6 +70,15 @@ export const completeAcceptedDelivery = Effect.fn("WorkbenchWorkItems.completeAc
         const changed =
           yield* sql`UPDATE workbench_work_items SET business_state='completed',completed_at=${r.completedAt},version=version+1,handoff_ref=${r.handoffRef},preserved_ref=${r.preservedRef} WHERE id=${b.workItemId} AND task_id=${b.taskId} AND task_created_at=${b.taskCreatedAt} AND project_id=${b.projectId} AND dispatcher_thread_id=${b.dispatcherThreadId} AND work_thread_id=${b.workThreadId} AND cycle_number=${b.cycleNumber} AND version=${b.workItemVersion} AND latest_event_sequence=${b.latestEventSequence} AND processed_through_sequence=${b.processedThroughSequence} AND business_state='awaiting_delivery' AND attention_hold=0 AND recovery_ref IS NULL
       AND EXISTS(SELECT 1 FROM workbench_release_obligations o WHERE o.work_item_id=${b.workItemId} AND o.task_created_at=${b.taskCreatedAt} AND o.cycle_number=${b.cycleNumber})
+      AND EXISTS(SELECT 1 FROM scheduled_tasks st
+        JOIN workbench_queue_bindings qb ON qb.task_id=st.task_id AND qb.task_created_at=st.created_at AND qb.project_id=st.project_id AND qb.dispatcher_thread_id=st.thread_id
+        JOIN workbench_queues q ON q.id=qb.queue_id AND q.id=${b.queueId} AND q.controller_id=${b.controllerId} AND q.project_id=${b.projectId}
+        JOIN scheduled_task_execution_metadata meta ON meta.singleton=1 AND meta.tracking_id=${b.trackingId}
+        JOIN projection_projects p ON p.project_id=st.project_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+        JOIN orchestration_v2_projection_threads parent ON parent.thread_id=st.thread_id AND parent.project_id=st.project_id AND parent.deleted_at IS NULL AND parent.archived_at IS NULL
+        JOIN orchestration_v2_projection_threads child ON child.thread_id=${b.workThreadId} AND child.project_id=st.project_id AND child.deleted_at IS NULL AND child.archived_at IS NULL
+        WHERE st.task_id=${b.taskId} AND st.created_at=${b.taskCreatedAt} AND st.project_id=${b.projectId} AND st.thread_id=${b.dispatcherThreadId}
+          AND json_extract(child.payload_json,'$.worktreePath')=workbench_work_items.worktree_path AND json_extract(child.payload_json,'$.branch')=workbench_work_items.branch)
       AND NOT EXISTS(SELECT 1 FROM workbench_work_batches WHERE work_item_id=${b.workItemId} AND state!='completed')
       AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses WHERE work_item_id=${b.workItemId} AND state IN ('recorded','queued','submitted','unknown')) RETURNING id`;
         if (changed.length !== 1) return yield* refused();
