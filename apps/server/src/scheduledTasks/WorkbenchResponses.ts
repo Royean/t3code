@@ -546,7 +546,7 @@ const make = Effect.gen(function* () {
                 yield* sql`UPDATE workbench_runtime_responses SET state='queued',reason='queue_full',updated_at=${yield* now} WHERE id=${r.id} AND state IN ('recorded','queued')`;
                 return false;
               }
-              yield* sql`UPDATE workbench_runtime_responses SET state='queued',claim_id=${entry.claim_id},attention_epoch=${entry.attention_epoch},reason=NULL,updated_at=${yield* now} WHERE id=${r.id} AND state IN ('recorded','queued')`;
+              yield* sql`UPDATE workbench_runtime_responses SET state='queued',claim_id=${entry.claim_id},reason=NULL,updated_at=${yield* now} WHERE id=${r.id} AND state IN ('recorded','queued')`;
               return true;
             }),
           );
