@@ -265,7 +265,7 @@ export const acquireAcceptanceFixture = Effect.fn("WorkbenchAcceptanceFixture.ac
       NodePath.join(root, "native/userdata/statev2.sqlite"),
     ).pipe(Layer.provide(NodeServices.layer));
     const stamp = DateTime.formatIso(yield* DateTime.now);
-    const provider = yield* makeScriptedProvider;
+    const provider = yield* makeScriptedProvider(config, root);
     let worktrees = NodeFS.readdirSync(root).filter((name) => /^child-[0-9]+$/.test(name)).length;
     const harness = makeHarness({
       workspaceRoot: repo,
@@ -273,7 +273,7 @@ export const acquireAcceptanceFixture = Effect.fn("WorkbenchAcceptanceFixture.ac
       scripts,
       databaseLayer: database,
       configLayer: config,
-      adapters: [provider.adapter],
+      registryLayer: provider.registryLayer,
       runEffectWorker: true,
       providers: [
         {
@@ -419,6 +419,7 @@ export const acquireAcceptanceFixture = Effect.fn("WorkbenchAcceptanceFixture.ac
     const serviceLayer = Layer.succeedContext(workbenchDomains);
     const tasks = Context.get(workbenchDomains, Scheduled.ScheduledTaskService),
       threads = Context.get(workbenchDomains, Threads.ThreadManagementService);
+    yield* provider.attach(threads);
     const launch = Context.get(workbenchDomains, ThreadLaunch.ThreadLaunchService),
       identity = Context.get(workbenchDomains, Environment.ServerEnvironmentIdentity);
     let saved = { task: (yield* tasks.list()).tasks.find((task) => task.id === taskId) };

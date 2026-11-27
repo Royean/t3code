@@ -17,6 +17,7 @@ import * as Reactor from "../../scheduledTasks/WorkbenchRepairReactor.ts";
 import * as Attention from "../../scheduledTasks/WorkbenchAttention.ts";
 import * as Items from "../../scheduledTasks/WorkbenchWorkItems.ts";
 import * as ProcessRunner from "../../processRunner.ts";
+import type { WorkbenchStartedTurn } from "./WorkbenchScriptedProvider.ts";
 import { releaseHash } from "../../scheduledTasks/workbenchReleaseProfile.ts";
 import {
   acquireAcceptanceFixture,
@@ -325,7 +326,7 @@ it.live.skipIf(!process.env.WORKBENCH_ACCEPTANCE_REPO)(
       assert.equal(f.worktrees(), 3);
       const sql = Context.get(f.services, SqlClient.SqlClient),
         reactor = Context.get(f.services, Reactor.WorkbenchRepairReactor);
-      const finishCheck = (run: typeof highRun) =>
+      const finishCheck = (run: WorkbenchStartedTurn) =>
         Effect.gen(function* () {
           const checked = yield* Context.get(f.services, ProcessRunner.ProcessRunner).run({
             command: process.execPath,

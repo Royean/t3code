@@ -10,6 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
@@ -89,6 +90,11 @@ export interface HarnessOptions {
   readonly runEffectWorker?: boolean;
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
+  readonly registryLayer?: Layer.Layer<
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    never,
+    McpProviderSessions.McpProviderSessions
+  >;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
   readonly createWorktree?: GitWorkflow.GitWorkflowService["Service"]["createWorktree"];
   readonly fetchWorktreeBaseCommit?: GitWorkflow.GitWorkflowService["Service"]["fetchWorktreeBaseCommit"];
@@ -117,7 +123,10 @@ export function makeHarness(options: HarnessOptions = {}) {
     scripts: options.scripts ?? otherProject.scripts,
   };
   const layerDatabase = options.databaseLayer ?? SqlitePersistence.layerMemory;
-  const layerRegistry = ProviderAdapterRegistry.layerFromAdapters(options.adapters ?? [adapter]);
+  const layerRegistry = (
+    options.registryLayer ??
+    ProviderAdapterRegistry.layerFromAdapters(options.adapters ?? [adapter])
+  ).pipe(Layer.provide(McpProviderSessions.layer));
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
     layerRegistry,

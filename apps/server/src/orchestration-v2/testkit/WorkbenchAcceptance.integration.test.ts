@@ -112,7 +112,7 @@ it.live.skipIf(!process.env.WORKBENCH_ACCEPTANCE_REPO)(
           capabilities: new Set(["orchestration"]),
           thread: {
             threadId: dispatcherId,
-            providerSessionId: "scripted:dispatcher",
+            providerSessionId: parentRun.providerThread.providerSessionId!,
             providerInstanceId: parentRun.modelSelection.instanceId,
           },
         },
