@@ -1,3 +1,5 @@
+import * as Verification from "./releaseVerification.ts";
+import type { WorkbenchOnlineReceipt } from "@t3tools/contracts";
 import * as Adapter from "./WorkbenchReleaseAdapter.ts";
 import {
   WorkbenchReleaseHostProfile as HostProfileSchema,
@@ -231,6 +233,11 @@ export class WorkbenchReleaseEvidence extends Context.Service<
       id: string,
       input: WorkbenchReleaseRevalidateInput,
     ) => Effect.Effect<ReleaseDeploymentMaterial, WorkbenchReleaseError>;
+    readonly runOnlineCheck: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput & Verification.OnlineCheckInput,
+    ) => Effect.Effect<WorkbenchOnlineReceipt, Verification.VerificationError>;
     readonly awaitPrepared: (
       queueId: string,
       id: string,
@@ -247,6 +254,7 @@ const make = Effect.gen(function* () {
     config = yield* Config.ServerConfig,
     runner = yield* Runner.ProcessRunner,
     adapter = yield* Adapter.WorkbenchReleaseAdapter;
+  const verificationExecutor = yield* Verification.make;
   const serviceScope = yield* Effect.scope;
   const context = Context.make(FileSystem.FileSystem, fs).pipe(
     Context.add(Path.Path, path),
@@ -882,6 +890,12 @@ const make = Effect.gen(function* () {
                   ),
                 );
             }
+            if (evidence.verification)
+              yield* verificationExecutor
+                .validate(directory(id), evidence, registered)
+                .pipe(
+                  Effect.mapError((cause) => causedProblem("artifact", "artifact_changed", cause)),
+                );
             const finalProfile = yield* profile(
               prepInput.profileId,
               prepInput.profileDigest,
@@ -1003,7 +1017,6 @@ const make = Effect.gen(function* () {
         "artifact_invalid",
         new ReleaseExecutionExitError({ exitCode: unpack.code, cause: unpack }),
       );
-    yield* fs.remove(archive);
     const unchanged = Effect.fn("WorkbenchReleaseEvidence.snapshotUnchanged")(function* () {
       for (const m of tracked) {
         const bytes = yield* regular(snapshot, m![3]!, "source_changed");
@@ -1012,6 +1025,30 @@ const make = Effect.gen(function* () {
       }
     });
     yield* unchanged();
+    const scripts = yield* releaseProfileScripts(p),
+      n = p.policy.checks.length;
+    const verification = yield* verificationExecutor
+      .seal({
+        directory: dir,
+        preparationId: id,
+        sourceSha: initial.head,
+        treeSha: initial.tree,
+        originalSourceRoots: [
+          initial.real,
+          initial.task.worktree_path,
+          initial.task.workspace_root,
+        ],
+        tracked: tracked.map((m) => ({
+          path: m![3]!,
+          mode: m![1]! as "100644" | "100755",
+          blobSha: m![2]!,
+        })),
+        health: scripts[n + 1]!,
+        core: scripts[n + 2]!,
+        profile: p,
+      })
+      .pipe(Effect.mapError((cause) => causedProblem("snapshot", "artifact_invalid", cause)));
+    yield* fs.remove(archive);
     const observedTarget = yield* target(p);
     const rollback = yield* regular(
       initial.real,
@@ -1071,7 +1108,6 @@ const make = Effect.gen(function* () {
       insertions += Number(a) || 0;
       deletions += Number(b) || 0;
     }
-    const scripts = yield* releaseProfileScripts(p);
     const receipts: WorkbenchReleaseReceipt[] = [];
     let artifactHash: string | null = null;
     let artifactBytes = 0;
@@ -1258,6 +1294,7 @@ const make = Effect.gen(function* () {
     const now = yield* stamp,
       w = initial.task;
     const unsigned = {
+      verification,
       ...(deployment ? { deployment } : {}),
       schemaVersion: 1 as const,
       id: `evidence:${releaseHash(id)}`,
@@ -1534,6 +1571,36 @@ const make = Effect.gen(function* () {
       return yield* new WorkbenchReleaseError({ reason: "conflict" });
     return material;
   });
+  const runOnlineCheck = Effect.fn("WorkbenchReleaseEvidence.runOnlineCheck")(function* (
+    queueId: string,
+    id: string,
+    input: WorkbenchReleaseRevalidateInput & Verification.OnlineCheckInput,
+  ) {
+    const material = yield* admittedMaterial(queueId, id, input).pipe(
+      Effect.mapError(
+        (cause) =>
+          new Verification.VerificationError({
+            reason: "material_invalid",
+            stage: "material",
+            cause,
+          }),
+      ),
+    );
+    if (
+      canonicalReleaseJson(material.evidence.deployment?.desired) !==
+      canonicalReleaseJson(input.candidate)
+    )
+      return yield* new Verification.VerificationError({
+        reason: "material_invalid",
+        stage: "subject",
+      });
+    return yield* verificationExecutor.check(
+      directory(id),
+      material.evidence,
+      material.profile,
+      input,
+    );
+  });
   return WorkbenchReleaseEvidence.of({
     catalog,
     prepare,
@@ -1543,6 +1610,7 @@ const make = Effect.gen(function* () {
     awaitPrepared,
     admissionMaterial,
     admittedMaterial,
+    runOnlineCheck,
   });
 });
 export const layer = Layer.effect(WorkbenchReleaseEvidence, make);

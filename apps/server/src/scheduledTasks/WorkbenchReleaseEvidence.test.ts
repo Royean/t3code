@@ -1,3 +1,8 @@
+import * as Clock from "effect/Clock";
+import { canonicalReleaseJson, releaseDigest } from "./workbenchReleaseProfile.ts";
+import * as TestClock from "effect/testing/TestClock";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import * as DeploymentHttp from "./workbenchDeploymentHttp.ts";
 import * as Deployment from "./WorkbenchDeployment.ts";
 import * as ReleaseAdapter from "./WorkbenchReleaseAdapter.ts";
@@ -42,10 +47,9 @@ import * as Release from "./WorkbenchReleaseEvidence.ts";
 
 const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
 const config = Config.layerTest(process.cwd(), { prefix: "issue15-native-config-" });
-const baseDependencies = Layer.mergeAll(
+const systemDependencies = Layer.mergeAll(
   platform,
   config.pipe(Layer.provide(platform)),
-  Sqlite.layerMemory,
   Git.layer.pipe(
     Layer.provide(VcsProcess.layer),
     Layer.provide(ProcessRunner.layer),
@@ -57,6 +61,7 @@ const baseDependencies = Layer.mergeAll(
     getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
   }),
 );
+const baseDependencies = Layer.mergeAll(systemDependencies, Sqlite.layerMemory);
 const dependencies = ReleaseAdapter.layer.pipe(Layer.provideMerge(baseDependencies));
 const releaseLayer = Release.layer.pipe(Layer.provideMerge(dependencies));
 const layer = Deployment.layer.pipe(Layer.provideMerge(releaseLayer));
@@ -106,9 +111,9 @@ const fixture = Effect.gen(function* () {
     "check.cjs":
       "if(require('node:fs').readFileSync('input.txt','utf8')!=='candidate')process.exit(7)",
     "artifact.cjs":
-      "if(require('node:fs').readFileSync(process.env.T3_RELEASE_ARTIFACT,'utf8')!=='candidate')process.exit(8)",
+      "if(process.env.T3_RELEASE_PHASE==='online'){(async()=>{const r=await fetch(process.env.T3_RELEASE_TARGET_ORIGIN+'/checks/'+process.env.T3_RELEASE_CHECK_ROLE,{headers:{'x-release-execution':process.env.T3_RELEASE_EXECUTION_ID}});if(!r.ok)process.exit(31);const v=await r.json();if(v.artifactSha256!==process.env.T3_RELEASE_EXPECTED_ARTIFACT_SHA256||v.value!=='CANDIDATE')process.exit(32)})().catch(()=>process.exit(33))}else if(require('node:fs').readFileSync(process.env.T3_RELEASE_ARTIFACT,'utf8')!=='candidate')process.exit(8)",
     "rollback.cjs":
-      "if(require('node:fs').readFileSync(process.env.T3_RELEASE_ROLLBACK_ARTIFACT,'utf8')!=='prior-artifact')process.exit(9)",
+      "if(!['prior-artifact','candidate'].includes(require('node:fs').readFileSync(process.env.T3_RELEASE_ROLLBACK_ARTIFACT,'utf8')))process.exit(9)",
     "execute.cjs": "require('node:fs').writeFileSync('MUST-NOT-EXECUTE','bad');process.exit(99)",
   };
   for (const [name, data] of Object.entries(files))
@@ -1180,11 +1185,24 @@ it.live(
     }).pipe(Effect.provide(layer)),
 );
 
-const approvedDeploymentFixture = Effect.gen(function* () {
+const approvedDeploymentFixtureFor = Effect.fn("releaseFixture.approved")(function* (
+  observation?: {
+    durationSeconds: number;
+    intervalSeconds: number;
+    consecutiveSuccesses: number;
+  },
+  unchanged = false,
+) {
   const f = yield* fixture,
     releases = yield* Release.WorkbenchReleaseEvidence,
     cfg = yield* Config.ServerConfig;
-  const a = yield* deploymentFixture(f.dir, (yield* f.git(["rev-parse", "main"])).stdout.trim());
+  if (unchanged)
+    yield* f.fs.writeFileString(f.path.join(f.repo, "baseline-private/baseline.bin"), "candidate");
+  const a = yield* deploymentFixture(
+    f.dir,
+    unchanged ? f.head : (yield* f.git(["rev-parse", "main"])).stdout.trim(),
+    unchanged ? { bytes: "candidate", version: `sha256-${releaseHash("candidate")}` } : undefined,
+  );
   const profile = {
     ...f.profile,
     version: 2,
@@ -1192,6 +1210,7 @@ const approvedDeploymentFixture = Effect.gen(function* () {
       ...f.profile.policy,
       target: { ...f.profile.policy.target, origin: a.policy.adapter.origin },
       deployment: a.policy,
+      observation: observation ?? f.profile.policy.observation,
     },
   };
   yield* f.fs.writeFileString(
@@ -1251,6 +1270,7 @@ const approvedDeploymentFixture = Effect.gen(function* () {
   };
   return { f, a, e, input, payload };
 });
+const approvedDeploymentFixture = approvedDeploymentFixtureFor();
 it.live("deploys only a committed approval's sealed bytes and preserves exact retry identity", () =>
   Effect.gen(function* () {
     const { a, input } = yield* approvedDeploymentFixture,
@@ -1721,4 +1741,798 @@ it.live.each(["before", "partial"] as const)(
         Effect.provideService(FileSystem.FileSystem, monitoredFs),
       );
     }).pipe(Effect.provide(dependencies)),
+);
+
+it.live("seals verification source and exact definitions in new approved evidence", () =>
+  Effect.gen(function* () {
+    const { e } = yield* approvedDeploymentFixture;
+    expect(e.verification).toMatchObject({
+      schemaVersion: 1,
+      semanticsVersion: 1,
+      sourceTreeSha: e.source.treeSha,
+    });
+    expect(e.verification?.archive.bytes).toBeGreaterThan(0);
+    expect(e.verification?.archive.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(e.verification?.manifestDigest).toMatch(/^[a-f0-9]{64}$/);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "executes frozen health and core against the actual online target after the source project drifts",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, e, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment,
+        releases = yield* Release.WorkbenchReleaseEvidence;
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+      yield* f.fs.writeFileString(f.path.join(f.repo, "artifact.cjs"), "process.exit(99)");
+      yield* f.sql`UPDATE projection_projects SET scripts_json='[]' WHERE project_id='project'`;
+      const base = {
+        ...scope,
+        expectedEvidenceDigest: e.digest,
+        sampleId: "sample",
+        authorizationDigest: input.reservation.authorizationDigest,
+        runnerEpoch: "epoch",
+        candidate: e.deployment!.desired,
+        activationRevision: 1,
+      };
+      const health = yield* releases.runOnlineCheck("queue", e.preparationId, {
+        ...base,
+        role: "health",
+        executionId: "health-execution",
+      });
+      expect(health.state).toBe("succeeded");
+      expect(health.exitCode).toBe(0);
+      expect(health.materialDigest).toBe(e.verification!.manifestDigest);
+      a.setCheckFault("core", true);
+      const core = yield* releases.runOnlineCheck("queue", e.preparationId, {
+        ...base,
+        role: "core",
+        executionId: "core-execution",
+      });
+      expect(core.state).toBe("failed");
+      expect(core.exitCode).toBe(31);
+      expect(core.outputDigest).toMatch(/^[a-f0-9]{64}$/);
+      expect(a.bytes()).toBe("candidate");
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "persists a real health failure and recovers the same approved baseline through the original rollback identity",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      a.setCheckFault("health", true);
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const failed = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment;
+      expect(failed.acceptance?.state).toBe("failed");
+      expect(failed.acceptance?.latestSample?.health?.exitCode).toBe(31);
+      expect(failed.acceptance?.latestSample?.core).toBeNull();
+      yield* deployments.sync;
+      const restored = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(restored.state).toBe("rolled_back");
+      expect(restored.acceptance?.failure).toEqual(failed.acceptance?.failure);
+      expect(restored.rollbackOperation?.id).toBe("rollback-operation");
+      expect(a.bytes()).toBe("prior-artifact");
+      expect(a.writes()).toBe(2);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "earns the full monotonic window from actual sequential health-core samples and seals passed proof",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixtureFor({
+          durationSeconds: 2,
+          intervalSeconds: 1,
+          consecutiveSuccesses: 2,
+        }),
+        deployments = yield* Deployment.WorkbenchDeployment;
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const first = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment.acceptance!;
+      expect(first.state).toBe("observing");
+      expect(first.window.elapsedMilliseconds).toBe(0);
+      expect(first.window.successfulSamples).toBe(1);
+      yield* TestClock.adjust("1 second");
+      const second = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        2,
+      )).deployment.acceptance!;
+      expect(second.state).toBe("observing");
+      expect(second.window.elapsedMilliseconds).toBe(1000);
+      yield* TestClock.adjust("1 second");
+      const passed = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        3,
+      )).deployment.acceptance!;
+      expect(passed.state).toBe("passed");
+      expect(passed.window.elapsedMilliseconds).toBe(2000);
+      expect(passed.window.successfulSamples).toBe(3);
+      expect(passed.latestSample?.health?.state).toBe("succeeded");
+      expect(passed.latestSample?.core?.state).toBe("succeeded");
+      const calls = a.checkCalls();
+      yield* TestClock.adjust("3 seconds");
+      yield* deployments.sync;
+      expect(
+        (yield* deployments.get("queue", input.deploymentId, scope)).deployment.acceptance,
+      ).toEqual(passed);
+      expect(a.checkCalls()).toBe(calls);
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live(
+  "reopens the actual Native SQLite database and restarts only the unfinished observation window",
+  () =>
+    Effect.gen(function* () {
+      const cfg = yield* Config.ServerConfig,
+        path = yield* Path.Path;
+      const dbPath = path.join(cfg.stateDir, "issue17-reopen.sqlite");
+      const nativeLayer = Deployment.layer.pipe(
+        Layer.provideMerge(Release.layer),
+        Layer.provideMerge(ReleaseAdapter.layer),
+        Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+      );
+      const firstScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const firstContext = yield* Layer.buildWithScope(nativeLayer, firstScope);
+      const prepared = yield* approvedDeploymentFixtureFor({
+        durationSeconds: 2,
+        intervalSeconds: 1,
+        consecutiveSuccesses: 2,
+      }).pipe(Effect.provide(firstContext));
+      const original = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", prepared.input);
+        yield* deployments.sync;
+        return (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          1,
+        )).deployment.acceptance!;
+      }).pipe(Effect.provide(firstContext));
+      yield* Scope.close(firstScope, Exit.void);
+      const secondScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+      const reopened = yield* Layer.buildWithScope(nativeLayer, secondScope);
+      const passedProof = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        const reset = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          2,
+        )).deployment.acceptance!;
+        expect(reset.runnerEpoch).not.toBe(original.runnerEpoch);
+        expect(reset.window.resets).toBeGreaterThan(0);
+        expect(reset.window.successfulSamples).toBe(1);
+        expect(reset.window.elapsedMilliseconds).toBe(0);
+        expect(reset.state).toBe("observing");
+        yield* TestClock.adjust("1 second");
+        yield* deployments.awaitAcceptanceSample("queue", prepared.input.deploymentId, scope, 3);
+        yield* TestClock.adjust("1 second");
+        const passed = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          4,
+        )).deployment.acceptance!;
+        expect(passed.state).toBe("passed");
+        expect(passed.ledger.count).toBe(4);
+        expect(prepared.a.writes()).toBe(1);
+        return passed;
+      }).pipe(Effect.provide(reopened));
+      yield* Scope.close(secondScope, Exit.void);
+      prepared.a.setAdapterAvailable(false);
+      const finalScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(finalScope, Exit.void));
+      const offline = yield* Layer.buildWithScope(nativeLayer, finalScope);
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        const before = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(before.state).toBe("deploy_unknown");
+        expect(before.acceptance).toEqual(passedProof);
+        const calls = prepared.a.checkCalls();
+        prepared.a.setAdapterAvailable(true);
+        yield* deployments.sync;
+        const fresh = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(fresh.state).toBe("deployed");
+        expect(fresh.acceptance).toEqual(passedProof);
+        expect(prepared.a.checkCalls()).toBe(calls);
+        expect(prepared.a.writes()).toBe(1);
+      }).pipe(Effect.provide(offline));
+    }).pipe(Effect.provide(systemDependencies.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+
+it.live(
+  "keeps a legacy admitted packet missing verification material unknown without inventing checks",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, e, input, payload } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      const { verification: _verification, digest: _digest, ...unsigned } = e,
+        legacy = { ...unsigned, digest: releaseDigest(unsigned) };
+      const [row] = yield* f.sql<{
+        preparation_json: string;
+      }>`SELECT preparation_json FROM workbench_release_preparations WHERE id=${e.preparationId}`;
+      const prep = JSON.parse(row!.preparation_json);
+      prep.evidence = legacy;
+      yield* f.sql`UPDATE workbench_release_preparations SET preparation_json=${JSON.stringify(prep)} WHERE id=${e.preparationId}`;
+      const grant = {
+        ...payload,
+        deploymentId: "legacy-wb",
+        nativeDeploymentId: "legacy-native",
+        evidenceDigest: legacy.digest,
+      };
+      const legacyInput = {
+        ...input,
+        deploymentId: grant.nativeDeploymentId,
+        expectedEvidenceDigest: legacy.digest,
+        reservation: a.reserve(grant),
+      };
+      yield* deployments.admit("queue", legacyInput);
+      yield* deployments.sync;
+      const d = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        legacyInput.deploymentId,
+        scope,
+        1,
+      )).deployment;
+      expect(d.state).toBe("deployed");
+      expect(d.acceptance?.state).toBe("unknown");
+      expect(d.acceptance?.reasons).toEqual(["material_missing"]);
+      expect(d.acceptance?.ledger.count).toBe(0);
+      expect(a.checkCalls()).toBe(0);
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer)),
+);
+it.live(
+  "damaged sealed verification source after commitment stays unknown and cannot authorize rollback",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, e, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment,
+        cfg = yield* Config.ServerConfig,
+        gate = a.gateNext("after_apply");
+      yield* deployments.admit("queue", input);
+      yield* gate.reached;
+      const archive = f.path.join(
+        cfg.stateDir,
+        "workbench-release-evidence",
+        releaseHash(e.preparationId),
+        "verification.tar",
+      );
+      yield* f.fs.chmod(archive, 0o600);
+      yield* f.fs.writeFileString(archive, "corrupt");
+      gate.release();
+      yield* gate.completed;
+      yield* deployments.sync;
+      const d = (yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1))
+        .deployment;
+      expect(d.acceptance?.state).toBe("unknown");
+      expect(d.acceptance?.reasons).toEqual(["material_invalid"]);
+      expect(d.acceptance?.failure).toBeNull();
+      yield* deployments.sync;
+      expect(a.checkCalls()).toBe(0);
+      expect(a.writes()).toBe(1);
+      expect(a.bytes()).toBe("candidate");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live.each(["succeeded", "failed"] as const)(
+  "keeps true %s receipts across a wall jump without inventing healthy coverage",
+  (receiptState) =>
+    Effect.gen(function* () {
+      const clock = yield* Clock.Clock;
+      let offset = 0;
+      const shifted: Clock.Clock = {
+        ...clock,
+        currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe() + offset,
+        currentTimeMillis: Effect.sync(() => clock.currentTimeMillisUnsafe() + offset),
+        currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe() + BigInt(offset) * 1000000n,
+        currentTimeNanos: Effect.sync(
+          () => clock.currentTimeNanosUnsafe() + BigInt(offset) * 1000000n,
+        ),
+      };
+      yield* Effect.gen(function* () {
+        const { a, input } = yield* approvedDeploymentFixtureFor({
+            durationSeconds: 2,
+            intervalSeconds: 1,
+            consecutiveSuccesses: 2,
+          }),
+          deployments = yield* Deployment.WorkbenchDeployment,
+          gate = a.gateNext("core_check");
+        a.setCheckFault("core", receiptState === "failed");
+        yield* deployments.admit("queue", input);
+        yield* gate.reached;
+        offset = receiptState === "failed" ? -5000 : 5000;
+        gate.release();
+        yield* gate.completed;
+        const result = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          input.deploymentId,
+          scope,
+          1,
+        )).deployment.acceptance!;
+        expect(result.latestSample?.core?.state).toBe(receiptState);
+        if (receiptState === "succeeded") {
+          expect(result.state).toBe("unknown");
+          expect(result.reasons).toEqual(["clock_changed"]);
+          expect(result.window.elapsedMilliseconds).toBe(0);
+          expect(result.window.successfulSamples).toBe(0);
+          expect(result.failure).toBeNull();
+          expect(a.writes()).toBe(1);
+        } else {
+          expect(result.state).toBe("failed");
+          expect(result.failure?.reason).toBe("core_failed");
+          yield* deployments.sync;
+          expect(
+            (yield* deployments.get("queue", input.deploymentId, scope)).deployment.state,
+          ).toBe("rolled_back");
+          expect(a.writes()).toBe(2);
+        }
+      }).pipe(Effect.provide(layer), Effect.provideService(Clock.Clock, shifted));
+    }).pipe(Effect.provide(TestClock.layer())),
+);
+it.live("a later genuine observation failure keeps its failed evidence after actual recovery", () =>
+  Effect.gen(function* () {
+    const { a, input } = yield* approvedDeploymentFixtureFor({
+        durationSeconds: 3,
+        intervalSeconds: 1,
+        consecutiveSuccesses: 2,
+      }),
+      deployments = yield* Deployment.WorkbenchDeployment;
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+    a.setCheckFault("health", true);
+    yield* TestClock.adjust("1 second");
+    const failed = (yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 2))
+      .deployment.acceptance!;
+    expect(failed.state).toBe("failed");
+    expect(failed.failure?.reason).toBe("observation_failed");
+    expect(failed.latestSample?.core).toBeNull();
+    yield* deployments.sync;
+    const result = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+    expect(result.state).toBe("rolled_back");
+    expect(result.acceptance).toEqual(failed);
+    expect(a.writes()).toBe(2);
+  }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live("a wall rollback after both real check receipts cannot finalize healthy coverage", () =>
+  Effect.gen(function* () {
+    const clock = yield* Clock.Clock;
+    let offset = 0;
+    const shifted: Clock.Clock = {
+      ...clock,
+      currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe() + offset,
+      currentTimeMillis: Effect.sync(() => clock.currentTimeMillisUnsafe() + offset),
+    };
+    yield* Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixtureFor({
+          durationSeconds: 2,
+          intervalSeconds: 1,
+          consecutiveSuccesses: 2,
+        }),
+        deployments = yield* Deployment.WorkbenchDeployment,
+        core = a.gateNext("core_check");
+      yield* deployments.admit("queue", input);
+      yield* core.reached;
+      const version = a.gateNext("version_read");
+      core.release();
+      yield* core.completed;
+      yield* version.reached;
+      offset = -5000;
+      version.release();
+      yield* version.completed;
+      const result = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment.acceptance!;
+      expect(result.latestSample?.health?.state).toBe("succeeded");
+      expect(result.latestSample?.core?.state).toBe("succeeded");
+      expect(result.state).toBe("unknown");
+      expect(result.reasons).toEqual(["clock_changed"]);
+      expect(result.window.successfulSamples).toBe(0);
+      expect(result.failure).toBeNull();
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer), Effect.provideService(Clock.Clock, shifted));
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.live(
+  "a failed online check after a verified no-op deploy reports unchanged baseline without blind restoration",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixtureFor(undefined, true),
+        deployments = yield* Deployment.WorkbenchDeployment;
+      a.setCheckFault("health", true);
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const failed = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment.acceptance!;
+      expect(failed.state).toBe("failed");
+      yield* deployments.sync;
+      const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(d.state).toBe("failed_unchanged");
+      expect(d.deployOperation?.result?.effect).toBe("unchanged");
+      expect(d.rollbackOperation).toBeNull();
+      expect(d.acceptance?.failure).toEqual(failed.failure);
+      expect(d.versionObservation?.basis).toEqual(a.baseline);
+      expect(a.writes()).toBe(0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "finalizes an interrupted core invocation unknown once across actual SQLite reopen without replaying execution IDs",
+  () =>
+    Effect.gen(function* () {
+      const cfg = yield* Config.ServerConfig,
+        path = yield* Path.Path,
+        dbPath = path.join(cfg.stateDir, "issue17-orphan.sqlite");
+      const nativeLayer = Deployment.layer.pipe(
+        Layer.provideMerge(Release.layer),
+        Layer.provideMerge(ReleaseAdapter.layer),
+        Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+      );
+      const firstScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const firstContext = yield* Layer.buildWithScope(nativeLayer, firstScope);
+      const prepared = yield* approvedDeploymentFixtureFor({
+        durationSeconds: 2,
+        intervalSeconds: 1,
+        consecutiveSuccesses: 2,
+      }).pipe(Effect.provide(firstContext));
+      const gate = prepared.a.gateNext("core_check");
+      const active = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", prepared.input);
+        yield* gate.reached;
+        return (yield* deployments.get("queue", prepared.input.deploymentId, scope)).deployment
+          .acceptance!.activeSample!;
+      }).pipe(Effect.provide(firstContext));
+      expect(active.role).toBe("core");
+      yield* Scope.close(firstScope, Exit.void);
+      const reopenedScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(reopenedScope, Exit.void));
+      const reopened = yield* Layer.buildWithScope(nativeLayer, reopenedScope);
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        const next = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          2,
+        )).deployment.acceptance!;
+        expect(next.ledger.count).toBe(2);
+        expect(next.firstSample?.ordinal).toBe(2);
+        expect(next.window.successfulSamples).toBe(1);
+        expect(next.window.elapsedMilliseconds).toBe(0);
+        expect(next.runnerEpoch).not.toBe(active.runnerEpoch);
+        expect(next.firstSample?.id).not.toBe(active.id);
+        expect(next.state).toBe("observing");
+        const ids = prepared.a.checkExecutions();
+        expect(ids).toHaveLength(4);
+        expect(new Set(ids).size).toBe(4);
+        expect(prepared.a.writes()).toBe(1);
+      }).pipe(Effect.provide(reopened));
+      gate.release();
+      yield* gate.completed;
+    }).pipe(Effect.provide(systemDependencies.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live(
+  "restores a durably recorded terminal failure after actual database reopen before sample finalization",
+  () =>
+    Effect.gen(function* () {
+      const cfg = yield* Config.ServerConfig,
+        path = yield* Path.Path,
+        dbPath = path.join(cfg.stateDir, "issue17-terminal-intent.sqlite");
+      const nativeLayer = Deployment.layer.pipe(
+        Layer.provideMerge(Release.layer),
+        Layer.provideMerge(ReleaseAdapter.layer),
+        Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+      );
+      const firstScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const first = yield* Layer.buildWithScope(nativeLayer, firstScope);
+      const prepared = yield* approvedDeploymentFixture.pipe(Effect.provide(first));
+      const core = prepared.a.gateNext("core_check");
+      prepared.a.setCheckFault("core", true);
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.admit("queue", prepared.input);
+        yield* core.reached;
+      }).pipe(Effect.provide(first));
+      const target = prepared.a.gateNext("target_read");
+      core.release();
+      yield* core.completed;
+      yield* target.reached;
+      const interrupted = yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        return (yield* deployments.get("queue", prepared.input.deploymentId, scope)).deployment
+          .acceptance!;
+      }).pipe(Effect.provide(first));
+      expect(interrupted.activeSample?.role).toBe("core");
+      expect(interrupted.ledger.count).toBe(0);
+      yield* Scope.close(firstScope, Exit.void);
+      target.release();
+      yield* target.completed;
+      const reopenedScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(reopenedScope, Exit.void));
+      const reopened = yield* Layer.buildWithScope(nativeLayer, reopenedScope);
+      yield* Effect.gen(function* () {
+        const deployments = yield* Deployment.WorkbenchDeployment;
+        yield* deployments.sync;
+        const finalized = (yield* deployments.awaitAcceptanceSample(
+          "queue",
+          prepared.input.deploymentId,
+          scope,
+          1,
+        )).deployment.acceptance!;
+        expect(finalized.state).toBe("failed");
+        expect(finalized.runnerEpoch).toBe(interrupted.runnerEpoch);
+        expect(finalized.failure?.role).toBe("core");
+        expect(finalized.latestSample?.id).toBe(interrupted.activeSample?.id);
+        expect(finalized.latestSample?.core?.exitCode).toBe(31);
+        expect(finalized.activeSample).toBeNull();
+        expect(finalized.ledger.count).toBe(1);
+        yield* deployments.sync;
+        const result = (yield* deployments.get("queue", prepared.input.deploymentId, scope))
+          .deployment;
+        expect(result.state).toBe("rolled_back");
+        expect(result.acceptance).toEqual(finalized);
+        expect(result.rollbackOperation?.id).toBe("rollback-operation");
+        expect(prepared.a.checkCalls()).toBe(2);
+        expect(prepared.a.writes()).toBe(2);
+        expect(prepared.a.bytes()).toBe("prior-artifact");
+      }).pipe(Effect.provide(reopened));
+    }).pipe(Effect.provide(systemDependencies.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live.each(["candidate", "always"] as const)(
+  "a real core failure starts fixed recovery despite a %s-unavailable independent version endpoint",
+  (fault) =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment,
+        gate = a.gateNext("core_check");
+      a.setCheckFault("core", true);
+      yield* deployments.admit("queue", input);
+      yield* gate.reached;
+      a.setVersionFault("http500", fault === "candidate");
+      gate.release();
+      yield* gate.completed;
+      const failed = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment.acceptance!;
+      expect(failed.state).toBe("failed");
+      expect(failed.failure?.role).toBe("core");
+      yield* deployments.sync;
+      const recovered = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(recovered.state).toBe(fault === "candidate" ? "rolled_back" : "rollback_unknown");
+      expect(recovered.acceptance).toEqual(failed);
+      expect(a.bytes()).toBe("prior-artifact");
+      expect(a.writes()).toBe(2);
+      a.setVersionFault(null);
+      yield* deployments.sync;
+      expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment.state).toBe(
+        "rolled_back",
+      );
+      expect(a.writes()).toBe(2);
+    }).pipe(Effect.provide(layer)),
+);
+it.live(
+  "failed actual acceptance rollback retains failure and explicit attention without claiming restoration",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment,
+        gate = a.gateNext("core_check");
+      a.setCheckFault("core", true);
+      yield* deployments.admit("queue", input);
+      yield* gate.reached;
+      a.setMode("rollback_failure");
+      gate.release();
+      yield* gate.completed;
+      const failed = (yield* deployments.awaitAcceptanceSample(
+        "queue",
+        input.deploymentId,
+        scope,
+        1,
+      )).deployment.acceptance!;
+      yield* deployments.sync;
+      const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(d.state).toBe("attention");
+      expect(d.reasons).toEqual(["rollback_failed"]);
+      expect(d.acceptance).toEqual(failed);
+      expect(a.writes()).toBe(1);
+      expect(a.bytes()).toBe("candidate");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live("a long real check gap starts a fresh window without crediting the missing period", () =>
+  Effect.gen(function* () {
+    const { a, input } = yield* approvedDeploymentFixtureFor({
+        durationSeconds: 2,
+        intervalSeconds: 1,
+        consecutiveSuccesses: 2,
+      }),
+      deployments = yield* Deployment.WorkbenchDeployment;
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1);
+    const gate = a.gateNext("core_check");
+    yield* TestClock.adjust("1 second");
+    yield* gate.reached;
+    yield* TestClock.adjust("3 seconds");
+    gate.release();
+    yield* gate.completed;
+    const reset = (yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 2))
+      .deployment.acceptance!;
+    expect(reset.state).toBe("observing");
+    expect(reset.window.successfulSamples).toBe(1);
+    expect(reset.window.elapsedMilliseconds).toBe(0);
+    expect(reset.window.resets).toBeGreaterThan(0);
+    expect(reset.firstSample?.ordinal).toBe(2);
+    expect(reset.firstSample?.gapMilliseconds).toBeNull();
+    expect(reset.firstSample?.wallGapMilliseconds).toBeNull();
+    expect(reset.failure).toBeNull();
+    expect(a.writes()).toBe(1);
+  }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live("exhausted historical evidence budget stops new probes and retains unknown", () =>
+  Effect.gen(function* () {
+    const { f, a, input } = yield* approvedDeploymentFixtureFor({
+        durationSeconds: 2,
+        intervalSeconds: 1,
+        consecutiveSuccesses: 2,
+      }),
+      deployments = yield* Deployment.WorkbenchDeployment;
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    const d = (yield* deployments.awaitAcceptanceSample("queue", input.deploymentId, scope, 1))
+        .deployment,
+      previous = d.acceptance!;
+    const ordinal = 131072,
+      id = "historical-limit",
+      sample = {
+        ...previous.latestSample!,
+        id,
+        ordinal,
+        state: "unknown" as const,
+        completedAt: null,
+        health: null,
+        core: null,
+        targetBefore: null,
+        targetAfter: null,
+        versionObservation: null,
+        gapMilliseconds: null,
+        wallGapMilliseconds: null,
+        creditedElapsedMilliseconds: 0,
+      };
+    sample.inputDigest = releaseDigest({
+      authorizationDigest: d.authorizationDigest,
+      materialDigest: previous.materialDigest,
+      sampleId: id,
+      ordinal,
+      runnerEpoch: previous.runnerEpoch,
+      candidate: d.desired,
+      activationRevision: previous.activationRevision,
+      policyDigest: releaseDigest(previous.policy),
+    });
+    const { digest: _digest, ...unsigned } = sample;
+    sample.digest = releaseDigest(unsigned);
+    const acceptance = {
+      ...previous,
+      version: previous.version + 1,
+      state: "unknown" as const,
+      reasons: ["check_unknown"],
+      firstSample: null,
+      latestSample: sample,
+      window: {
+        ...previous.window,
+        id: null,
+        runnerEpoch: null,
+        startedAt: null,
+        endedAt: null,
+        elapsedMilliseconds: 0,
+        successfulSamples: 0,
+        maxGapMilliseconds: 0,
+        maxWallGapMilliseconds: 0,
+        resets: previous.window.resets + 1,
+        resetReason: "check_unknown",
+      },
+      ledger: {
+        ...previous.ledger,
+        count: ordinal,
+        digest: releaseHash("historical unknown ledger prefix"),
+      },
+    };
+    yield* f.sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson({ ...d, version: d.version + 1, acceptance })} WHERE id=${d.id}`;
+    yield* f.sql`UPDATE workbench_acceptance_runtime SET last_mono=NULL,last_wall=NULL WHERE deployment_id=${d.id}`;
+    const calls = a.checkCalls();
+    yield* TestClock.adjust("1 second");
+    const limited = (yield* deployments.awaitAcceptanceSample("queue", d.id, scope, ordinal))
+      .deployment.acceptance!;
+    expect(limited.state).toBe("unknown");
+    expect(limited.reasons).toEqual(["evidence_limit"]);
+    expect(limited.activeSample).toBeNull();
+    expect(limited.failure).toBeNull();
+    expect(limited.ledger.count).toBe(ordinal);
+    expect(a.checkCalls()).toBe(calls);
+    expect(a.writes()).toBe(1);
+  }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(TestClock.layer())))),
+);
+it.live(
+  "verification material refuses command arguments pointing into the mutable source project",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence,
+        cfg = yield* Config.ServerConfig;
+      const command = `${process.execPath} ${f.path.join(f.repo, "artifact.cjs")}`,
+        scripts = f.scripts.map((script) =>
+          script.id === "health" ? { ...script, command } : script,
+        );
+      const profile = {
+        ...f.profile,
+        policy: {
+          ...f.profile.policy,
+          health: {
+            scriptId: "health",
+            definitionHash: releaseHash(JSON.stringify({ id: "health", command })),
+          },
+        },
+      };
+      yield* f.sql`UPDATE projection_projects SET scripts_json=${JSON.stringify(scripts)} WHERE project_id='project'`;
+      yield* f.fs.writeFileString(
+        f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+        JSON.stringify({ schemaVersion: 1, profiles: [profile] }),
+      );
+      const catalog = (yield* releases.catalog({})).profiles[0]!;
+      yield* releases.prepare("queue", {
+        ...scope,
+        preparationId: "absolute-probe",
+        workItemId: "item",
+        expectedWorkItemVersion: 1,
+        profileId: profile.id,
+        profileDigest: catalog.digest,
+      });
+      const result = (yield* releases.awaitPrepared("queue", "absolute-probe", scope)).preparation;
+      expect(result.state).toBe("blocked");
+      expect(result.reasons).toEqual(["artifact_invalid"]);
+      expect(result.evidence).toBeNull();
+    }).pipe(Effect.provide(layer)),
 );

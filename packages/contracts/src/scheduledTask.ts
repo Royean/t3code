@@ -1,4 +1,5 @@
 import {
+  WorkbenchEvidenceVerification,
   WorkbenchDeploymentHostPolicy,
   WorkbenchDeploymentPlan,
   WorkbenchDeploymentEvidence,
@@ -1303,6 +1304,7 @@ export const WorkbenchReleaseReceipt = Schema.Struct({
 });
 export type WorkbenchReleaseReceipt = typeof WorkbenchReleaseReceipt.Type;
 export const WorkbenchReleaseEvidence = Schema.Struct({
+  verification: Schema.optional(WorkbenchEvidenceVerification),
   deployment: Schema.optional(WorkbenchDeploymentEvidence),
   schemaVersion: Schema.Literal(1),
   id: ReleaseId,

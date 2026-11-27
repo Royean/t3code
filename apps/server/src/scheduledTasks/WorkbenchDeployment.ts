@@ -1,3 +1,4 @@
+import * as Acceptance from "./releaseAcceptance.ts";
 import {
   WorkbenchDeployment as DeploymentSchema,
   WorkbenchDeploymentAdmitInput,
@@ -82,6 +83,12 @@ export class WorkbenchDeployment extends Context.Service<
       id: string,
       scope: Scope,
     ) => Effect.Effect<WorkbenchDeploymentResult, WorkbenchDeploymentError>;
+    readonly awaitAcceptanceSample: (
+      queueId: string,
+      id: string,
+      scope: Scope,
+      count: number,
+    ) => Effect.Effect<WorkbenchDeploymentResult, WorkbenchDeploymentError>;
     readonly sync: Effect.Effect<void>;
   }
 >()("t3/scheduledTasks/WorkbenchDeployment") {}
@@ -94,6 +101,7 @@ const make = Effect.gen(function* () {
     serviceScope = yield* Effect.scope,
     locks = yield* KeyedLock.make<string>();
   const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const acceptance = yield* Acceptance.make((id, effect) => locks.withLock(id, effect));
   const decodeInput = Schema.decodeEffect(Schema.fromJsonString(WorkbenchDeploymentAdmitInput));
   const decodeDeployment = Schema.decodeEffect(Schema.fromJsonString(DeploymentSchema));
   const decodeProfile = Schema.decodeEffect(Schema.fromJsonString(WorkbenchReleaseHostProfile));
@@ -283,7 +291,15 @@ const make = Effect.gen(function* () {
     const save = Effect.fn("WorkbenchDeployment.save")(function* (
       patch: Partial<DeploymentRecord>,
     ) {
-      const next = { ...d, ...patch, version: d.version + 1, updatedAt: yield* now };
+      const currentStamp = yield* now;
+      const next = {
+        ...d,
+        ...patch,
+        version: d.version + 1,
+        updatedAt: DateTime.formatIso(
+          DateTime.makeUnsafe(Math.max(Date.parse(currentStamp), Date.parse(d.updatedAt))),
+        ),
+      };
       const changed =
         yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt},settled_state=CASE WHEN settled_state IS NULL AND ${["deployed", "rolled_back", "failed_unchanged"].includes(next.state)} THEN ${next.state} ELSE settled_state END WHERE id=${d.id} AND deployment_json=${canonicalReleaseJson(d)} RETURNING id`;
       if (changed.length !== 1)
@@ -374,6 +390,7 @@ const make = Effect.gen(function* () {
     )
       return yield* new Adapter.ReleaseAdapterError({ reason: "permit_invalid", stage: "commit" });
     if (d.claimState !== "committed") yield* save({ claimState: "committed" });
+    const acceptanceFailure = yield* acceptance.failureRequested(d);
     const operation = Effect.fn("WorkbenchDeployment.operation")(function* (
       kind: "deploy" | "rollback",
       allowPut: boolean,
@@ -421,7 +438,10 @@ const make = Effect.gen(function* () {
       before: WorkbenchDeploymentTarget,
     ) {
       yield* save({ state: "rolling_back", reasons: ["deployment_failed"] });
-      const rollback = yield* operation("rollback", !physicallySettled && attributable(before));
+      const rollback = yield* operation(
+        "rollback",
+        (!physicallySettled || acceptanceFailure) && attributable(before),
+      );
       if (!terminal(rollback)) {
         yield* save({
           state: rollback.state === "unknown" ? "rollback_unknown" : "rolling_back",
@@ -471,9 +491,10 @@ const make = Effect.gen(function* () {
       return;
     }
     if (
-      !alreadyDeployed &&
+      (!alreadyDeployed || acceptanceFailure) &&
       attributable(target) &&
-      (deploy.state === "failed" ||
+      (acceptanceFailure ||
+        deploy.state === "failed" ||
         deploy.result?.effect === "partial" ||
         target.state !== "consistent" ||
         !same(target.basis, p.desired))
@@ -500,6 +521,16 @@ const make = Effect.gen(function* () {
       same(version, p.desired);
     const own = attributable(verifiedTarget);
     if (
+      acceptanceFailure &&
+      deploy.result?.effect === "unchanged" &&
+      baseline &&
+      verifiedTarget.revision === p.baseline.revision
+    ) {
+      yield* save({ state: "failed_unchanged", reasons: ["deployment_failed"] });
+      return;
+    }
+    if (
+      !acceptanceFailure &&
       deploy.state === "succeeded" &&
       desired &&
       (deploy.result?.effect === "changed"
@@ -509,6 +540,7 @@ const make = Effect.gen(function* () {
           verifiedTarget.revision === p.baseline.revision)
     ) {
       yield* save({ state: "deployed", reasons: [] });
+      yield* acceptance.schedule(d.id);
       return;
     }
     if (
@@ -520,7 +552,7 @@ const make = Effect.gen(function* () {
       yield* save({ state: "failed_unchanged", reasons: ["deployment_failed"] });
       return;
     }
-    if (!alreadyDeployed && own) {
+    if ((!alreadyDeployed || acceptanceFailure) && own) {
       yield* reconcileRollback(verifiedTarget);
       return;
     }
@@ -550,6 +582,7 @@ const make = Effect.gen(function* () {
                 const reason: WorkbenchDeploymentReason = isAdapterError(cause)
                   ? cause.reason
                   : "state_unknown";
+                const observedStamp = yield* now;
                 const next: DeploymentRecord = {
                   ...d,
                   state:
@@ -568,7 +601,11 @@ const make = Effect.gen(function* () {
                         ? "unknown"
                         : d.claimState,
                   version: d.version + 1,
-                  updatedAt: yield* now,
+                  updatedAt: DateTime.formatIso(
+                    DateTime.makeUnsafe(
+                      Math.max(Date.parse(observedStamp), Date.parse(d.updatedAt)),
+                    ),
+                  ),
                 };
                 yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt} WHERE id=${d.id} AND deployment_json=${latest.deployment_json}`;
               }),
@@ -584,7 +621,30 @@ const make = Effect.gen(function* () {
       ),
     ),
   );
+  const cached = yield* sql<Row>`SELECT * FROM workbench_deployments WHERE state='deployed'`;
+  for (const row of cached) {
+    const d = yield* decodeDeployment(row.deployment_json),
+      wall = yield* now;
+    const next: DeploymentRecord = {
+      ...d,
+      state: "deploy_unknown",
+      reasons: ["state_unknown"],
+      version: d.version + 1,
+      updatedAt: DateTime.formatIso(
+        DateTime.makeUnsafe(Math.max(Date.parse(d.updatedAt), Date.parse(wall))),
+      ),
+    };
+    yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt} WHERE id=${d.id} AND deployment_json=${row.deployment_json}`;
+  }
   yield* sync.pipe(Effect.repeat(Schedule.spaced("2 seconds")), Effect.forkIn(serviceScope));
-  return WorkbenchDeployment.of({ admit, get, sync });
+  const awaitAcceptanceSample = Effect.fn("WorkbenchDeployment.awaitAcceptanceSample")(
+    function* (queueId: string, id: string, scope: Scope, count: number) {
+      yield* read(queueId, id, scope);
+      yield* acceptance.awaitSample(id, count);
+      return yield* get(queueId, id, scope);
+    },
+    Effect.catch((cause) => failure("get", cause)),
+  );
+  return WorkbenchDeployment.of({ admit, get, sync, awaitAcceptanceSample });
 });
 export const layer = Layer.effect(WorkbenchDeployment, make);

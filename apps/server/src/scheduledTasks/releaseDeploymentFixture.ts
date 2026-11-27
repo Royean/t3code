@@ -21,6 +21,7 @@ import { releaseDigest, releaseHash, canonicalReleaseJson } from "./workbenchRel
 export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function* (
   dir: string,
   baselineSha: string,
+  existing?: { bytes: string; version: string },
 ) {
   const path = yield* Path.Path,
     cfg = yield* Config.ServerConfig;
@@ -37,7 +38,7 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
   const artifacts = path.join(dir, "adapter-artifacts"),
     targetFile = path.join(dir, "actual-online.bin");
   NodeFS.mkdirSync(artifacts);
-  NodeFS.writeFileSync(targetFile, "prior-artifact");
+  NodeFS.writeFileSync(targetFile, existing?.bytes ?? "prior-artifact");
   db.exec(
     "CREATE TABLE journal(id TEXT PRIMARY KEY,kind TEXT NOT NULL,input TEXT NOT NULL,result TEXT NOT NULL); CREATE TABLE meta(id TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE claims(id TEXT PRIMARY KEY,value TEXT NOT NULL)",
   );
@@ -51,9 +52,9 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       .run(id, JSON.stringify(value));
   const baseline = {
     serviceId: "service",
-    version: "v1",
+    version: existing?.version ?? "v1",
     sourceSha: baselineSha,
-    artifactSha256: releaseHash("prior-artifact"),
+    artifactSha256: releaseHash(existing?.bytes ?? "prior-artifact"),
   };
   putMeta("target", { revision: 0, lastOperationId: null, state: "consistent", basis: baseline });
   putMeta("fence", { epoch: 0, nonce: null });
@@ -67,10 +68,20 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     operationReads = true,
     adapterAvailable = true,
     requestCount = 0,
+    healthFault = false,
+    coreFault = false,
+    checkCount = 0,
     versionFault: "http500" | "disconnect" | "invalid_json" | null = null,
     versionFaultOnlyCandidate = true;
   type Gate = {
-    point: "before_apply" | "after_apply" | "after_claim";
+    point:
+      | "before_apply"
+      | "after_apply"
+      | "after_claim"
+      | "health_check"
+      | "core_check"
+      | "version_read"
+      | "target_read";
     arrive: () => void;
     release: () => void;
     complete: () => void;
@@ -78,6 +89,7 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     wait: Promise<void>;
     completed: Effect.Effect<void>;
   };
+  const checkExecutions: string[] = [];
   let nextGate: Gate | undefined;
   const gates = new Set<Gate>();
   const gateNext = (point: Gate["point"]) => {
@@ -196,7 +208,34 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     try {
       const url = new URL(req.url!, "http://fixture"),
         route = url.pathname;
+      if (route === "/checks/health" || route === "/checks/core") {
+        checkCount++;
+        if (typeof req.headers["x-release-execution"] === "string")
+          checkExecutions.push(req.headers["x-release-execution"]);
+        const point = route.endsWith("health") ? "health_check" : "core_check";
+        if (nextGate?.point === point) {
+          const gate = nextGate;
+          nextGate = undefined;
+          gate.arrive();
+          await gate.wait;
+          gate.complete();
+        }
+        const bytes = NodeFS.readFileSync(targetFile),
+          failed = route.endsWith("health") ? healthFault : coreFault;
+        return json(res, failed || bytes.toString() !== "candidate" ? 503 : 200, {
+          serviceId: "service",
+          artifactSha256: releaseHash(bytes),
+          value: bytes.toString().toUpperCase(),
+        });
+      }
       if (route === "/version") {
+        const gate = nextGate?.point === "version_read" ? nextGate : undefined;
+        if (gate) {
+          nextGate = undefined;
+          gate.arrive();
+          await gate.wait;
+          gate.complete();
+        }
         if (
           versionFault &&
           (!versionFaultOnlyCandidate || currentBasis().artifactSha256 !== baseline.artifactSha256)
@@ -262,6 +301,13 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       const id = decodeURIComponent(route.split("/").at(-1)!);
       if (route === "/release/descriptor") return json(res, 200, descriptor);
       if (route === "/release/target") {
+        if (nextGate?.point === "target_read") {
+          const gate = nextGate;
+          nextGate = undefined;
+          gate.arrive();
+          await gate.wait;
+          gate.complete();
+        }
         return json(res, 200, target());
       }
       if (route.startsWith("/release/artifacts/")) {
@@ -411,8 +457,11 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
           updatedAt: createdAt,
         };
         record(id, kind, input, base);
-        const gate = nextGate;
-        nextGate = undefined;
+        const gate =
+          nextGate?.point === "before_apply" || nextGate?.point === "after_apply"
+            ? nextGate
+            : undefined;
+        if (gate) nextGate = undefined;
         if (gate?.point === "before_apply") {
           gate.arrive();
           await gate.wait;
@@ -420,7 +469,13 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
         const shouldFail = kind === "deploy" ? mode === "before" : mode === "rollback_failure";
         let writtenRevision: number | null = null,
           effect: "unchanged" | "changed" | "partial" = "unchanged";
-        if (!shouldFail) {
+        if (
+          !shouldFail &&
+          !(
+            kind === "deploy" &&
+            canonicalReleaseJson(p.desired) === canonicalReleaseJson(before.basis)
+          )
+        ) {
           const artifact = kind === "deploy" ? p.artifact : p.rollbackArtifact,
             bytes = NodeFS.readFileSync(path.join(artifacts, artifact.sha256));
           if (releaseHash(bytes) !== artifact.sha256) return error(res, 409, "conflict");
@@ -547,6 +602,12 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       db.close();
       db = new NodeSqlite.DatabaseSync(path.join(dir, "independent-adapter.sqlite"));
       store.database = db;
+    },
+    checkCalls: () => checkCount,
+    checkExecutions: () => [...checkExecutions],
+    setCheckFault: (role: "health" | "core", value: boolean) => {
+      if (role === "health") healthFault = value;
+      else coreFault = value;
     },
     requests: () => requestCount,
     setVersionFault: (fault: typeof versionFault, onlyCandidate = true) => {

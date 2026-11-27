@@ -180,3 +180,43 @@ only further observations; an outage cannot authorize a new rollback. Unknown op
 unrelated target changes and failed/unknown rollback retain the Workbench global lock and need
 attention. Neither timeouts nor disconnection release it. Successful deployment also retains
 the lock for later acceptance/merge and does not update main or complete the business task.
+
+## Online acceptance
+
+New preparations seal the original tracked source export and exact health/core command
+definitions in private verification material. Its manifest and archive digests enter the evidence
+the user approves. Checks execute fresh private copies of that material after deployment, even
+if the original worktree or project definitions change. Legacy evidence without the material stays
+unverified; preflight receipts and a timer cannot establish online acceptance.
+
+Health then core run for every observation sample. Configure self-contained, repeat-safe,
+read-only or idempotent probes. Online invocations receive `T3_RELEASE_PHASE=online`,
+`T3_RELEASE_CHECK_ROLE`, `T3_RELEASE_TARGET_ORIGIN`, `T3_RELEASE_VERSION_PATH`, expected
+source/artifact/version/activation identity and sealed artifact paths in a minimal environment.
+They receive no adapter/coordinator/production credentials. Explicit arguments into the mutable
+project/worktree are rejected. This runs trusted configured code in a sealed cwd, not an OS
+sandbox; scripts themselves retain the host user's filesystem/network capabilities. No setup or
+copying of ignored dependencies occurs. Choose an interval that accommodates both real checks.
+
+Only successful real probes plus current adapter and independent version proof count toward
+the full project observation duration and success threshold. Same-runner monotonic completion
+gaps credit time; missing samples, clock discontinuities and gaps reset continuity rather than
+inventing healthy time or failed checks. Restart resets an unfinished window. An interrupted
+invocation is finalized unknown once; repeat-safe new attempts use new execution identities.
+The bounded private ledger retains complete evidence while HTTP exposes first/latest samples
+and aggregates. Exhausting its fixed evidence budget leaves unknown with the lock held.
+
+A genuine terminal nonzero health/core result can authorize the original fixed baseline recovery,
+including when the broken candidate's version endpoint is unavailable. Timeout, missing material
+or an unknown result cannot authorize a new restore. Restoration still requires both independent
+proofs; failed/unknown restoration preserves failure and human attention. A deployment which
+actually changed nothing can instead prove its unchanged original baseline without writing it
+again. These actions reuse the original committed authority and rollback identity; there is no
+HTTP command for arbitrary rollback or another approval step.
+
+Passing seals the completed proof and stops sampling. Target observation continues, and a
+Native restart first marks cached current deployment state unknown until fresh observations
+succeed. Workbench can then show awaiting merge while retaining the service lock. Historical
+passed proof alone never merges main or completes the task; merge must apply its own fresh
+fences. The verifier supports at most 20,000 regular tracked entries, 64 MiB per file, a 256 MiB
+archive and an 8 MiB private manifest, without symlinks, submodules or credentials.

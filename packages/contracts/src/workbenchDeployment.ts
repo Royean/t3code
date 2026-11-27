@@ -276,7 +276,158 @@ export const WorkbenchDeploymentReason = Schema.Literals([
   "registration_changed",
 ]);
 export type WorkbenchDeploymentReason = typeof WorkbenchDeploymentReason.Type;
+export const WorkbenchEvidenceVerification = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  semanticsVersion: Schema.Literal(1),
+  ref: Id,
+  manifestDigest: Hash,
+  archive: Schema.Struct({
+    sha256: Hash,
+    bytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 268435456 })),
+  }),
+  sourceTreeSha: GitSha,
+  policyDigest: Hash,
+});
+export type WorkbenchEvidenceVerification = typeof WorkbenchEvidenceVerification.Type;
+export const WorkbenchAcceptancePolicy = Schema.Struct({
+  semanticsVersion: Schema.Literal(1),
+  sampling: Schema.Literal("health_then_core"),
+  durationSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 86400 })),
+  intervalSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3600 })),
+  consecutiveSuccesses: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
+  maxGapSeconds: Positive,
+  maxSamples: Schema.Literal(131072),
+});
+export type WorkbenchAcceptancePolicy = typeof WorkbenchAcceptancePolicy.Type;
+export const WorkbenchOnlineReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: Id,
+  sampleId: Id,
+  executionId: Id,
+  role: Schema.Literals(["health", "core"]),
+  scriptId: Id,
+  definitionHash: Hash,
+  phase: Schema.Literal("online"),
+  subject: Schema.Literal("deployed_artifact"),
+  authorizationDigest: Hash,
+  materialDigest: Hash,
+  candidate: WorkbenchDeploymentBasis,
+  activationRevision: Count,
+  runnerEpoch: Id,
+  state: Schema.Literals(["succeeded", "failed", "unknown"]),
+  exitCode: Schema.NullOr(Schema.Int),
+  outputDigest: Schema.NullOr(Hash),
+  startedAt: DeploymentIso,
+  completedAt: Schema.NullOr(DeploymentIso),
+  durationMilliseconds: Schema.NullOr(Count),
+});
+export type WorkbenchOnlineReceipt = typeof WorkbenchOnlineReceipt.Type;
+export const WorkbenchAcceptanceSample = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: Id,
+  ordinal: Positive,
+  runnerEpoch: Id,
+  inputDigest: Hash,
+  state: Schema.Literals(["succeeded", "failed", "unknown"]),
+  candidate: WorkbenchDeploymentBasis,
+  activationRevision: Count,
+  startedAt: DeploymentIso,
+  completedAt: Schema.NullOr(DeploymentIso),
+  health: Schema.NullOr(WorkbenchOnlineReceipt),
+  core: Schema.NullOr(WorkbenchOnlineReceipt),
+  targetBefore: Schema.NullOr(WorkbenchDeploymentTarget),
+  targetAfter: Schema.NullOr(WorkbenchDeploymentTarget),
+  versionObservation: Schema.NullOr(
+    Schema.Struct({ basis: WorkbenchDeploymentBasis, observedAt: DeploymentIso }),
+  ),
+  gapMilliseconds: Schema.NullOr(Count),
+  creditedElapsedMilliseconds: Count,
+  digest: Hash,
+  wallGapMilliseconds: Schema.NullOr(Count),
+});
+export type WorkbenchAcceptanceSample = typeof WorkbenchAcceptanceSample.Type;
+export const WorkbenchAcceptanceReason = Schema.Literals([
+  "material_missing",
+  "material_invalid",
+  "health_failed",
+  "core_failed",
+  "observation_failed",
+  "check_unknown",
+  "window_gap",
+  "clock_changed",
+  "native_restarted",
+  "target_changed",
+  "evidence_limit",
+]);
+export type WorkbenchAcceptanceReason = typeof WorkbenchAcceptanceReason.Type;
+export const WorkbenchAcceptance = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: Id,
+  authorizationDigest: Hash,
+  materialDigest: Schema.NullOr(Hash),
+  policy: WorkbenchAcceptancePolicy,
+  candidate: WorkbenchDeploymentBasis,
+  activationRevision: Count,
+  deployOperationId: Id,
+  version: Positive,
+  state: Schema.Literals(["pending", "checking", "observing", "passed", "failed", "unknown"]),
+  reasons: Schema.Array(WorkbenchAcceptanceReason).check(Schema.isMaxLength(11)),
+  runnerEpoch: Schema.NullOr(Id),
+  firstSample: Schema.NullOr(WorkbenchAcceptanceSample),
+  latestSample: Schema.NullOr(WorkbenchAcceptanceSample),
+  window: Schema.Struct({
+    id: Schema.NullOr(Id),
+    runnerEpoch: Schema.NullOr(Id),
+    startedAt: Schema.NullOr(DeploymentIso),
+    endedAt: Schema.NullOr(DeploymentIso),
+    elapsedMilliseconds: Count,
+    successfulSamples: Count,
+    maxGapMilliseconds: Count,
+    resets: Count,
+    resetReason: Schema.NullOr(
+      Schema.Literals([
+        "window_gap",
+        "clock_changed",
+        "native_restarted",
+        "check_unknown",
+        "target_changed",
+      ]),
+    ),
+    maxWallGapMilliseconds: Count,
+  }),
+  ledger: Schema.Struct({
+    ref: Id,
+    count: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 131072 })),
+    digest: Hash,
+  }),
+  failure: Schema.NullOr(
+    Schema.Struct({
+      id: Id,
+      reason: Schema.Literals(["health_failed", "core_failed", "observation_failed"]),
+      role: Schema.Literals(["health", "core"]),
+      sampleId: Id,
+      receiptId: Id,
+      outputDigest: Hash,
+      occurredAt: DeploymentIso,
+    }),
+  ),
+  createdAt: DeploymentIso,
+  updatedAt: DeploymentIso,
+  observedAt: Schema.NullOr(DeploymentIso),
+  completedAt: Schema.NullOr(DeploymentIso),
+  activeSample: Schema.NullOr(
+    Schema.Struct({
+      id: Id,
+      ordinal: Positive,
+      runnerEpoch: Id,
+      role: Schema.Literals(["health", "core"]),
+      startedAt: DeploymentIso,
+    }),
+  ),
+});
+export type WorkbenchAcceptance = typeof WorkbenchAcceptance.Type;
 export const WorkbenchDeployment = Schema.Struct({
+  acceptance: Schema.optional(Schema.NullOr(WorkbenchAcceptance)),
   id: Id,
   authorizationDigest: Hash,
   preparationId: Id,
