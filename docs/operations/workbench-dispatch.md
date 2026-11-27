@@ -119,3 +119,19 @@ success or task completion.
 
 Diff insertion/deletion totals count text lines only; binary files still count as changed files,
 and their complete Git binary patches remain available in the sealed diff.
+
+Release Git observations use the fixed system Git with fsmonitor, hooks, paging and
+external diff/text conversion disabled. Their environment omits service/API variables,
+Git repository selectors and interactive askpass helpers. Fresh main is read from the
+registered remote's single URL in a private observer directory whose Git ceiling blocks
+parent repository discovery. Project-local SSH commands, upload-pack commands and
+credential helpers therefore cannot authorize extra execution. Normal authentication
+uses the host's global Git configuration, home and SSH agent, with the same minimal
+environment; move intentional authentication configuration there rather than project
+`.git/config`. Multiple remote URLs, embedded HTTP credentials and external helper
+protocols remain blocked. The resolved URL is hashed into private source identity, so
+changing it invalidates evidence even when the advertised main commit stays equal.
+
+Operational failures retain their immediate cause and stage in private server diagnostics.
+Workbench receives only fixed failure reasons; diagnostic paths, process output and cause
+objects are excluded from its release HTTP responses.

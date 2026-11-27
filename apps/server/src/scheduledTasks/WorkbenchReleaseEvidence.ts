@@ -12,7 +12,7 @@ import {
   type WorkbenchReleaseDiffResult,
   type WorkbenchReleasePreparation,
   type WorkbenchReleaseHostProfile,
-  type WorkbenchReleaseReason,
+  WorkbenchReleaseReason,
   type WorkbenchReleaseReceipt,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -27,7 +27,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Config from "../config.ts";
 import * as Environment from "../environment/ServerEnvironment.ts";
-import * as Git from "../vcs/GitVcsDriver.ts";
+import type * as Git from "../vcs/GitVcsDriver.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Runner from "../processRunner.ts";
 import {
   canonicalReleaseJson,
@@ -68,6 +69,7 @@ type Source = {
   head: string;
   tree: string;
   base: string;
+  remoteDigest: string;
 };
 type Row = {
   id: string;
@@ -86,10 +88,78 @@ class Blocked extends Schema.TaggedError<Blocked>()("ReleasePreparationBlocked",
   reason: Schema.String,
 }) {}
 const problem = (reason: WorkbenchReleaseReason) => new Blocked({ reason });
-const isBlocked = Schema.is(Blocked);
+const DiagnosticStage = Schema.Literals([
+  "catalog",
+  "prepare",
+  "get",
+  "revalidate",
+  "diff",
+  "await_prepared",
+  "profile",
+  "source",
+  "artifact",
+  "target",
+  "snapshot",
+  "git",
+  "build",
+  "check",
+  "health",
+  "core",
+  "rollback_verify",
+  "cleanup",
+]);
+type DiagnosticStage = typeof DiagnosticStage.Type;
+class ReleaseEvidenceOperationError extends Schema.TaggedError<ReleaseEvidenceOperationError>()(
+  "ReleaseEvidenceOperationError",
+  {
+    stage: DiagnosticStage,
+    reason: WorkbenchReleaseReason,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return `Release evidence operation failed (${this.stage}).`;
+  }
+}
+class ReleaseExecutionExitError extends Schema.TaggedError<ReleaseExecutionExitError>()(
+  "ReleaseExecutionExitError",
+  {
+    exitCode: Schema.NullOr(Schema.Int),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return "Release subprocess did not complete successfully.";
+  }
+}
+const isOperationError = Schema.is(ReleaseEvidenceOperationError);
+const isPreparationProblem = Schema.is(Schema.Union([Blocked, ReleaseEvidenceOperationError]));
 const isReleaseError = Schema.is(WorkbenchReleaseError);
-const failure = (cause: unknown) =>
-  isReleaseError(cause) ? cause : new WorkbenchReleaseError({ reason: "unavailable" });
+const causedProblem = (stage: DiagnosticStage, reason: WorkbenchReleaseReason, cause: unknown) =>
+  isOperationError(cause) ? cause : new ReleaseEvidenceOperationError({ stage, reason, cause });
+const reportFailure = Effect.fn("WorkbenchReleaseEvidence.reportFailure")(function* (
+  stage: DiagnosticStage,
+  reason: WorkbenchReleaseReason,
+  cause: unknown,
+) {
+  yield* Effect.logWarning(
+    "Release evidence operation failed",
+    causedProblem(stage, reason, cause),
+  );
+});
+// Public release errors omit private causes after the internal diagnostics record them.
+const publicFailure = Effect.fn("WorkbenchReleaseEvidence.publicFailure")(function* (
+  stage: DiagnosticStage,
+  cause: unknown,
+) {
+  if (isReleaseError(cause)) return yield* cause;
+  yield* reportFailure(
+    stage,
+    isOperationError(cause) ? cause.reason : "evidence_unavailable",
+    cause,
+  );
+  return yield* new WorkbenchReleaseError({ reason: "unavailable" });
+});
 const decodePreparation = Schema.decodeEffect(Schema.fromJsonString(PreparationSchema));
 const decodeEvidence = Schema.decodeUnknownEffect(EvidenceSchema);
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -153,7 +223,6 @@ const make = Effect.gen(function* () {
     fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
     config = yield* Config.ServerConfig,
-    git = yield* Git.GitVcsDriver,
     runner = yield* Runner.ProcessRunner;
   const serviceScope = yield* Effect.scope;
   const context = Context.make(FileSystem.FileSystem, fs).pipe(
@@ -166,6 +235,190 @@ const make = Effect.gen(function* () {
   const stamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const root = path.join(config.stateDir, "workbench-release-evidence");
   const directory = (id: string) => path.join(root, releaseHash(id));
+  const executeGit = Effect.fn("WorkbenchReleaseEvidence.executeGit")(function* (
+    input: Git.ExecuteGitInput,
+  ) {
+    const host = yield* HostProcess.Environment;
+    const env: NodeJS.ProcessEnv = {
+      PATH: host.PATH ?? "/usr/bin:/bin",
+      HOME: host.HOME ?? config.stateDir,
+      ...(host.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: host.SSH_AUTH_SOCK } : {}),
+      ...(host.USER ? { USER: host.USER } : {}),
+      ...(host.LOGNAME ? { LOGNAME: host.LOGNAME } : {}),
+      LANGUAGE: "C",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_ASKPASS: "",
+      SSH_ASKPASS: "",
+      SSH_ASKPASS_REQUIRE: "never",
+      GIT_PAGER: "cat",
+      PAGER: "cat",
+      GIT_CEILING_DIRECTORIES: path.dirname(input.cwd),
+      GIT_ALLOW_PROTOCOL: "file:ssh:http:https:git",
+    };
+    // Network observations run outside the project; only host/global authentication config applies.
+    const hardened = [
+      "--no-pager",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.untrackedCache=false",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.pager=cat",
+      "-c",
+      "diff.external=",
+      "-c",
+      "diff.trustExitCode=false",
+    ];
+    const result = yield* runner
+      .run({
+        command: "/usr/bin/git",
+        args: [...hardened, ...input.args],
+        cwd: input.cwd,
+        env,
+        extendEnv: false,
+        timeout: input.timeoutMs ?? 10000,
+        maxOutputBytes: input.maxOutputBytes ?? MAX_DIFF,
+        outputMode: "truncate",
+      })
+      .pipe(
+        Effect.mapError((cause) =>
+          causedProblem(
+            "git",
+            cause._tag === "ProcessTimeoutError"
+              ? "timeout"
+              : cause._tag === "ProcessOutputLimitError"
+                ? "output_limit"
+                : "evidence_unavailable",
+            cause,
+          ),
+        ),
+      );
+    if (
+      result.code === null ||
+      (!input.allowNonZeroExit && result.code !== 0) ||
+      result.stdoutInvalidUtf8 ||
+      result.stderrInvalidUtf8
+    )
+      return yield* causedProblem(
+        "git",
+        "evidence_unavailable",
+        new ReleaseExecutionExitError({ exitCode: result.code, cause: result }),
+      );
+    return {
+      exitCode: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      stdoutTruncated: result.stdoutTruncated,
+      stderrTruncated: result.stderrTruncated,
+    };
+  });
+  const resolveCommit = Effect.fn("WorkbenchReleaseEvidence.resolveCommit")(function* (input: {
+    cwd: string;
+    revision: string;
+  }) {
+    const result = yield* executeGit({
+      operation: "release.resolveCommit",
+      cwd: input.cwd,
+      args: ["rev-parse", "--verify", `${input.revision}^{commit}`],
+      maxOutputBytes: 4096,
+    });
+    const commitSha = result.stdout.trim();
+    if (result.stdoutTruncated || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commitSha))
+      return yield* problem("evidence_unavailable");
+    return { commitSha };
+  });
+  const listWorktreePaths = Effect.fn("WorkbenchReleaseEvidence.listWorktreePaths")(function* (
+    cwd: string,
+  ) {
+    const result = yield* executeGit({
+      operation: "release.worktrees",
+      cwd,
+      args: ["worktree", "list", "--porcelain", "-z"],
+    });
+    if (result.stdoutTruncated) return yield* problem("evidence_unavailable");
+    return result.stdout.split("\0\0").flatMap((record) => {
+      const fields = record.split("\0"),
+        entry = fields.find((f) => f.startsWith("worktree "));
+      return !entry || fields.some((f) => f.startsWith("prunable"))
+        ? []
+        : [path.resolve(cwd, entry.slice("worktree ".length))];
+    });
+  });
+  const git = { execute: executeGit, resolveCommit, listWorktreePaths };
+  const remoteDefinition = Effect.fn("WorkbenchReleaseEvidence.remoteDefinition")(function* (
+    cwd: string,
+    main: WorkbenchReleaseHostProfile["policy"]["main"],
+  ) {
+    const configured = yield* executeGit({
+      operation: "release.remote",
+      cwd,
+      args: ["config", "--local", "--get-all", `remote.${main.remote}.url`],
+      maxOutputBytes: 16384,
+    });
+    const urls = configured.stdout.replace(/\r?\n$/, "").split(/\r?\n/);
+    if (
+      configured.stdoutTruncated ||
+      urls.length !== 1 ||
+      !urls[0] ||
+      urls[0].trim() !== urls[0] ||
+      /[\x00-\x1f\x7f]/.test(urls[0])
+    )
+      return yield* problem("profile_invalid");
+    const originalUrl = urls[0];
+    let url = originalUrl;
+    if (path.isAbsolute(url)) url = path.resolve(url);
+    else if (
+      /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*:[^\x00-\x20]+$/.test(url) &&
+      !url.includes("://")
+    ) {
+      if (url.startsWith("ext:") || url.includes("::")) return yield* problem("profile_invalid");
+    } else {
+      const parsed = yield* Effect.try({
+        try: () => new URL(url),
+        catch: (cause) => causedProblem("source", "profile_invalid", cause),
+      });
+      if (
+        !["https:", "http:", "ssh:", "git:", "file:"].includes(parsed.protocol) ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash ||
+        (parsed.protocol !== "ssh:" && parsed.username)
+      )
+        return yield* problem("profile_invalid");
+    }
+    return {
+      url,
+      remoteDigest: releaseDigest({ remote: main.remote, url: originalUrl, ref: main.ref }),
+    };
+  });
+  const remoteObservation = Effect.fn("WorkbenchReleaseEvidence.remoteObservation")(function* (
+    cwd: string,
+    main: WorkbenchReleaseHostProfile["policy"]["main"],
+  ) {
+    const definition = yield* remoteDefinition(cwd, main);
+    const observer = path.join(root, "git-observer");
+    yield* fs.makeDirectory(observer, { recursive: true, mode: 0o700 });
+    if (yield* fs.exists(path.join(observer, ".git")))
+      return yield* problem("evidence_unavailable");
+    const result = yield* executeGit({
+      operation: "release.remoteObservation",
+      cwd: observer,
+      args: [
+        "ls-remote",
+        "--refs",
+        "--exit-code",
+        "--upload-pack=git-upload-pack",
+        definition.url,
+        main.ref,
+      ],
+      maxOutputBytes: 16384,
+    });
+    return { ...result, remoteDigest: definition.remoteDigest };
+  });
   const authorize = Effect.fn("WorkbenchReleaseEvidence.authorize")(function* (
     queueId: string,
     scope: Scope,
@@ -210,14 +463,16 @@ const make = Effect.gen(function* () {
     projectId: string,
   ) {
     const registry = yield* readReleaseProfiles().pipe(
-      Effect.mapError(() => problem("profile_invalid")),
+      Effect.mapError((cause) => causedProblem("profile", "profile_invalid", cause)),
     );
     const found = registry.profiles.find(
       (p) => p.id === id && p.projectId === projectId && p.enabled,
     );
     if (!found) return yield* problem("profile_missing");
     if (releaseDigest(found) !== hash) return yield* problem("profile_changed");
-    yield* releaseProfileScripts(found).pipe(Effect.mapError(() => problem("profile_changed")));
+    yield* releaseProfileScripts(found).pipe(
+      Effect.mapError((cause) => causedProblem("profile", "profile_changed", cause)),
+    );
     return found;
   });
   const task = Effect.fn("WorkbenchReleaseEvidence.task")(function* (
@@ -264,6 +519,7 @@ const make = Effect.gen(function* () {
     queueId: string,
     input: WorkbenchReleasePrepareInput,
     original: Source,
+    main: WorkbenchReleaseHostProfile["policy"]["main"],
   ) {
     const w = original.task;
     const run = (args: ReadonlyArray<string>) =>
@@ -276,6 +532,8 @@ const make = Effect.gen(function* () {
       });
     const before = yield* task(queueId, input);
     if (canonicalReleaseJson(before) !== canonicalReleaseJson(w))
+      return yield* problem("source_changed");
+    if ((yield* remoteDefinition(w.worktree_path, main)).remoteDigest !== original.remoteDigest)
       return yield* problem("source_changed");
     const branch = yield* run(["symbolic-ref", "--quiet", "--short", "HEAD"]);
     const head = (yield* git.resolveCommit({ cwd: w.worktree_path, revision: "HEAD" })).commitSha;
@@ -309,13 +567,22 @@ const make = Effect.gen(function* () {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const checked = yield* task(queueId, input).pipe(
+          Effect.tapError((cause) =>
+            reportFailure(
+              "source",
+              isPreparationProblem(cause)
+                ? (cause.reason as WorkbenchReleaseReason)
+                : "evidence_unavailable",
+              cause,
+            ),
+          ),
           Effect.match({
             onSuccess: (value) =>
               canonicalReleaseJson(value) === canonicalReleaseJson(original.task)
                 ? null
                 : ("source_changed" as const),
             onFailure: (e) =>
-              isBlocked(e)
+              isPreparationProblem(e)
                 ? (e.reason as WorkbenchReleaseReason)
                 : ("evidence_unavailable" as const),
           }),
@@ -372,13 +639,7 @@ const make = Effect.gen(function* () {
     if (status.stdoutTruncated || status.stdout.trim()) return yield* problem("source_dirty");
     const head = (yield* git.resolveCommit({ cwd: real, revision: "HEAD" })).commitSha;
     const tree = (yield* run(["rev-parse", "--verify", `${head}^{tree}`])).stdout.trim();
-    const remote = yield* run([
-      "ls-remote",
-      "--refs",
-      "--exit-code",
-      p.policy.main.remote,
-      p.policy.main.ref,
-    ]);
+    const remote = yield* remoteObservation(real, p.policy.main);
     const line = remote.stdout.trim().split(/\r?\n/);
     const match = /^([a-f0-9]{40}|[a-f0-9]{64})\s+(.+)$/.exec(line[0] ?? "");
     if (remote.stdoutTruncated || line.length !== 1 || !match || match[2] !== p.policy.main.ref)
@@ -391,8 +652,8 @@ const make = Effect.gen(function* () {
       allowNonZeroExit: true,
     });
     if (integrated.exitCode !== 0) return yield* problem("base_not_integrated");
-    const observed = { task: w, real, common, head, tree, base };
-    yield* localFence(queueId, input, observed);
+    const observed = { task: w, real, common, head, tree, base, remoteDigest: remote.remoteDigest };
+    yield* localFence(queueId, input, observed, p.policy.main);
     return observed satisfies Source;
   });
   const regular = Effect.fn("WorkbenchReleaseEvidence.regular")(function* (
@@ -405,13 +666,19 @@ const make = Effect.gen(function* () {
     let current = parent;
     for (const part of relative.split("/")) {
       current = path.join(current, part);
-      const info = yield* fs.stat(current).pipe(Effect.mapError(() => problem(reason)));
+      const info = yield* fs
+        .stat(current)
+        .pipe(Effect.mapError((cause) => causedProblem("artifact", reason, cause)));
       if (info.type === "SymbolicLink") return yield* problem(invalid);
       if ((yield* fs.realPath(current)) !== current) return yield* problem(invalid);
     }
-    const info = yield* fs.stat(current);
+    const info = yield* fs
+      .stat(current)
+      .pipe(Effect.mapError((cause) => causedProblem("artifact", reason, cause)));
     if (info.type !== "File" || info.size > MAX_ARTIFACT) return yield* problem(invalid);
-    const bytes = yield* fs.readFile(current);
+    const bytes = yield* fs
+      .readFile(current)
+      .pipe(Effect.mapError((cause) => causedProblem("artifact", reason, cause)));
     if (bytes.byteLength !== Number(info.size) || bytes.byteLength > MAX_ARTIFACT)
       return yield* problem(reason);
     return bytes;
@@ -451,13 +718,13 @@ const make = Effect.gen(function* () {
         }
         return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       },
-      catch: () => problem("target_unavailable"),
+      catch: (cause) => causedProblem("target", "target_unavailable", cause),
     }).pipe(
       Effect.timeout("10 seconds"),
-      Effect.mapError(() => problem("target_unavailable")),
+      Effect.mapError((cause) => causedProblem("target", "target_unavailable", cause)),
     );
     const decoded = yield* decodeTarget(yield* decodeJson(result)).pipe(
-      Effect.mapError(() => problem("target_unavailable")),
+      Effect.mapError((cause) => causedProblem("target", "target_unavailable", cause)),
     );
     if (decoded.serviceId !== p.policy.target.serviceId) return yield* problem("target_changed");
     return {
@@ -486,29 +753,28 @@ const make = Effect.gen(function* () {
       };
     },
     Effect.provide(context),
-    Effect.mapError(failure),
+    Effect.catch((cause) => publicFailure("catalog", cause)),
   );
-  const get = Effect.fn("WorkbenchReleaseEvidence.get")(function* (
-    queueId: string,
-    id: string,
-    scope: Scope,
-  ) {
-    const row = yield* read(queueId, id, scope);
-    let p = yield* decodePreparation(row.preparation_json);
-    if ((p.state === "preparing" || p.state === "queued") && !jobs.has(id)) {
-      const now = yield* stamp;
-      p = {
-        ...p,
-        state: "unknown",
-        reasons: ["preparation_interrupted"],
-        version: p.version + 1,
-        updatedAt: now,
-        validation: { state: "unknown", version: p.validation.version + 1, observedAt: now },
-      };
-      yield* save(p);
-    }
-    return yield* envelope(queueId, scope, p);
-  }, Effect.mapError(failure));
+  const get = Effect.fn("WorkbenchReleaseEvidence.get")(
+    function* (queueId: string, id: string, scope: Scope) {
+      const row = yield* read(queueId, id, scope);
+      let p = yield* decodePreparation(row.preparation_json);
+      if ((p.state === "preparing" || p.state === "queued") && !jobs.has(id)) {
+        const now = yield* stamp;
+        p = {
+          ...p,
+          state: "unknown",
+          reasons: ["preparation_interrupted"],
+          version: p.version + 1,
+          updatedAt: now,
+          validation: { state: "unknown", version: p.validation.version + 1, observedAt: now },
+        };
+        yield* save(p);
+      }
+      return yield* envelope(queueId, scope, p);
+    },
+    Effect.catch((cause) => publicFailure("get", cause)),
+  );
   const revalidate = Effect.fn("WorkbenchReleaseEvidence.revalidate")(
     function* (queueId: string, id: string, input: WorkbenchReleaseRevalidateInput) {
       return yield* locks.withLock(
@@ -579,18 +845,31 @@ const make = Effect.gen(function* () {
                 evidence.diff.digest
             )
               return yield* problem("artifact_changed");
-            yield* localFence(queueId, prepInput, original);
+            yield* localFence(queueId, prepInput, original, finalProfile.policy.main);
           }).pipe(
+            Effect.tapError((cause) =>
+              reportFailure(
+                "revalidate",
+                isPreparationProblem(cause)
+                  ? (cause.reason as WorkbenchReleaseReason)
+                  : "evidence_unavailable",
+                cause,
+              ),
+            ),
             Effect.match({
               onSuccess: () => null,
               onFailure: (error) =>
-                isBlocked(error)
+                isPreparationProblem(error)
                   ? (error.reason as WorkbenchReleaseReason)
                   : ("evidence_unavailable" as const),
             }),
           );
           const now = yield* stamp;
-          const unknown = checked === "target_unavailable" || checked === "evidence_unavailable";
+          const unknown =
+            checked === "target_unavailable" ||
+            checked === "evidence_unavailable" ||
+            checked === "timeout" ||
+            checked === "output_limit";
           const next: WorkbenchReleasePreparation = {
             ...p,
             state: checked ? (unknown ? "unknown" : "invalidated") : "ready",
@@ -611,7 +890,7 @@ const make = Effect.gen(function* () {
       );
     },
     Effect.provide(context),
-    Effect.mapError(failure),
+    Effect.catch((cause) => publicFailure("revalidate", cause)),
   );
   const produce = Effect.fn("WorkbenchReleaseEvidence.produce")(function* (
     queueId: string,
@@ -646,15 +925,22 @@ const make = Effect.gen(function* () {
       cwd: initial.real,
       args: ["archive", "--format=tar", `--output=${archive}`, initial.head],
     });
-    const unpack = yield* runner.run({
-      command: "/usr/bin/tar",
-      args: ["-xf", archive, "-C", snapshot],
-      env: { PATH: "/usr/bin:/bin" },
-      extendEnv: false,
-      timeout: "120 seconds",
-      maxOutputBytes: MAX_DIFF,
-    });
-    if (unpack.code !== 0) return yield* problem("artifact_invalid");
+    const unpack = yield* runner
+      .run({
+        command: "/usr/bin/tar",
+        args: ["-xf", archive, "-C", snapshot],
+        env: { PATH: "/usr/bin:/bin" },
+        extendEnv: false,
+        timeout: "120 seconds",
+        maxOutputBytes: MAX_DIFF,
+      })
+      .pipe(Effect.mapError((cause) => causedProblem("snapshot", "artifact_invalid", cause)));
+    if (unpack.code !== 0)
+      return yield* causedProblem(
+        "snapshot",
+        "artifact_invalid",
+        new ReleaseExecutionExitError({ exitCode: unpack.code, cause: unpack }),
+      );
     yield* fs.remove(archive);
     const unchanged = Effect.fn("WorkbenchReleaseEvidence.snapshotUnchanged")(function* () {
       for (const m of tracked) {
@@ -697,7 +983,7 @@ const make = Effect.gen(function* () {
     const patchBytes = yield* regular(dir, "diff", "evidence_unavailable");
     yield* Effect.try({
       try: () => new TextDecoder("utf-8", { fatal: true }).decode(patchBytes),
-      catch: () => problem("evidence_unavailable"),
+      catch: (cause) => causedProblem("snapshot", "evidence_unavailable", cause),
     });
     yield* fs.chmod(path.join(dir, "diff"), 0o400);
     const stats = yield* git.execute({
@@ -772,7 +1058,8 @@ const make = Effect.gen(function* () {
         })
         .pipe(
           Effect.mapError((e) =>
-            problem(
+            causedProblem(
+              role,
               e._tag === "ProcessTimeoutError"
                 ? "timeout"
                 : e._tag === "ProcessOutputLimitError"
@@ -784,6 +1071,7 @@ const make = Effect.gen(function* () {
                       : role === "rollback_verify"
                         ? "rollback_failed"
                         : "preflight_failed",
+              e,
             ),
           ),
         );
@@ -796,7 +1084,8 @@ const make = Effect.gen(function* () {
         result.stderrTruncated
       ) {
         yield* sql`UPDATE workbench_release_stages SET state='failed',exit_code=${result.code},output_digest=${outputDigest},completed_at=${completedAt} WHERE preparation_id=${id} AND ordinal=${i}`;
-        return yield* problem(
+        return yield* causedProblem(
+          role,
           role === "build"
             ? "build_failed"
             : role === "check"
@@ -804,6 +1093,7 @@ const make = Effect.gen(function* () {
               : role === "rollback_verify"
                 ? "rollback_failed"
                 : "preflight_failed",
+          new ReleaseExecutionExitError({ exitCode: result.code, cause: result }),
         );
       }
       yield* unchanged();
@@ -876,7 +1166,7 @@ const make = Effect.gen(function* () {
       releaseHash(yield* regular(dir, "diff", "artifact_changed")) !== releaseHash(patchBytes)
     )
       return yield* problem("artifact_changed");
-    yield* localFence(queueId, input, initial);
+    yield* localFence(queueId, input, initial, sealedProfile.policy.main);
     const now = yield* stamp,
       w = initial.task;
     const unsigned = {
@@ -976,17 +1266,27 @@ const make = Effect.gen(function* () {
             input.profileDigest,
             input.projectId,
           ).pipe(
+            Effect.tapError((cause) => reportFailure("profile", "profile_changed", cause)),
             Effect.mapError(
               (e) =>
                 new WorkbenchReleaseError({
                   reason:
-                    isBlocked(e) && e.reason === "profile_changed"
+                    isPreparationProblem(e) && e.reason === "profile_changed"
                       ? "profile_changed"
                       : "profile_invalid",
                 }),
             ),
           );
           const initial = yield* source(queueId, input, registered).pipe(
+            Effect.tapError((cause) =>
+              reportFailure(
+                "source",
+                isPreparationProblem(cause)
+                  ? (cause.reason as WorkbenchReleaseReason)
+                  : "evidence_unavailable",
+                cause,
+              ),
+            ),
             Effect.mapError(() => new WorkbenchReleaseError({ reason: "stale_state" })),
           );
           const now = yield* stamp,
@@ -1016,10 +1316,17 @@ const make = Effect.gen(function* () {
             Effect.timeout("20 minutes"),
             Effect.catch((error) =>
               Effect.gen(function* () {
+                yield* reportFailure(
+                  "prepare",
+                  isPreparationProblem(error)
+                    ? (error.reason as WorkbenchReleaseReason)
+                    : "evidence_unavailable",
+                  error,
+                );
                 const row = yield* read(queueId, input.preparationId, input),
                   saved = yield* decodePreparation(row.preparation_json),
                   now = yield* stamp;
-                const reason = isBlocked(error)
+                const reason = isPreparationProblem(error)
                   ? (error.reason as WorkbenchReleaseReason)
                   : isReleaseError(error) && error.reason === "profile_changed"
                     ? "profile_changed"
@@ -1046,11 +1353,7 @@ const make = Effect.gen(function* () {
                 }),
                 fs.remove(path.join(directory(input.preparationId), "source.tar"), { force: true }),
               ]).pipe(
-                Effect.catch(() =>
-                  Effect.logWarning("Release preparation temporary source cleanup failed", {
-                    preparationId: input.preparationId,
-                  }),
-                ),
+                Effect.catch((cause) => reportFailure("cleanup", "evidence_unavailable", cause)),
               ),
             ),
             Effect.ensuring(Deferred.succeed(done, undefined)),
@@ -1062,45 +1365,43 @@ const make = Effect.gen(function* () {
       );
     },
     Effect.provide(context),
-    Effect.mapError(failure),
+    Effect.catch((cause) => publicFailure("prepare", cause)),
   );
-  const diff = Effect.fn("WorkbenchReleaseEvidence.diff")(function* (
-    queueId: string,
-    id: string,
-    scope: Scope,
-  ) {
-    const row = yield* read(queueId, id, scope),
-      p = yield* decodePreparation(row.preparation_json);
-    if (!p.evidence) return yield* new WorkbenchReleaseError({ reason: "not_found" });
-    const bytes = yield* regular(directory(id), "diff", "evidence_unavailable");
-    if (bytes.byteLength > MAX_DIFF || releaseHash(bytes) !== p.evidence.diff.digest)
-      return yield* new WorkbenchReleaseError({ reason: "unavailable" });
-    return {
-      environmentId: yield* environment.getEnvironmentId,
-      trackingId: scope.expectedTrackingId,
-      queueId,
-      controllerId: scope.controllerId,
-      projectId: scope.projectId,
-      preparationId: id,
-      diff: {
-        ref: p.evidence.diff.ref,
-        digest: p.evidence.diff.digest,
-        byteCount: bytes.byteLength,
-        complete: true as const,
-        patch: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-      },
-    };
-  }, Effect.mapError(failure));
-  const awaitPrepared = Effect.fn("WorkbenchReleaseEvidence.awaitPrepared")(function* (
-    queueId: string,
-    id: string,
-    scope: Scope,
-  ) {
-    yield* authorize(queueId, scope);
-    const done = jobs.get(id);
-    if (done) yield* Deferred.await(done);
-    return yield* get(queueId, id, scope);
-  }, Effect.mapError(failure));
+  const diff = Effect.fn("WorkbenchReleaseEvidence.diff")(
+    function* (queueId: string, id: string, scope: Scope) {
+      const row = yield* read(queueId, id, scope),
+        p = yield* decodePreparation(row.preparation_json);
+      if (!p.evidence) return yield* new WorkbenchReleaseError({ reason: "not_found" });
+      const bytes = yield* regular(directory(id), "diff", "evidence_unavailable");
+      if (bytes.byteLength > MAX_DIFF || releaseHash(bytes) !== p.evidence.diff.digest)
+        return yield* new WorkbenchReleaseError({ reason: "unavailable" });
+      return {
+        environmentId: yield* environment.getEnvironmentId,
+        trackingId: scope.expectedTrackingId,
+        queueId,
+        controllerId: scope.controllerId,
+        projectId: scope.projectId,
+        preparationId: id,
+        diff: {
+          ref: p.evidence.diff.ref,
+          digest: p.evidence.diff.digest,
+          byteCount: bytes.byteLength,
+          complete: true as const,
+          patch: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        },
+      };
+    },
+    Effect.catch((cause) => publicFailure("diff", cause)),
+  );
+  const awaitPrepared = Effect.fn("WorkbenchReleaseEvidence.awaitPrepared")(
+    function* (queueId: string, id: string, scope: Scope) {
+      yield* authorize(queueId, scope);
+      const done = jobs.get(id);
+      if (done) yield* Deferred.await(done);
+      return yield* get(queueId, id, scope);
+    },
+    Effect.catch((cause) => publicFailure("await_prepared", cause)),
+  );
   return WorkbenchReleaseEvidence.of({ catalog, prepare, get, revalidate, diff, awaitPrepared });
 });
 export const layer = Layer.effect(WorkbenchReleaseEvidence, make);

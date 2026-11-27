@@ -26,6 +26,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Config from "../config.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as Git from "../vcs/GitVcsDriver.ts";
@@ -400,118 +401,170 @@ it.live("a new service observes an interrupted durable prepare without rebuildin
 class ReleaseTestApi extends HttpApi.make("environment").add(
   EnvironmentHttpApi.groups.workbenchRelease,
 ) {}
-it.live(
-  "release HTTP requires both scopes, returns durable 202, and fences cross-controller reads",
-  () =>
-    Effect.gen(function* () {
-      yield* fixture;
-      const releases = yield* Release.WorkbenchReleaseEvidence;
-      const web = HttpRouter.toWebHandler(
-        HttpApiBuilder.layer(ReleaseTestApi).pipe(
-          Layer.provide(ReleaseHttp.layer),
-          Layer.provide(Layer.succeed(Release.WorkbenchReleaseEvidence, releases)),
-          Layer.provide(
-            Layer.succeed(EnvironmentAuthenticatedAuth, (effect) =>
-              Effect.gen(function* () {
-                const request = yield* HttpServerRequest.HttpServerRequest;
-                if (!request.headers["test-scopes"])
-                  return yield* failEnvironmentAuthInvalid("missing_credential");
-                return yield* effect.pipe(
-                  Effect.provideService(EnvironmentAuthenticatedPrincipal, {
-                    sessionId: AuthSessionId.make("fixture"),
-                    subject: "fixture",
-                    method: "bearer-access-token",
-                    scopes: new Set(
-                      request.headers["test-scopes"].split(",") as AuthEnvironmentScope[],
-                    ),
-                  }),
-                );
-              }),
-            ),
-          ),
-          Layer.provide(
-            HttpPlatform.layer.pipe(
-              Layer.provide(NodeServices.layer),
-              Layer.provide(Etag.layerWeak),
-            ),
-          ),
-          Layer.provide(Etag.layerWeak),
-          Layer.provide(platform),
-        ),
-        { disableLogger: true },
-      );
-      yield* Effect.addFinalizer(() => Effect.promise(() => web.dispose()));
-      const both = "orchestration:read,orchestration:operate";
-      const call = (url: string, scopes?: string, body?: unknown) =>
-        Effect.promise(() =>
-          web.handler(
-            new Request(`http://fixture.local${url}`, {
-              method: body === undefined ? "GET" : "POST",
-              headers: {
-                ...(scopes ? { "test-scopes": scopes } : {}),
-                ...(body === undefined ? {} : { "content-type": "application/json" }),
-              },
-              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+it.live("release HTTP fences scopes and keeps actual process failure diagnostics private", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture,
+      cfg = yield* Config.ServerConfig;
+    const diagnostics: unknown[] = [];
+    const releases = yield* Release.WorkbenchReleaseEvidence;
+    const web = HttpRouter.toWebHandler(
+      HttpApiBuilder.layer(ReleaseTestApi).pipe(
+        Layer.provide(ReleaseHttp.layer),
+        Layer.provide(Layer.succeed(Release.WorkbenchReleaseEvidence, releases)),
+        Layer.provide(
+          Layer.succeed(EnvironmentAuthenticatedAuth, (effect) =>
+            Effect.gen(function* () {
+              const request = yield* HttpServerRequest.HttpServerRequest;
+              if (!request.headers["test-scopes"])
+                return yield* failEnvironmentAuthInvalid("missing_credential");
+              return yield* effect.pipe(
+                Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+                  sessionId: AuthSessionId.make("fixture"),
+                  subject: "fixture",
+                  method: "bearer-access-token",
+                  scopes: new Set(
+                    request.headers["test-scopes"].split(",") as AuthEnvironmentScope[],
+                  ),
+                }),
+              );
             }),
           ),
-        );
-      expect((yield* call("/api/workbench/release-profiles")).status).toBe(401);
-      expect((yield* call("/api/workbench/release-profiles", "orchestration:read")).status).toBe(
-        403,
+        ),
+        Layer.provide(
+          HttpPlatform.layer.pipe(Layer.provide(NodeServices.layer), Layer.provide(Etag.layerWeak)),
+        ),
+        Layer.provide(Etag.layerWeak),
+        Layer.provide(platform),
+        Layer.provide(
+          Logger.layer([Logger.make(({ message }) => diagnostics.push(message))], {
+            mergeWithExisting: false,
+          }),
+        ),
+      ),
+      { disableLogger: true },
+    );
+    yield* Effect.addFinalizer(() => Effect.promise(() => web.dispose()));
+    const both = "orchestration:read,orchestration:operate";
+    const call = (url: string, scopes?: string, body?: unknown) =>
+      Effect.promise(() =>
+        web.handler(
+          new Request(`http://fixture.local${url}`, {
+            method: body === undefined ? "GET" : "POST",
+            headers: {
+              ...(scopes ? { "test-scopes": scopes } : {}),
+              ...(body === undefined ? {} : { "content-type": "application/json" }),
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          }),
+        ),
       );
-      expect((yield* call("/api/workbench/release-profiles", "orchestration:operate")).status).toBe(
-        403,
-      );
-      const catalogResponse = yield* call(
-        "/api/workbench/release-profiles?projectId=project",
+    expect((yield* call("/api/workbench/release-profiles")).status).toBe(401);
+    expect((yield* call("/api/workbench/release-profiles", "orchestration:read")).status).toBe(403);
+    expect((yield* call("/api/workbench/release-profiles", "orchestration:operate")).status).toBe(
+      403,
+    );
+    const catalogResponse = yield* call("/api/workbench/release-profiles?projectId=project", both);
+    expect(catalogResponse.status).toBe(200);
+    const catalog = yield* releases.catalog({});
+    const input = {
+      ...scope,
+      preparationId: "http",
+      workItemId: "item",
+      expectedWorkItemVersion: 1,
+      profileId: "profile",
+      profileDigest: catalog.profiles[0]!.digest,
+    };
+    const accepted = yield* call("/api/workbench/queues/queue/release-preparations", both, input);
+    expect(accepted.status).toBe(202);
+    const prepared = yield* releases.awaitPrepared("queue", "http", scope);
+    expect(prepared.preparation.state).toBe("ready");
+    const base = "/api/workbench/queues/queue/release-preparations/http";
+    expect(
+      (yield* call(
+        `${base}?controllerId=other&projectId=project&expectedTrackingId=tracking`,
         both,
-      );
-      expect(catalogResponse.status).toBe(200);
-      const catalog = yield* releases.catalog({});
-      const input = {
+      )).status,
+    ).toBe(409);
+    expect(
+      (yield* call(
+        "/api/workbench/queues/queue/release-preparations/absent?controllerId=controller&projectId=project&expectedTrackingId=tracking",
+        both,
+      )).status,
+    ).toBe(404);
+    expect(
+      (yield* call("/api/workbench/queues/queue/release-preparations", both, {
+        ...input,
+        profileDigest: "a".repeat(64),
+      })).status,
+    ).toBe(409);
+    expect(
+      (yield* call(`${base}/revalidate`, both, {
         ...scope,
-        preparationId: "http",
-        workItemId: "item",
-        expectedWorkItemVersion: 1,
-        profileId: "profile",
-        profileDigest: catalog.profiles[0]!.digest,
-      };
-      const accepted = yield* call("/api/workbench/queues/queue/release-preparations", both, input);
-      expect(accepted.status).toBe(202);
-      const prepared = yield* releases.awaitPrepared("queue", "http", scope);
-      expect(prepared.preparation.state).toBe("ready");
-      const base = "/api/workbench/queues/queue/release-preparations/http";
-      expect(
-        (yield* call(
-          `${base}?controllerId=other&projectId=project&expectedTrackingId=tracking`,
-          both,
-        )).status,
-      ).toBe(409);
-      expect(
-        (yield* call(
-          "/api/workbench/queues/queue/release-preparations/absent?controllerId=controller&projectId=project&expectedTrackingId=tracking",
-          both,
-        )).status,
-      ).toBe(404);
-      expect(
-        (yield* call("/api/workbench/queues/queue/release-preparations", both, {
-          ...input,
-          profileDigest: "a".repeat(64),
-        })).status,
-      ).toBe(409);
-      expect(
-        (yield* call(`${base}/revalidate`, both, {
-          ...scope,
-          expectedEvidenceDigest: prepared.preparation.evidence!.digest,
-        })).status,
-      ).toBe(200);
-      const diff = yield* call(
-        `${base}/diff?controllerId=controller&projectId=project&expectedTrackingId=tracking`,
-        both,
+        expectedEvidenceDigest: prepared.preparation.evidence!.digest,
+      })).status,
+    ).toBe(200);
+    const diff = yield* call(
+      `${base}/diff?controllerId=controller&projectId=project&expectedTrackingId=tracking`,
+      both,
+    );
+    expect(diff.status).toBe(200);
+    expect(yield* Effect.promise(() => diff.text())).not.toContain("prior-artifact");
+    const marker = "PRIVATE_RELEASE_SPAWN_DIAGNOSTIC";
+    const command = f.path.join(f.dir, marker);
+    const scripts = f.scripts.map((script) =>
+      script.id === "build" ? { ...script, command } : script,
+    );
+    const failureProfile = {
+      ...f.profile,
+      policy: {
+        ...f.profile.policy,
+        build: {
+          scriptId: "build",
+          definitionHash: releaseHash(JSON.stringify({ id: "build", command })),
+        },
+      },
+    };
+    yield* f.sql`UPDATE projection_projects SET scripts_json=${JSON.stringify(scripts)} WHERE project_id='project'`;
+    yield* f.fs.writeFileString(
+      f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+      JSON.stringify({ schemaVersion: 1, profiles: [failureProfile] }),
+    );
+    const failureCatalog = yield* releases.catalog({});
+    expect(
+      (yield* call("/api/workbench/queues/queue/release-preparations", both, {
+        ...input,
+        preparationId: "diagnostic",
+        profileDigest: failureCatalog.profiles[0]!.digest,
+      })).status,
+    ).toBe(202);
+    expect((yield* releases.awaitPrepared("queue", "diagnostic", scope)).preparation.state).toBe(
+      "blocked",
+    );
+    const result = yield* call(
+      "/api/workbench/queues/queue/release-preparations/diagnostic?controllerId=controller&projectId=project&expectedTrackingId=tracking",
+      both,
+    );
+    expect(result.status).toBe(200);
+    const body = yield* Effect.promise(() => result.text());
+    expect(JSON.parse(body)).toMatchObject({
+      preparation: { state: "blocked", reasons: ["build_failed"], evidence: null },
+    });
+    for (const secret of [marker, f.dir, "cause", "ProcessSpawnError"])
+      expect(body).not.toContain(secret);
+    const diagnostic = diagnostics
+      .flatMap((entry) => (Array.isArray(entry) ? entry : []))
+      .find(
+        (entry) =>
+          typeof entry === "object" &&
+          entry !== null &&
+          entry._tag === "ReleaseEvidenceOperationError",
       );
-      expect(diff.status).toBe(200);
-      expect(yield* Effect.promise(() => diff.text())).not.toContain("prior-artifact");
-    }).pipe(Effect.scoped, Effect.provide(layer)),
+    expect(diagnostic).toMatchObject({
+      stage: "build",
+      reason: "build_failed",
+      cause: { _tag: "ProcessSpawnError", cause: expect.anything() },
+    });
+  }).pipe(Effect.scoped, Effect.provide(layer)),
 );
 
 it.live.each(["rollback_missing", "rollback_mismatch", "artifact_invalid"] as const)(
@@ -599,37 +652,68 @@ it.live("an unavailable target is unknown until a fresh exact revalidation succe
   }).pipe(Effect.scoped, Effect.provide(layer)),
 );
 
-it.live("revalidation catches tracked source changing during its final remote read", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture,
-      releases = yield* Release.WorkbenchReleaseEvidence,
-      catalog = yield* releases.catalog({});
-    yield* releases.prepare("queue", {
-      ...scope,
-      preparationId: "remote-race",
-      workItemId: "item",
-      expectedWorkItemVersion: 1,
-      profileId: "profile",
-      profileDigest: catalog.profiles[0]!.digest,
-    });
-    const p = (yield* releases.awaitPrepared("queue", "remote-race", scope)).preparation;
-    expect(p.state).toBe("ready");
-    const wrapper = f.path.join(f.dir, "upload-pack"),
-      counter = f.path.join(f.dir, "remote-count");
-    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-    yield* f.fs.writeFileString(
-      wrapper,
-      `#!/bin/sh\nprintf x >> ${quote(counter)}\nif [ "$(wc -c < ${quote(counter)})" -eq 2 ]; then printf changed > ${quote(f.path.join(f.repo, "input.txt"))}; fi\nexec /usr/bin/git upload-pack "$@"\n`,
-    );
-    yield* f.fs.chmod(wrapper, 0o700);
-    yield* f.git(["config", "remote.origin.uploadpack", wrapper]);
-    const after = (yield* releases.revalidate("queue", "remote-race", {
-      ...scope,
-      expectedEvidenceDigest: p.evidence!.digest,
-    })).preparation;
-    expect(after.state).toBe("invalidated");
-    expect(after.reasons).toContain("source_dirty");
-  }).pipe(Effect.scoped, Effect.provide(layer)),
+it.live.each(["tracked_source", "remote_url"] as const)(
+  "revalidation catches %s changing during its final remote read",
+  (material) =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        realRunner = yield* ProcessRunner.ProcessRunner;
+      let observations = 0,
+        armed = false;
+      const alternate = f.path.join(f.dir, "race-alternate.git");
+      yield* f.git(["clone", "--bare", f.path.join(f.dir, "remote.git"), alternate]);
+      const gatedRunner: ProcessRunner.ProcessRunner["Service"] = {
+        run: Effect.fn("releaseFixture.gatedProcess")(function* (input) {
+          const result = yield* realRunner.run(input);
+          if (
+            armed &&
+            input.command === "/usr/bin/git" &&
+            input.args.includes("ls-remote") &&
+            ++observations === 2
+          ) {
+            if (material === "tracked_source")
+              yield* f.fs
+                .writeFileString(f.path.join(f.repo, "input.txt"), "changed")
+                .pipe(Effect.orDie);
+            else
+              yield* realRunner.run({
+                command: "/usr/bin/git",
+                args: ["-C", f.repo, "remote", "set-url", "origin", alternate],
+              });
+          }
+          return result;
+        }),
+      };
+      yield* Effect.gen(function* () {
+        const releases = yield* Release.WorkbenchReleaseEvidence,
+          catalog = yield* releases.catalog({});
+        yield* releases.prepare("queue", {
+          ...scope,
+          preparationId: "remote-race",
+          workItemId: "item",
+          expectedWorkItemVersion: 1,
+          profileId: "profile",
+          profileDigest: catalog.profiles[0]!.digest,
+        });
+        const p = (yield* releases.awaitPrepared("queue", "remote-race", scope)).preparation;
+        expect(p.state).toBe("ready");
+        armed = true;
+        const after = (yield* releases.revalidate("queue", "remote-race", {
+          ...scope,
+          expectedEvidenceDigest: p.evidence!.digest,
+        })).preparation;
+        expect(after.state).toBe("invalidated");
+        expect(after.reasons).toContain(
+          material === "tracked_source" ? "source_dirty" : "source_changed",
+        );
+      }).pipe(
+        Effect.provide(
+          Release.layer.pipe(
+            Layer.provide(Layer.succeed(ProcessRunner.ProcessRunner, gatedRunner)),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(dependencies)),
 );
 
 it.live.each(["single", "double"] as const)(
@@ -726,4 +810,252 @@ it.live("does not advertise enabled release execution on an unsupported host pla
       .pipe(Effect.provideService(HostProcess.Platform, "win32"), Effect.flip);
     expect(error.reason).toBe("profile_invalid");
   }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live("release Git reads suppress project fsmonitor and per-remote executable helpers", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture,
+      releases = yield* Release.WorkbenchReleaseEvidence,
+      catalog = yield* releases.catalog({});
+    const marker = f.path.join(f.dir, "UNREGISTERED_HELPER_RAN"),
+      monitor = f.path.join(f.dir, "monitor"),
+      upload = f.path.join(f.dir, "upload"),
+      seenEnv = f.path.join(f.dir, "remote-env");
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    yield* f.fs.writeFileString(
+      monitor,
+      `#!/bin/sh\nprintf helper > ${quote(marker)}\nprintf 'token\\0'\n`,
+    );
+    yield* f.fs.chmod(monitor, 0o700);
+    yield* f.fs.writeFileString(
+      upload,
+      `#!/bin/sh\nprintf '%s' "\${T3_RELEASE_FIXTURE_SERVICE_SECRET-unset}" > ${quote(seenEnv)}\nexec /usr/bin/git upload-pack "$@"\n`,
+    );
+    yield* f.fs.chmod(upload, 0o700);
+    yield* f.git(["config", "core.fsmonitor", monitor]);
+    yield* f.git(["config", "core.fsmonitorHookVersion", "2"]);
+    yield* f.git(["config", "remote.origin.uploadpack", upload]);
+    const host = yield* HostProcess.Environment;
+    const isolated = Effect.gen(function* () {
+      yield* releases.prepare("queue", {
+        ...scope,
+        preparationId: "git-boundary",
+        workItemId: "item",
+        expectedWorkItemVersion: 1,
+        profileId: "profile",
+        profileDigest: catalog.profiles[0]!.digest,
+      });
+      const p = (yield* releases.awaitPrepared("queue", "git-boundary", scope)).preparation;
+      expect(p.state).toBe("ready");
+      expect(yield* f.fs.exists(marker)).toBe(false);
+      expect(yield* f.fs.exists(seenEnv)).toBe(false);
+      expect(
+        (yield* releases.revalidate("queue", "git-boundary", {
+          ...scope,
+          expectedEvidenceDigest: p.evidence!.digest,
+        })).preparation.validation.state,
+      ).toBe("current");
+      expect(yield* f.fs.exists(marker)).toBe(false);
+      expect(yield* f.fs.exists(seenEnv)).toBe(false);
+    });
+    yield* isolated.pipe(
+      Effect.provideService(HostProcess.Environment, {
+        ...host,
+        T3_RELEASE_FIXTURE_SERVICE_SECRET: "SYNTHETIC_NEVER_PASS_TO_GIT",
+      }),
+    );
+  }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live(
+  "fresh main retains host credential authentication without passing service secrets to helpers",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence,
+        cfg = yield* Config.ServerConfig,
+        runner = yield* ProcessRunner.ProcessRunner;
+      const home = f.path.join(f.dir, "auth-home"),
+        helper = f.path.join(f.dir, "credential-helper"),
+        observed = f.path.join(f.dir, "auth-env");
+      yield* f.fs.makeDirectory(home);
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      yield* f.fs.writeFileString(
+        helper,
+        `#!/bin/sh\nif [ "$1" = get ]; then printf '%s' "\${T3_RELEASE_FIXTURE_SERVICE_SECRET-unset}" > ${quote(observed)}; printf 'username=release-fixture\\npassword=only-fixture\\n'; fi\n`,
+      );
+      yield* f.fs.chmod(helper, 0o700);
+      yield* f.fs.writeFileString(
+        f.path.join(home, ".gitconfig"),
+        `[credential]\n\thelper = ${helper}\n`,
+      );
+      const parentMarker = f.path.join(f.dir, "PARENT_GIT_CONFIG_RAN"),
+        parentHelper = f.path.join(f.dir, "parent-helper");
+      yield* f.fs.writeFileString(
+        parentHelper,
+        `#!/bin/sh\nprintf parent > ${quote(parentMarker)}\nprintf 'username=wrong\\npassword=wrong\\n'\n`,
+      );
+      yield* f.fs.chmod(parentHelper, 0o700);
+      yield* runner.run({
+        command: "/usr/bin/git",
+        args: ["-C", cfg.stateDir, "config", "--add", "credential.helper", ""],
+      });
+      yield* runner.run({
+        command: "/usr/bin/git",
+        args: ["-C", cfg.stateDir, "config", "--add", "credential.helper", parentHelper],
+      });
+
+      const baseline = (yield* f.git(["rev-parse", "main"])).stdout.trim();
+      const server = NodeHttp.createServer((request, response) => {
+        if (request.headers.authorization !== "Basic cmVsZWFzZS1maXh0dXJlOm9ubHktZml4dHVyZQ==") {
+          response.writeHead(401, { "www-authenticate": 'Basic realm="release-fixture"' });
+          response.end();
+          return;
+        }
+        response.setHeader("content-type", "text/plain");
+        if (request.url?.startsWith("/repo/info/refs"))
+          response.end(`${baseline}\trefs/heads/main\n`);
+        else if (request.url === "/repo/HEAD") response.end("ref: refs/heads/main\n");
+        else {
+          response.statusCode = 404;
+          response.end();
+        }
+      });
+      yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () => new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)),
+          catch: () => new WorkbenchReleaseError({ reason: "unavailable" }),
+        }),
+        () => Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
+      );
+      const address = server.address();
+      if (!address || typeof address === "string")
+        return yield* new WorkbenchReleaseError({ reason: "unavailable" });
+      yield* f.git(["remote", "set-url", "origin", `http://127.0.0.1:${address.port}/repo`]);
+      const host = yield* HostProcess.Environment;
+      yield* Effect.gen(function* () {
+        const catalog = yield* releases.catalog({});
+        yield* releases.prepare("queue", {
+          ...scope,
+          preparationId: "host-auth",
+          workItemId: "item",
+          expectedWorkItemVersion: 1,
+          profileId: "profile",
+          profileDigest: catalog.profiles[0]!.digest,
+        });
+        const p = (yield* releases.awaitPrepared("queue", "host-auth", scope)).preparation;
+        expect(p.state).toBe("ready");
+        expect(yield* f.fs.readFileString(observed)).toBe("unset");
+        expect(yield* f.fs.exists(parentMarker)).toBe(false);
+        expect(
+          (yield* releases.revalidate("queue", "host-auth", {
+            ...scope,
+            expectedEvidenceDigest: p.evidence!.digest,
+          })).preparation.validation.state,
+        ).toBe("current");
+        expect(yield* f.fs.readFileString(observed)).toBe("unset");
+        expect(yield* f.fs.exists(parentMarker)).toBe(false);
+      }).pipe(
+        Effect.provideService(HostProcess.Environment, {
+          ...host,
+          HOME: home,
+          GIT_DIR: f.path.join(f.repo, ".git"),
+          GIT_WORK_TREE: f.repo,
+          T3_RELEASE_FIXTURE_SERVICE_SECRET: "SYNTHETIC_MUST_NOT_REACH_AUTH",
+        }),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live(
+  "changing only the registered remote URL invalidates old evidence even at the same main SHA",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence,
+        catalog = yield* releases.catalog({});
+      yield* releases.prepare("queue", {
+        ...scope,
+        preparationId: "remote-url",
+        workItemId: "item",
+        expectedWorkItemVersion: 1,
+        profileId: "profile",
+        profileDigest: catalog.profiles[0]!.digest,
+      });
+      const p = (yield* releases.awaitPrepared("queue", "remote-url", scope)).preparation;
+      expect(p.state).toBe("ready");
+      const alternate = f.path.join(f.dir, "alternate.git");
+      yield* f.git(["clone", "--bare", f.path.join(f.dir, "remote.git"), alternate]);
+      yield* f.git(["remote", "set-url", "origin", alternate]);
+      const after = (yield* releases.revalidate("queue", "remote-url", {
+        ...scope,
+        expectedEvidenceDigest: p.evidence!.digest,
+      })).preparation;
+      expect(after.state).toBe("invalidated");
+      expect(after.reasons).toContain("source_changed");
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live("an archive format helper in project config cannot execute during preparation", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture,
+      releases = yield* Release.WorkbenchReleaseEvidence,
+      catalog = yield* releases.catalog({});
+    const helper = f.path.join(f.dir, "archive-helper"),
+      marker = f.path.join(f.dir, "ARCHIVE_HELPER_RAN");
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    yield* f.fs.writeFileString(
+      helper,
+      `#!/bin/sh\nprintf archive > ${quote(marker)}\nexec /bin/cat\n`,
+    );
+    yield* f.fs.chmod(helper, 0o700);
+    yield* f.git(["config", "tar.tar.command", helper]);
+    yield* releases.prepare("queue", {
+      ...scope,
+      preparationId: "archive-config",
+      workItemId: "item",
+      expectedWorkItemVersion: 1,
+      profileId: "profile",
+      profileDigest: catalog.profiles[0]!.digest,
+    });
+    const p = (yield* releases.awaitPrepared("queue", "archive-config", scope)).preparation;
+    expect(p.state).toBe("ready");
+    expect(yield* f.fs.exists(marker)).toBe(false);
+  }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live.each(["multiple", "credentials", "external_protocol"] as const)(
+  "does not execute a remote observation with %s remote configuration",
+  (kind) =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence,
+        catalog = yield* releases.catalog({});
+      const marker = f.path.join(f.dir, "FORBIDDEN_REMOTE_EXECUTED"),
+        helper = f.path.join(f.dir, "forbidden-remote");
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      yield* f.fs.writeFileString(helper, `#!/bin/sh\nprintf bad > ${quote(marker)}\n`);
+      yield* f.fs.chmod(helper, 0o700);
+      if (kind === "multiple")
+        yield* f.git(["config", "--add", "remote.origin.url", f.path.join(f.dir, "remote.git")]);
+      else
+        yield* f.git([
+          "remote",
+          "set-url",
+          "origin",
+          kind === "credentials" ? "http://fixture:synthetic@127.0.0.1/repo" : `ext::${helper}`,
+        ]);
+      const error = yield* releases
+        .prepare("queue", {
+          ...scope,
+          preparationId: "bad-remote",
+          workItemId: "item",
+          expectedWorkItemVersion: 1,
+          profileId: "profile",
+          profileDigest: catalog.profiles[0]!.digest,
+        })
+        .pipe(Effect.flip);
+      expect(error.reason).toBe("stale_state");
+      expect(yield* f.fs.exists(marker)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
 );

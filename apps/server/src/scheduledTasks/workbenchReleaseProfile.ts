@@ -16,6 +16,17 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Config from "../config.ts";
 
+class ReleaseProfileOperationError extends Schema.TaggedError<ReleaseProfileOperationError>()(
+  "ReleaseProfileOperationError",
+  {
+    stage: Schema.Literals(["decode_profile", "decode_scripts"]),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return "Release profile decoding failed.";
+  }
+}
 const decodeProfileFile = Schema.decodeEffect(Schema.fromJsonString(WorkbenchReleaseProfileFile));
 const decodeProjectScripts = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Array(ProjectScript)),
@@ -143,6 +154,12 @@ export const readReleaseProfiles = Effect.fn("WorkbenchReleaseEvidence.readProfi
   if (stat.type !== "File" || stat.size > 1024 * 1024)
     return yield* new WorkbenchReleaseError({ reason: "profile_invalid" });
   const decoded = yield* decodeProfileFile(yield* fs.readFileString(file)).pipe(
+    Effect.tapError((cause) =>
+      Effect.logWarning(
+        "Release profile decoding failed",
+        new ReleaseProfileOperationError({ stage: "decode_profile", cause }),
+      ),
+    ),
     Effect.mapError(() => new WorkbenchReleaseError({ reason: "profile_invalid" })),
   );
   const platform = yield* HostProcess.Platform;
@@ -175,6 +192,12 @@ export const releaseProfileScripts = Effect.fn("WorkbenchReleaseEvidence.profile
     }>`SELECT scripts_json FROM projection_projects WHERE project_id=${profile.projectId} AND deleted_at IS NULL`;
     if (!row) return yield* new WorkbenchReleaseError({ reason: "profile_invalid" });
     const scripts = yield* decodeProjectScripts(row.scripts_json).pipe(
+      Effect.tapError((cause) =>
+        Effect.logWarning(
+          "Release script decoding failed",
+          new ReleaseProfileOperationError({ stage: "decode_scripts", cause }),
+        ),
+      ),
       Effect.mapError(() => new WorkbenchReleaseError({ reason: "profile_invalid" })),
     );
     const p = profile.policy;
