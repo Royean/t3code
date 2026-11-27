@@ -1,3 +1,7 @@
+import * as DeploymentHttp from "./workbenchDeploymentHttp.ts";
+import * as Deployment from "./WorkbenchDeployment.ts";
+import * as ReleaseAdapter from "./WorkbenchReleaseAdapter.ts";
+import { deploymentFixture } from "./releaseDeploymentFixture.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   AuthSessionId,
@@ -38,7 +42,7 @@ import * as Release from "./WorkbenchReleaseEvidence.ts";
 
 const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
 const config = Config.layerTest(process.cwd(), { prefix: "issue15-native-config-" });
-const dependencies = Layer.mergeAll(
+const baseDependencies = Layer.mergeAll(
   platform,
   config.pipe(Layer.provide(platform)),
   Sqlite.layerMemory,
@@ -53,7 +57,9 @@ const dependencies = Layer.mergeAll(
     getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
   }),
 );
-const layer = Release.layer.pipe(Layer.provideMerge(dependencies));
+const dependencies = ReleaseAdapter.layer.pipe(Layer.provideMerge(baseDependencies));
+const releaseLayer = Release.layer.pipe(Layer.provideMerge(dependencies));
+const layer = Deployment.layer.pipe(Layer.provideMerge(releaseLayer));
 
 it.effect("an unconfigured host exposes no release commands or candidate authority", () =>
   Effect.gen(function* () {
@@ -1058,4 +1064,582 @@ it.live.each(["multiple", "credentials", "external_protocol"] as const)(
       expect(error.reason).toBe("stale_state");
       expect(yield* f.fs.exists(marker)).toBe(false);
     }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.live(
+  "pins the actual HTTP deployment plan in the host profile without enabling legacy profiles",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence;
+      const legacy = (yield* releases.catalog({ projectId: "project" })).profiles[0]!;
+      expect(legacy).not.toHaveProperty("deploymentPlan");
+      const deployment = (yield* deploymentFixture(
+        f.dir,
+        (yield* f.git(["rev-parse", "main"])).stdout.trim(),
+      )).policy;
+      const cfg = yield* Config.ServerConfig;
+      yield* f.fs.writeFileString(
+        f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          profiles: [{ ...f.profile, version: 2, policy: { ...f.profile.policy, deployment } }],
+        }),
+      );
+      const enabled = (yield* releases.catalog({ projectId: "project" })).profiles[0]!;
+      expect(enabled.deploymentPlan).toEqual({
+        adapterId: "adapter",
+        adapterVersion: 1,
+        generationId: "generation",
+        serviceKey: "formal-service",
+        coordinator: { id: deployment.coordinator.id, origin: deployment.coordinator.origin },
+        deploy: deployment.deploy,
+        rollback: { ...deployment.rollback, verification: "fixed_target_and_adapter" },
+      });
+      expect(enabled.digest).not.toBe(legacy.digest);
+      yield* f.fs.writeFileString(
+        f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          profiles: [
+            {
+              ...f.profile,
+              policy: {
+                ...f.profile.policy,
+                deployment: {
+                  ...deployment,
+                  adapter: { ...deployment.adapter, origin: "http://unsafe.example.invalid" },
+                },
+              },
+            },
+          ],
+        }),
+      );
+      expect((yield* releases.catalog({}).pipe(Effect.flip)).reason).toBe("profile_invalid");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "seals actual adapter rollback readiness and staged byte identities into deployment evidence",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        releases = yield* Release.WorkbenchReleaseEvidence,
+        cfg = yield* Config.ServerConfig;
+      const baselineSha = (yield* f.git(["rev-parse", "main"])).stdout.trim();
+      const adapter = yield* deploymentFixture(f.dir, baselineSha);
+      const profile = {
+        ...f.profile,
+        version: 2,
+        policy: {
+          ...f.profile.policy,
+          target: { ...f.profile.policy.target, origin: adapter.policy.adapter.origin },
+          deployment: adapter.policy,
+        },
+      };
+      yield* f.fs.writeFileString(
+        f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+        JSON.stringify({ schemaVersion: 1, profiles: [profile] }),
+      );
+      const catalog = (yield* releases.catalog({ projectId: "project" })).profiles[0]!;
+      yield* releases.prepare("queue", {
+        ...scope,
+        preparationId: "adapter-prepare",
+        workItemId: "item",
+        expectedWorkItemVersion: 1,
+        profileId: "profile",
+        profileDigest: catalog.digest,
+      });
+      const preparation = (yield* releases.awaitPrepared("queue", "adapter-prepare", scope))
+        .preparation;
+      expect(preparation.state).toBe("ready");
+      expect(preparation.evidence?.deployment?.plan).toEqual(catalog.deploymentPlan);
+      expect(preparation.evidence?.deployment?.preflight.state).toBe("succeeded");
+      expect(preparation.evidence?.deployment?.preflight.result?.exitCode).toBe(0);
+      expect(adapter.writes()).toBe(0);
+      expect(adapter.bytes()).toBe("prior-artifact");
+      const rechecked = yield* releases.revalidate("queue", "adapter-prepare", {
+        ...scope,
+        expectedEvidenceDigest: preparation.evidence!.digest,
+      });
+      expect(rechecked.preparation.validation.state).toBe("current");
+      adapter.setAdapterAvailable(false);
+      expect(
+        (yield* releases.revalidate("queue", "adapter-prepare", {
+          ...scope,
+          expectedEvidenceDigest: preparation.evidence!.digest,
+        })).preparation.validation.state,
+      ).toBe("unknown");
+      adapter.setAdapterAvailable(true);
+      expect(
+        (yield* releases.revalidate("queue", "adapter-prepare", {
+          ...scope,
+          expectedEvidenceDigest: preparation.evidence!.digest,
+        })).preparation.validation.state,
+      ).toBe("current");
+    }).pipe(Effect.provide(layer)),
+);
+
+const approvedDeploymentFixture = Effect.gen(function* () {
+  const f = yield* fixture,
+    releases = yield* Release.WorkbenchReleaseEvidence,
+    cfg = yield* Config.ServerConfig;
+  const a = yield* deploymentFixture(f.dir, (yield* f.git(["rev-parse", "main"])).stdout.trim());
+  const profile = {
+    ...f.profile,
+    version: 2,
+    policy: {
+      ...f.profile.policy,
+      target: { ...f.profile.policy.target, origin: a.policy.adapter.origin },
+      deployment: a.policy,
+    },
+  };
+  yield* f.fs.writeFileString(
+    f.path.join(cfg.stateDir, "workbench-release-profiles.json"),
+    JSON.stringify({ schemaVersion: 1, profiles: [profile] }),
+  );
+  const catalog = (yield* releases.catalog({ projectId: "project" })).profiles[0]!;
+  yield* releases.prepare("queue", {
+    ...scope,
+    preparationId: "approved-prepare",
+    workItemId: "item",
+    expectedWorkItemVersion: 1,
+    profileId: "profile",
+    profileDigest: catalog.digest,
+  });
+  const e = (yield* releases.awaitPrepared("queue", "approved-prepare", scope)).preparation
+    .evidence!;
+  expect(e?.deployment?.preflight.state).toBe("succeeded");
+  const claimToken = "d".repeat(64);
+  const payload = {
+    schemaVersion: 1 as const,
+    deploymentId: "wb-deployment",
+    nativeDeploymentId: "native-deployment",
+    ownerId: "owner",
+    candidateId: "candidate",
+    decisionId: "decision",
+    decidedAt: 1,
+    packetDigest: releaseHash("approved packet"),
+    preparationId: e.preparationId,
+    evidenceDigest: e.digest,
+    profileDigest: e.profile.digest,
+    binding: e.binding,
+    sourceSha: e.source.commitSha,
+    mainSha: e.source.main.commitSha,
+    artifact: { sha256: e.artifact.sha256, bytes: e.artifact.bytes },
+    rollbackArtifact: { sha256: e.rollback.artifact.sha256, bytes: e.rollback.artifact.bytes },
+    plan: e.deployment!.plan,
+    desired: e.deployment!.desired,
+    baseline: {
+      basis: { serviceId: e.target.serviceId, ...e.target.basis },
+      revision: e.deployment!.baselineRevision,
+    },
+    deployOperationId: "deploy-operation",
+    rollbackOperationId: "rollback-operation",
+    lock: { epoch: 1, nonce: "e".repeat(64) },
+    issuer: { id: a.policy.coordinator.id, origin: a.policy.coordinator.origin },
+    claimTokenDigest: releaseHash(claimToken),
+    createdAt: 2,
+  };
+  const input = {
+    ...scope,
+    deploymentId: payload.nativeDeploymentId,
+    preparationId: e.preparationId,
+    expectedEvidenceDigest: e.digest,
+    reservation: a.reserve(payload),
+    claimToken,
+  };
+  return { f, a, e, input, payload };
+});
+it.live("deploys only a committed approval's sealed bytes and preserves exact retry identity", () =>
+  Effect.gen(function* () {
+    const { a, input } = yield* approvedDeploymentFixture,
+      deployments = yield* Deployment.WorkbenchDeployment;
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    const result = yield* deployments.get("queue", input.deploymentId, scope);
+    expect(result.deployment.state).toBe("deployed");
+    expect(result.deployment.claimState).toBe("committed");
+    expect(result.deployment.target?.basis?.artifactSha256).toBe(releaseHash("candidate"));
+    expect(result.deployment.versionObservation?.basis.version).toBe(
+      `sha256-${releaseHash("candidate")}`,
+    );
+    expect(a.bytes()).toBe("candidate");
+    expect(a.writes()).toBe(1);
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    expect(a.writes()).toBe(1);
+    const publicJson = JSON.stringify(result);
+    expect(publicJson).not.toContain(input.claimToken);
+    expect(publicJson).not.toContain("signature");
+    expect(publicJson).not.toContain("fixture-adapter-private");
+    const changed = yield* deployments
+      .admit("queue", {
+        ...input,
+        reservation: { ...input.reservation, authorizationDigest: "f".repeat(64) },
+      })
+      .pipe(Effect.flip);
+    expect(changed.reason).toBe("conflict");
+  }).pipe(Effect.provide(layer)),
+);
+
+it.live.each([
+  { mode: "before", state: "failed_unchanged", writes: 0 },
+  { mode: "partial", state: "rolled_back", writes: 2 },
+  { mode: "rollback_failure", state: "attention", writes: 1 },
+] as const)(
+  "verifies actual $mode effects and reports $state without treating a receipt as recovery",
+  ({ mode, state, writes }) =>
+    Effect.gen(function* () {
+      const { f, a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      const main = (yield* f.git(["rev-parse", "main"])).stdout;
+      a.setMode(mode);
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const result = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(result.state).toBe(state);
+      expect(a.writes()).toBe(writes);
+      expect((yield* f.git(["rev-parse", "main"])).stdout).toBe(main);
+      if (state !== "attention") {
+        expect(a.bytes()).toBe("prior-artifact");
+        expect(result.versionObservation?.basis).toEqual(a.baseline);
+      }
+      if (state === "rolled_back") {
+        expect(result.rollbackOperation?.id).toBe("rollback-operation");
+        expect(result.target?.lastOperationId).toBe("rollback-operation");
+        expect(result.target?.revision).toBe(2);
+      }
+      if (state === "attention") expect(result.reasons).toContain("rollback_failed");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live.each(["success", "partial"] as const)(
+  "recovers %s after lost receipt and Native restart by querying the same operation despite changed source",
+  (mode) =>
+    Effect.gen(function* () {
+      const { f, a, input } = yield* approvedDeploymentFixture;
+      a.setMode(mode);
+      a.loseNextResponse();
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.admit("queue", input);
+          yield* deployments.sync;
+          expect(
+            (yield* deployments.get("queue", input.deploymentId, scope)).deployment.state,
+          ).toBe("deploy_unknown");
+          expect(a.writes()).toBe(1);
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+      yield* f.fs.writeFileString(f.path.join(f.repo, "input.txt"), "changed after commitment");
+      a.setOperationReads(true);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.sync;
+          const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+          expect(d.state).toBe(mode === "partial" ? "rolled_back" : "deployed");
+          expect(d.deployOperation?.externalExecutionId).toBe("external:deploy-operation");
+          expect(a.bytes()).toBe(mode === "partial" ? "prior-artifact" : "candidate");
+          expect(a.writes()).toBe(mode === "partial" ? 2 : 1);
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+    }).pipe(Effect.provide(releaseLayer)),
+);
+
+it.live(
+  "rejects forged authority and stale admission without physical permission or response secrets",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      const forged = { ...input, reservation: { ...input.reservation, signature: "a".repeat(86) } };
+      expect((yield* deployments.admit("queue", forged).pipe(Effect.flip)).reason).toBe(
+        "permit_invalid",
+      );
+      expect(
+        (yield* deployments
+          .admit("queue", { ...input, claimToken: "f".repeat(64) })
+          .pipe(Effect.flip)).reason,
+      ).toBe("permit_invalid");
+      yield* f.fs.writeFileString(f.path.join(f.repo, "input.txt"), "unapproved");
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      const before = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(before.state).toBe("rejected");
+      expect(before.claimState).toBe("reserved");
+      expect(a.writes()).toBe(0);
+      expect(a.bytes()).toBe("prior-artifact");
+      yield* deployments.get("queue", input.deploymentId, scope);
+      expect(a.writes()).toBe(0);
+      expect(
+        (yield* deployments
+          .get("queue", input.deploymentId, { ...scope, projectId: ProjectId.make("other") })
+          .pipe(Effect.flip)).reason,
+      ).toBe("not_found");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live("retains an uncertain release when the changed target belongs to another operation", () =>
+  Effect.gen(function* () {
+    const { a, input } = yield* approvedDeploymentFixture,
+      deployments = yield* Deployment.WorkbenchDeployment;
+    a.setMode("partial");
+    a.loseNextResponse();
+    yield* deployments.admit("queue", input);
+    yield* deployments.sync;
+    a.replaceTarget();
+    a.setOperationReads(true);
+    yield* deployments.sync;
+    const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+    expect(d.state).toBe("attention");
+    expect(d.reasons).toContain("target_changed_unrelated");
+    expect(d.rollbackOperation).toBeNull();
+    expect(a.writes()).toBe(1);
+    expect(a.bytes()).toBe("third-party");
+  }).pipe(Effect.provide(layer)),
+);
+
+class DeploymentTestApi extends HttpApi.make("environment").add(
+  EnvironmentHttpApi.groups.workbenchDeployment,
+) {}
+it.live(
+  "deployment HTTP requires both scopes and exposes only the original public deployment",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      const web = HttpRouter.toWebHandler(
+        HttpApiBuilder.layer(DeploymentTestApi).pipe(
+          Layer.provide(DeploymentHttp.layer),
+          Layer.provide(Layer.succeed(Deployment.WorkbenchDeployment, deployments)),
+          Layer.provide(
+            Layer.succeed(EnvironmentAuthenticatedAuth, (effect) =>
+              Effect.gen(function* () {
+                const request = yield* HttpServerRequest.HttpServerRequest;
+                if (!request.headers["test-scopes"])
+                  return yield* failEnvironmentAuthInvalid("missing_credential");
+                return yield* effect.pipe(
+                  Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+                    sessionId: AuthSessionId.make("fixture"),
+                    subject: "fixture",
+                    method: "bearer-access-token",
+                    scopes: new Set(
+                      request.headers["test-scopes"].split(",") as AuthEnvironmentScope[],
+                    ),
+                  }),
+                );
+              }),
+            ),
+          ),
+          Layer.provide(
+            HttpPlatform.layer.pipe(
+              Layer.provide(NodeServices.layer),
+              Layer.provide(Etag.layerWeak),
+            ),
+          ),
+          Layer.provide(Etag.layerWeak),
+          Layer.provide(platform),
+        ),
+        { disableLogger: true },
+      );
+      yield* Effect.addFinalizer(() => Effect.promise(() => web.dispose()));
+      const both = "orchestration:read,orchestration:operate",
+        base = "/api/workbench/queues/queue/deployments";
+      const call = (route: string, scopes?: string, body?: unknown) =>
+        Effect.promise(() =>
+          web.handler(
+            new Request(`http://fixture.local${route}`, {
+              method: body === undefined ? "GET" : "POST",
+              headers: {
+                ...(scopes ? { "test-scopes": scopes } : {}),
+                ...(body === undefined ? {} : { "content-type": "application/json" }),
+              },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            }),
+          ),
+        );
+      expect((yield* call(base, undefined, input)).status).toBe(401);
+      expect((yield* call(base, "orchestration:read", input)).status).toBe(403);
+      expect((yield* call(base, "orchestration:operate", input)).status).toBe(403);
+      const forged = yield* call(base, both, {
+        ...input,
+        reservation: { ...input.reservation, kind: "commit" },
+      });
+      expect(forged.status).toBe(403);
+      expect(yield* Effect.promise(() => forged.json())).toEqual({
+        _tag: "WorkbenchDeploymentError",
+        reason: "permit_invalid",
+      });
+      expect(a.writes()).toBe(0);
+      expect((yield* call(base, both, input)).status).toBe(202);
+      yield* deployments.sync;
+      const response = yield* call(
+        `${base}/${input.deploymentId}?controllerId=controller&projectId=project&expectedTrackingId=tracking`,
+        both,
+      );
+      expect(response.status).toBe(200);
+      const text = yield* Effect.promise(() => response.text());
+      expect(JSON.parse(text).deployment.state).toBe("deployed");
+      for (const value of [
+        input.claimToken,
+        "signature",
+        "publicKey",
+        "credentialRef",
+        "fixture-adapter-private",
+        "cause",
+        "input_json",
+        "profile_json",
+      ])
+        expect(text).not.toContain(value);
+      expect(
+        (yield* call(
+          `${base}/${input.deploymentId}?controllerId=wrong&projectId=project&expectedTrackingId=tracking`,
+          both,
+        )).status,
+      ).toBe(404);
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "queries a running durable operation across interruption before treating physical apply as deployed",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture;
+      const gate = a.gateNext("after_apply");
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.admit("queue", input);
+          yield* gate.reached;
+          expect(a.bytes()).toBe("candidate");
+          expect(a.writes()).toBe(1);
+          expect(
+            (yield* deployments.get("queue", input.deploymentId, scope)).deployment.state,
+          ).not.toBe("deployed");
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.sync;
+          const running = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+          expect(running.state).toBe("deploying");
+          expect(running.deployOperation?.state).toBe("running");
+          gate.release();
+          yield* gate.completed;
+          yield* deployments.sync;
+          expect(
+            (yield* deployments.get("queue", input.deploymentId, scope)).deployment.state,
+          ).toBe("deployed");
+          expect(a.writes()).toBe(1);
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+    }).pipe(Effect.provide(releaseLayer)),
+);
+
+it.live(
+  "keeps a verified deployed attempt read-only after an outage instead of newly executing recovery",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment.state).toBe(
+        "deployed",
+      );
+      a.setAdapterAvailable(false);
+      yield* deployments.sync;
+      a.setAdapterAvailable(true);
+      a.corruptTargetBytes();
+      yield* deployments.sync;
+      const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(d.state).toBe("attention");
+      expect(d.rollbackOperation).toBeNull();
+      expect(a.writes()).toBe(1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "verifies a lost rollback receipt by querying the original restore instead of writing it again",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment;
+      a.setMode("partial");
+      a.loseNextRollbackResponse();
+      yield* deployments.admit("queue", input);
+      yield* deployments.sync;
+      expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment.state).toBe(
+        "rollback_unknown",
+      );
+      expect(a.bytes()).toBe("prior-artifact");
+      expect(a.writes()).toBe(2);
+      a.reopenLedger();
+      a.setOperationReads(true);
+      yield* deployments.sync;
+      expect((yield* deployments.get("queue", input.deploymentId, scope)).deployment.state).toBe(
+        "rolled_back",
+      );
+      expect(a.writes()).toBe(2);
+    }).pipe(Effect.provide(layer)),
+);
+it.live(
+  "recovers committed online authority after interruption before Native received the proof",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, input } = yield* approvedDeploymentFixture,
+        gate = a.gateNext("after_claim");
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.admit("queue", input);
+          yield* gate.reached;
+          expect(a.writes()).toBe(0);
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+      yield* f.fs.writeFileString(
+        f.path.join(f.repo, "input.txt"),
+        "changed after coordinator commit",
+      );
+      a.reopenLedger();
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const deployments = yield* Deployment.WorkbenchDeployment;
+          yield* deployments.sync;
+          const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+          expect(d.claimState).toBe("committed");
+          expect(d.state).toBe("deployed");
+          expect(a.bytes()).toBe("candidate");
+          expect(a.writes()).toBe(1);
+          gate.release();
+          yield* gate.completed;
+        }).pipe(Effect.provide(Deployment.layer)),
+      );
+    }).pipe(Effect.provide(releaseLayer)),
+);
+
+it.live(
+  "rechecks the adapter journal generation after the online claim before sending physical authority",
+  () =>
+    Effect.gen(function* () {
+      const { a, input } = yield* approvedDeploymentFixture,
+        deployments = yield* Deployment.WorkbenchDeployment,
+        gate = a.gateNext("after_claim");
+      yield* deployments.admit("queue", input);
+      yield* gate.reached;
+      a.rotateGeneration();
+      gate.release();
+      yield* gate.completed;
+      yield* deployments.sync;
+      const d = (yield* deployments.get("queue", input.deploymentId, scope)).deployment;
+      expect(d.claimState).toBe("committed");
+      expect(d.state).toBe("deploy_unknown");
+      expect(d.reasons).toContain("adapter_identity_mismatch");
+      expect(a.operationPutRequests()).toBe(0);
+      expect(a.writes()).toBe(0);
+    }).pipe(Effect.provide(layer)),
 );

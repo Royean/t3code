@@ -1,3 +1,6 @@
+import * as WorkbenchDeployment from "./scheduledTasks/WorkbenchDeployment.ts";
+import * as WorkbenchDeploymentHttp from "./scheduledTasks/workbenchDeploymentHttp.ts";
+import * as WorkbenchReleaseAdapter from "./scheduledTasks/WorkbenchReleaseAdapter.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Random from "effect/Random";
@@ -901,7 +904,19 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(
         WorkbenchTaskProgressHttp.layer.pipe(Layer.provide(WorkbenchTaskProgress.layer)),
       ),
-      Layer.provide(WorkbenchReleaseHttp.layer.pipe(Layer.provide(WorkbenchRelease.layer))),
+      Layer.provide(
+        Layer.mergeAll(
+          WorkbenchReleaseHttp.layer.pipe(
+            Layer.provide(WorkbenchRelease.layer),
+            Layer.provide(WorkbenchReleaseAdapter.layer),
+          ),
+          WorkbenchDeploymentHttp.layer.pipe(
+            Layer.provide(WorkbenchDeployment.layer),
+            Layer.provide(WorkbenchRelease.layer),
+            Layer.provide(WorkbenchReleaseAdapter.layer),
+          ),
+        ),
+      ),
       Layer.provide(WorkbenchRepairsHttp.layer.pipe(Layer.provide(WorkbenchRepairs.layer))),
       Layer.provide(
         WorkbenchQueueHttp.layer.pipe(

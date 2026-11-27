@@ -1,3 +1,9 @@
+import {
+  WorkbenchDeploymentAdmitInput,
+  WorkbenchDeploymentQuery,
+  WorkbenchDeploymentResult,
+  WorkbenchDeploymentError,
+} from "./workbenchDeployment.ts";
 import * as Context from "effect/Context";
 import type * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -1365,6 +1371,42 @@ const releaseErrors = [
     HttpApiSchema.status(503),
   ),
 ] as const;
+const deploymentErrors = [
+  ...EnvironmentScopedOperationErrors,
+  WorkbenchDeploymentError.check(Schema.makeFilter((e) => e.reason === "invalid_request")).pipe(
+    HttpApiSchema.status(400),
+  ),
+  WorkbenchDeploymentError.check(Schema.makeFilter((e) => e.reason === "not_found")).pipe(
+    HttpApiSchema.status(404),
+  ),
+  WorkbenchDeploymentError.check(
+    Schema.makeFilter((e) => ["permit_invalid", "coordinator_forbidden"].includes(e.reason)),
+  ).pipe(HttpApiSchema.status(403)),
+  WorkbenchDeploymentError.check(
+    Schema.makeFilter((e) =>
+      ["conflict", "invalid_binding", "stale_state", "evidence_invalid"].includes(e.reason),
+    ),
+  ).pipe(HttpApiSchema.status(409)),
+  WorkbenchDeploymentError.check(
+    Schema.makeFilter((e) => ["unavailable", "not_configured"].includes(e.reason)),
+  ).pipe(HttpApiSchema.status(503)),
+] as const;
+class EnvironmentWorkbenchDeploymentHttpApi extends HttpApiGroup.make("workbenchDeployment").add(
+  HttpApiEndpoint.post("admit", "/api/workbench/queues/:queueId/deployments", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchDeploymentAdmitInput,
+    success: WorkbenchDeploymentResult.pipe(HttpApiSchema.status(202)),
+    error: deploymentErrors,
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/deployments/:deploymentId", {
+    params: { queueId: TrimmedNonEmptyString, deploymentId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchDeploymentQuery,
+    success: WorkbenchDeploymentResult,
+    error: deploymentErrors,
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
 class EnvironmentWorkbenchReleaseHttpApi extends HttpApiGroup.make("workbenchRelease").add(
   HttpApiEndpoint.get("catalog", "/api/workbench/release-profiles", {
     headers: OptionalBearerHeaders,
@@ -1483,6 +1525,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentWorkbenchQueueHttpApi)
   .add(EnvironmentWorkbenchTaskProgressHttpApi)
   .add(EnvironmentWorkbenchReleaseHttpApi)
+  .add(EnvironmentWorkbenchDeploymentHttpApi)
   .add(EnvironmentWorkbenchAttentionHttpApi)
   .add(EnvironmentWorkbenchRepairsHttpApi)
   .add(EnvironmentWorkbenchResponsesHttpApi)

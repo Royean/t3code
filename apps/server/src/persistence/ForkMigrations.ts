@@ -1,3 +1,4 @@
+import WorkbenchDeployment from "./ForkMigrations/012_WorkbenchDeployment.ts";
 import * as Effect from "effect/Effect";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -60,7 +61,8 @@ export const hasPendingForkMigrations = Effect.gen(function* () {
     !applied.has("8:WorkbenchAttention") ||
     !applied.has("9:WorkbenchRuntimeResponses") ||
     !applied.has("10:WorkbenchRepairBudgets") ||
-    !applied.has("11:WorkbenchReleaseEvidence")
+    !applied.has("11:WorkbenchReleaseEvidence") ||
+    !applied.has("12:WorkbenchDeployment")
   );
 });
 
@@ -79,6 +81,7 @@ export const runForkMigrations = () =>
       "9_WorkbenchRuntimeResponses": WorkbenchRuntimeResponses,
       "10_WorkbenchRepairBudgets": WorkbenchRepairBudgets,
       "11_WorkbenchReleaseEvidence": WorkbenchReleaseEvidence,
+      "12_WorkbenchDeployment": WorkbenchDeployment,
     }),
   });
 

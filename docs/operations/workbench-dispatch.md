@@ -135,3 +135,48 @@ changing it invalidates evidence even when the advertised main commit stays equa
 Operational failures retain their immediate cause and stage in private server diagnostics.
 Workbench receives only fixed failure reasons; diagnostic paths, process output and cause
 objects are excluded from its release HTTP responses.
+
+## Approved deployment adapter
+
+Legacy release profiles prepare review evidence only. To enable automatic deployment after
+the Workbench user's exact approval, an environment administrator adds the typed optional
+`policy.deployment` to the same host profile. Pin the adapter's HTTPS, Tailnet or loopback
+origin/path, adapter version and durable journal generation, canonical service key, deploy
+and actual rollback action/plan digests, and the Workbench coordinator's origin and Ed25519
+public-key fingerprint. The coordinator administrator must register that service and explicitly
+authorize this Native origin, environment, project and owner. A changed plan/profile requires
+new preparation and approval. The adapter rollback plan is the actual approved recovery action;
+the older project `rollback.execute` reference remains a non-executed legacy declaration.
+
+Store adapter connection authentication separately in
+`<stateDir>/workbench-release-adapter-credentials.json` as
+`{"schemaVersion":1,"credentials":{"<credentialRef>":"<Bearer token>"}}`.
+Profiles contain only the reference. Restrict access to these administrator files. Rotating this
+connection token does not change the pinned endpoint, plan or coordinator authority. Production
+credentials belong behind the adapter; neither these tokens nor production credentials enter
+project script environments. Preparation stages the actual sealed candidate and baseline bytes
+and obtains a real non-production readiness/preflight receipt for that adapter rollback plan.
+
+The host-supplied adapter must implement the typed v1 descriptor, immutable content-addressed
+artifacts, preflight and operation interfaces. It needs its own durable journal and stable
+external execution identity, generation changes after journal loss, exact-baseline activation
+checks, service fencing, same-ID input binding and terminal tombstones. A CLI exit code or HTTP
+202 alone is insufficient. This feature supplies the Native client and isolated executable
+contract tests, not a universal production adapter or a production installation procedure.
+
+The authenticated deployment POST admits only a signed reservation for the prepared evidence.
+Reservations convey no production permission: Native performs fresh admission checks and then
+obtains the Workbench coordinator's durable committed proof online. Only that proof can authorize
+the exact deploy operation and its exact baseline rollback. Retrying admission uses the original
+ID and immutable body. GET only reads the original persisted deployment; the scoped background
+worker reconciles admitted intents by querying their original external operation IDs first.
+
+After commitment, observation and necessary failure recovery use frozen admitted materials,
+even when later source/task changes invalidate the old candidate for reuse. Failure or partial
+effects require a terminal, quiescent original operation and attributable actual target before
+restoration. Verified restoration needs both adapter target state and the independent fixed
+version endpoint to match the sealed baseline. An already verified deployed attempt performs
+only further observations; an outage cannot authorize a new rollback. Unknown operations,
+unrelated target changes and failed/unknown rollback retain the Workbench global lock and need
+attention. Neither timeouts nor disconnection release it. Successful deployment also retains
+the lock for later acceptance/merge and does not update main or complete the business task.

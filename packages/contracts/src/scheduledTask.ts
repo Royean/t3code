@@ -1,3 +1,8 @@
+import {
+  WorkbenchDeploymentHostPolicy,
+  WorkbenchDeploymentPlan,
+  WorkbenchDeploymentEvidence,
+} from "./workbenchDeployment.ts";
 import * as Schema from "effect/Schema";
 
 import {
@@ -1166,6 +1171,7 @@ export const WorkbenchReleaseObservation = Schema.Struct({
 export const WorkbenchReleasePolicy = Schema.Struct({
   main: ReleaseMain,
   target: ReleaseTarget,
+  deployment: Schema.optional(WorkbenchDeploymentHostPolicy),
   build: ReleaseScript,
   artifact: Schema.Struct({ relativePath: ReleaseText }),
   checks: Schema.Array(ReleaseScript).check(Schema.isMinLength(1), Schema.isMaxLength(10)),
@@ -1191,6 +1197,7 @@ export const WorkbenchReleaseProfileFile = Schema.Struct({
   profiles: Schema.Array(WorkbenchReleaseHostProfile).check(Schema.isMaxLength(100)),
 });
 export const WorkbenchPublicReleaseProfile = Schema.Struct({
+  deploymentPlan: Schema.optional(WorkbenchDeploymentPlan),
   id: ReleaseId,
   version: ReleasePositive,
   digest: ReleaseHash,
@@ -1296,6 +1303,7 @@ export const WorkbenchReleaseReceipt = Schema.Struct({
 });
 export type WorkbenchReleaseReceipt = typeof WorkbenchReleaseReceipt.Type;
 export const WorkbenchReleaseEvidence = Schema.Struct({
+  deployment: Schema.optional(WorkbenchDeploymentEvidence),
   schemaVersion: Schema.Literal(1),
   id: ReleaseId,
   digest: ReleaseHash,

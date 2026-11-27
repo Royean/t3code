@@ -1,3 +1,8 @@
+import * as Adapter from "./WorkbenchReleaseAdapter.ts";
+import {
+  WorkbenchReleaseHostProfile as HostProfileSchema,
+  type WorkbenchReleaseEvidence as Evidence,
+} from "@t3tools/contracts";
 import {
   WorkbenchReleaseError,
   WorkbenchReleaseEvidence as EvidenceSchema,
@@ -43,6 +48,12 @@ import {
   safeReleasePath,
 } from "./workbenchReleaseProfile.ts";
 
+export type ReleaseDeploymentMaterial = {
+  evidence: Evidence;
+  profile: WorkbenchReleaseHostProfile;
+  artifact: Uint8Array;
+  rollback: Uint8Array;
+};
 type Scope = typeof WorkbenchAttentionScope.Type;
 type Task = {
   id: string;
@@ -160,6 +171,7 @@ const publicFailure = Effect.fn("WorkbenchReleaseEvidence.publicFailure")(functi
   );
   return yield* new WorkbenchReleaseError({ reason: "unavailable" });
 });
+const decodeHostProfile = Schema.decodeEffect(Schema.fromJsonString(HostProfileSchema));
 const decodePreparation = Schema.decodeEffect(Schema.fromJsonString(PreparationSchema));
 const decodeEvidence = Schema.decodeUnknownEffect(EvidenceSchema);
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -209,6 +221,16 @@ export class WorkbenchReleaseEvidence extends Context.Service<
       id: string,
       scope: Scope,
     ) => Effect.Effect<WorkbenchReleaseDiffResult, WorkbenchReleaseError>;
+    readonly admissionMaterial: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+    ) => Effect.Effect<ReleaseDeploymentMaterial, WorkbenchReleaseError>;
+    readonly admittedMaterial: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+    ) => Effect.Effect<ReleaseDeploymentMaterial, WorkbenchReleaseError>;
     readonly awaitPrepared: (
       queueId: string,
       id: string,
@@ -223,7 +245,8 @@ const make = Effect.gen(function* () {
     fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
     config = yield* Config.ServerConfig,
-    runner = yield* Runner.ProcessRunner;
+    runner = yield* Runner.ProcessRunner,
+    adapter = yield* Adapter.WorkbenchReleaseAdapter;
   const serviceScope = yield* Effect.scope;
   const context = Context.make(FileSystem.FileSystem, fs).pipe(
     Context.add(Path.Path, path),
@@ -820,6 +843,45 @@ const make = Effect.gen(function* () {
               return yield* problem("rollback_mismatch");
             const { digest, ...unsigned } = evidence;
             if (releaseDigest(unsigned) !== digest) return yield* problem("evidence_unavailable");
+            if (registered.policy.deployment) {
+              if (!evidence.deployment) return yield* problem("evidence_unavailable");
+              yield* adapter
+                .verify(
+                  registered,
+                  evidence.deployment,
+                  Adapter.deploymentPreflightInput(
+                    evidence.deployment.preflight.id,
+                    evidence.deployment.plan,
+                    evidence.source.commitSha,
+                    { sha256: evidence.artifact.sha256, bytes: evidence.artifact.bytes },
+                    {
+                      basis: { serviceId: evidence.target.serviceId, ...evidence.target.basis },
+                      revision: evidence.deployment.baselineRevision,
+                      artifact: {
+                        sha256: evidence.rollback.artifact.sha256,
+                        bytes: evidence.rollback.artifact.bytes,
+                      },
+                    },
+                  ),
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    causedProblem(
+                      "target",
+                      [
+                        "adapter_unavailable",
+                        "coordinator_unavailable",
+                        "target_unavailable",
+                      ].includes(cause.reason)
+                        ? "target_unavailable"
+                        : cause.reason === "target_changed"
+                          ? "target_changed"
+                          : "preflight_failed",
+                      cause,
+                    ),
+                  ),
+                );
+            }
             const finalProfile = yield* profile(
               prepInput.profileId,
               prepInput.profileDigest,
@@ -1137,6 +1199,32 @@ const make = Effect.gen(function* () {
       receipts.push(receipt);
       yield* sql`UPDATE workbench_release_stages SET state='completed',receipt_json=${canonicalReleaseJson(receipt)},exit_code=0,output_digest=${outputDigest},completed_at=${completedAt} WHERE preparation_id=${id} AND ordinal=${i}`;
     }
+    const deployment = p.policy.deployment
+      ? yield* adapter
+          .prepare(
+            p,
+            id,
+            initial.head,
+            yield* regular(dir, "artifact", "artifact_changed"),
+            rollback,
+            { serviceId: observedTarget.serviceId, ...observedTarget.basis },
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              causedProblem(
+                "target",
+                ["adapter_unavailable", "coordinator_unavailable", "target_unavailable"].includes(
+                  cause.reason,
+                )
+                  ? "target_unavailable"
+                  : cause.reason === "target_changed"
+                    ? "target_changed"
+                    : "preflight_failed",
+                cause,
+              ),
+            ),
+          )
+      : undefined;
     const finalProfile = yield* profile(input.profileId, input.profileDigest, input.projectId);
     const finalSource = yield* source(queueId, input, finalProfile);
     if (finalSource.base !== initial.base) return yield* problem("base_changed");
@@ -1170,6 +1258,7 @@ const make = Effect.gen(function* () {
     const now = yield* stamp,
       w = initial.task;
     const unsigned = {
+      ...(deployment ? { deployment } : {}),
       schemaVersion: 1 as const,
       id: `evidence:${releaseHash(id)}`,
       preparationId: id,
@@ -1314,6 +1403,7 @@ const make = Effect.gen(function* () {
           jobs.set(input.preparationId, done);
           yield* produce(queueId, input, registered, initial).pipe(
             Effect.timeout("20 minutes"),
+            Effect.timeout("20 minutes"),
             Effect.catch((error) =>
               Effect.gen(function* () {
                 yield* reportFailure(
@@ -1402,6 +1492,57 @@ const make = Effect.gen(function* () {
     },
     Effect.catch((cause) => publicFailure("await_prepared", cause)),
   );
-  return WorkbenchReleaseEvidence.of({ catalog, prepare, get, revalidate, diff, awaitPrepared });
+  const admittedMaterial = Effect.fn("WorkbenchReleaseEvidence.admittedMaterial")(
+    function* (queueId: string, id: string, input: WorkbenchReleaseRevalidateInput) {
+      const [row] =
+        yield* sql<Row>`SELECT * FROM workbench_release_preparations WHERE id=${id} AND queue_id=${queueId} AND controller_id=${input.controllerId} AND project_id=${input.projectId} AND tracking_id=${input.expectedTrackingId}`;
+      if (!row) return yield* new WorkbenchReleaseError({ reason: "not_found" });
+      const preparation = yield* decodePreparation(row.preparation_json),
+        evidence = preparation.evidence;
+      if (!evidence || evidence.digest !== input.expectedEvidenceDigest)
+        return yield* new WorkbenchReleaseError({ reason: "conflict" });
+      const registered = yield* decodeHostProfile(row.profile_json);
+      const { digest, ...unsigned } = evidence;
+      if (
+        !evidence.deployment ||
+        !registered.policy.deployment ||
+        releaseDigest(unsigned) !== digest ||
+        releaseDigest(registered) !== evidence.profile.digest
+      )
+        return yield* new WorkbenchReleaseError({ reason: "conflict" });
+      const artifact = yield* regular(directory(id), "artifact", "artifact_changed"),
+        rollback = yield* regular(directory(id), "rollback", "rollback_mismatch");
+      if (
+        releaseHash(artifact) !== evidence.artifact.sha256 ||
+        artifact.length !== evidence.artifact.bytes ||
+        releaseHash(rollback) !== evidence.rollback.artifact.sha256 ||
+        rollback.length !== evidence.rollback.artifact.bytes
+      )
+        return yield* new WorkbenchReleaseError({ reason: "conflict" });
+      return { evidence, profile: registered, artifact, rollback };
+    },
+    Effect.catch((cause) => publicFailure("artifact", cause)),
+  );
+  const admissionMaterial = Effect.fn("WorkbenchReleaseEvidence.admissionMaterial")(function* (
+    queueId: string,
+    id: string,
+    input: WorkbenchReleaseRevalidateInput,
+  ) {
+    const material = yield* admittedMaterial(queueId, id, input);
+    const checked = yield* revalidate(queueId, id, input);
+    if (checked.preparation.state !== "ready" || checked.preparation.validation.state !== "current")
+      return yield* new WorkbenchReleaseError({ reason: "conflict" });
+    return material;
+  });
+  return WorkbenchReleaseEvidence.of({
+    catalog,
+    prepare,
+    get,
+    revalidate,
+    diff,
+    awaitPrepared,
+    admissionMaterial,
+    admittedMaterial,
+  });
 });
 export const layer = Layer.effect(WorkbenchReleaseEvidence, make);

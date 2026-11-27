@@ -8,6 +8,8 @@ import {
   ProjectScript,
   type WorkbenchReleaseHostProfile,
   type WorkbenchPublicReleaseProfile,
+  type WorkbenchDeploymentHostPolicy,
+  type WorkbenchDeploymentPlan,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -143,6 +145,31 @@ function validReleaseTarget(target: { origin: string; versionPath: string }) {
     return false;
   }
 }
+function validDeploymentPolicy(p: WorkbenchDeploymentHostPolicy) {
+  try {
+    const key = NodeCrypto.createPublicKey(p.coordinator.publicKey);
+    return (
+      validReleaseTarget({ origin: p.adapter.origin, versionPath: p.adapter.pathPrefix }) &&
+      !p.adapter.pathPrefix.endsWith("/") &&
+      validReleaseTarget({ origin: p.coordinator.origin, versionPath: "/" }) &&
+      key.asymmetricKeyType === "ed25519" &&
+      releaseHash(key.export({ type: "spki", format: "der" })) === p.coordinator.id
+    );
+  } catch {
+    return false;
+  }
+}
+export function publicDeploymentPlan(p: WorkbenchDeploymentHostPolicy): WorkbenchDeploymentPlan {
+  return {
+    adapterId: p.adapter.id,
+    adapterVersion: p.adapter.version,
+    generationId: p.adapter.generationId,
+    serviceKey: p.serviceKey,
+    coordinator: { id: p.coordinator.id, origin: p.coordinator.origin },
+    deploy: p.deploy,
+    rollback: { ...p.rollback, verification: "fixed_target_and_adapter" },
+  };
+}
 export const readReleaseProfiles = Effect.fn("WorkbenchReleaseEvidence.readProfiles")(function* () {
   const fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
@@ -172,6 +199,7 @@ export const readReleaseProfiles = Effect.fn("WorkbenchReleaseEvidence.readProfi
       o = policy.observation;
     if (
       !validReleaseTarget(policy.target) ||
+      (policy.deployment !== undefined && !validDeploymentPolicy(policy.deployment)) ||
       !safeReleasePath(policy.artifact.relativePath) ||
       !safeReleasePath(policy.rollback.artifactRelativePath) ||
       !/^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(policy.main.ref) ||
@@ -229,6 +257,7 @@ export const publicReleaseProfile = Effect.fn("WorkbenchReleaseEvidence.publicPr
   });
   const n = p.policy.checks.length;
   return {
+    ...(p.policy.deployment ? { deploymentPlan: publicDeploymentPlan(p.policy.deployment) } : {}),
     id: p.id,
     version: p.version,
     digest: releaseDigest(p),
