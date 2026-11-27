@@ -1,5 +1,15 @@
 import { expect, it } from "@effect/vitest";
-import { CommandId, MessageId, OrchestrationV2Command, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EventId,
+  MessageId,
+  OrchestrationV2Command,
+  OrchestrationV2RuntimeRequest,
+  RunId,
+  RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -10,10 +20,16 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Outbox from "./EffectOutbox.ts";
 import * as Guard from "./WorkbenchAttentionGuard.ts";
+import * as EventSink from "./EventSink.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 
 const threadId = ThreadId.make("attention-child");
 const encodeCommand = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2Command));
 const encodeRun = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeRequest = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.toCodecJson(OrchestrationV2RuntimeRequest)),
+);
 const command = {
   type: "message.dispatch" as const,
   commandId: CommandId.make("attention-resume-command"),
@@ -36,6 +52,329 @@ const seed = Effect.fn("WorkbenchAttentionGuard.test.seed")(function* () {
 });
 const layer = Layer.mergeAll(Guard.layer, Outbox.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
+);
+const eventLayer = EventSink.layer.pipe(
+  Layer.provideMerge(
+    Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(Layer.provideMerge(layer)),
+  ),
+);
+const seedResponse = Effect.fn("WorkbenchAttentionGuard.test.seedResponse")(function* () {
+  yield* seed();
+  const sql = yield* SqlClient.SqlClient;
+  const responseCommand = {
+    type: "runtime-request.respond" as const,
+    commandId: CommandId.make("recorded-response"),
+    threadId,
+    requestId: RuntimeRequestId.make("original-request"),
+    decision: "accept" as const,
+  };
+  const pending = yield* encodeRun({
+    id: responseCommand.requestId,
+    nodeId: "node",
+    kind: "command",
+    status: "pending",
+    providerTurnId: null,
+    nativeRequestRef: null,
+    createdAt: DateTime.formatIso(yield* DateTime.now),
+    resolvedAt: null,
+    responseCapability: { type: "live", providerSessionId: "session" },
+  });
+  const item = yield* encodeRun({
+    id: "card",
+    requestId: responseCommand.requestId,
+    type: "approval_request",
+  });
+  const source = {
+    id: "source",
+    version: 1,
+    fingerprint: "original",
+    queue_id: "queue",
+    work_item_id: "item",
+    cycle_number: 1,
+    batch_id: null,
+    thread_id: threadId,
+    source_run_id: "source-run",
+    source_attempt_id: null,
+    node_id: "node",
+    provider_thread_id: "provider-thread",
+    provider_turn_id: null,
+    runtime_request_id: responseCommand.requestId,
+    provider_session_id: "session",
+    request_json: pending,
+    turn_item_id: "card",
+    turn_item_json: item,
+    capability: "live",
+    provider_instance_id: "provider",
+    model_selection_json: '{"model":"model"}',
+    runtime_mode: "full-access",
+    interaction_mode: "default",
+    native_driver: "codex",
+    native_thread_id: "native-thread",
+    worktree_path: "/workspace",
+    worktree_real_path: "/workspace",
+    branch: "feature",
+    git_common_dir: "/repo/.git",
+  };
+  const policy = yield* encodeRun({
+    providerInstanceId: "provider",
+    modelSelection: { model: "model" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+  });
+  yield* sql`INSERT INTO orchestration_v2_projection_threads(thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json)
+    VALUES(${threadId},'project','Child','codex','full-access','default','2026-11-27','2026-11-27',${policy})`;
+  yield* sql`INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,ordinal,provider,status,requested_at,payload_json)
+    VALUES('source-run',${threadId},1,'codex','waiting','2026-11-27','{}')`;
+  yield* sql`UPDATE workbench_work_items SET run_id='source-run' WHERE id='item'`;
+  yield* sql`INSERT INTO orchestration_v2_projection_nodes(node_id,thread_id,run_id,root_node_id,kind,status,provider_thread_id,payload_json)
+    VALUES('node',${threadId},'source-run','node','approval','waiting','provider-thread','{}')`;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,thread_id,provider,provider_session_id,status,updated_at,payload_json)
+    VALUES('provider-thread',${threadId},'codex','session','active','2026-11-27','{"nativeThreadRef":{"driver":"codex","nativeId":"native-thread"}}')`;
+  yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests(runtime_request_id,thread_id,node_id,kind,status,created_at,payload_json)
+    VALUES(${responseCommand.requestId},${threadId},'node','command','pending','2026-11-27',${pending})`;
+  yield* sql`INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,thread_id,node_id,ordinal,type,status,updated_at,payload_json)
+    VALUES('card',${threadId},'node',1,'approval_request','pending','2026-11-27',${item})`;
+  yield* sql`INSERT INTO workbench_runtime_request_sources ${sql.insert({ ...source, status: "pending", summary_json: "{}", created_at: "2026-11-27", updated_at: "2026-11-27" })}`;
+  yield* sql`INSERT INTO workbench_runtime_responses(id,source_id,source_version,source_json,queue_id,work_item_id,attention_epoch,claim_id,command_id,request_json,state,payload_sha,actor_json,native_principal_json,created_at,updated_at)
+    VALUES('response','source',1,${yield* encodeRun(source)},'queue','item',0,'claim',${responseCommand.commandId},${yield* encodeCommand(responseCommand)},'queued','sha','{}','{}','2026-11-27','2026-11-27')`;
+  return responseCommand;
+});
+
+it.effect(
+  "admits only the recorded answer with the original source and occupied claim while held",
+  () =>
+    Effect.gen(function* () {
+      const command = yield* seedResponse();
+      const sql = yield* SqlClient.SqlClient;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const nativeCommand = { ...command, commandId: CommandId.make("original-ui-answer") };
+      yield* guard.assertCommand(nativeCommand);
+      yield* sql`UPDATE workbench_work_items SET attention_hold=1 WHERE id='item'`;
+      expect((yield* guard.assertCommand(nativeCommand).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "claim-stale",
+      });
+      yield* guard.assertCommand(command);
+      yield* guard.assertAdmission({ threadId, commandId: command.commandId, expectedEpoch: 0 });
+      expect(
+        (yield* guard.assertCommand({ ...command, decision: "acceptAlways" }).pipe(Effect.flip))
+          .reason,
+      ).toBe("response-mismatch");
+      yield* sql`UPDATE workbench_runtime_request_sources SET version=2 WHERE id='source'`;
+      expect((yield* guard.assertCommand(command).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "source-changed",
+      });
+      yield* sql`UPDATE workbench_runtime_request_sources SET version=1 WHERE id='source'`;
+      yield* sql`UPDATE workbench_queue_entries SET claim_id='other-claim' WHERE work_item_id='item'`;
+      expect((yield* guard.assertCommand(command).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "claim-stale",
+      });
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([false, true])(
+  "rechecks a changed source in the command transaction after planning (missing command: %s)",
+  (missing) =>
+    Effect.gen(function* () {
+      const command = yield* seedResponse();
+      const sql = yield* SqlClient.SqlClient;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const sink = yield* EventSink.EventSinkV2;
+      yield* guard.assertCommand(command);
+      const [raw] = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_runtime_requests WHERE runtime_request_id=${command.requestId}`;
+      const request = yield* decodeRequest(raw!.payload_json);
+      const now = yield* DateTime.now;
+      // Provider ingestion and source refresh can race a plan without taking Orchestrator's command lock.
+      yield* sql`UPDATE workbench_runtime_request_sources SET version=2 WHERE id='source'`;
+      const rejected = yield* sink
+        .commitCommand({
+          commandId: command.commandId,
+          commandType: command.type,
+          threadId,
+          acceptedAt: now,
+          ...(missing ? {} : { responseCommand: command }),
+          events: [
+            {
+              id: EventId.make("answer-resolved"),
+              type: "runtime-request.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...request, status: "resolved", decision: "accept", resolvedAt: now },
+            },
+          ],
+          effects: [],
+        })
+        .pipe(Effect.flip);
+      expect(rejected.cause).toMatchObject({
+        reason: missing ? "command-mismatch" : "source-changed",
+      });
+      expect(
+        yield* sql`SELECT 1 FROM orchestration_command_receipts WHERE command_id=${command.commandId}`,
+      ).toHaveLength(0);
+      expect(
+        yield* sql`SELECT status FROM orchestration_v2_projection_runtime_requests WHERE runtime_request_id=${command.requestId}`,
+      ).toEqual([{ status: "pending" }]);
+    }).pipe(Effect.provide(eventLayer)),
+);
+
+it.effect(
+  "requires an accepted running effect before handing the recorded answer to the live runtime",
+  () =>
+    Effect.gen(function* () {
+      const command = yield* seedResponse();
+      const sql = yield* SqlClient.SqlClient;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* Outbox.EffectOutboxV2;
+      const input = {
+        threadId,
+        commandId: command.commandId,
+        responseId: "response",
+        requestId: command.requestId,
+        providerSessionId: "session",
+        decision: "accept",
+      };
+      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='resolved',payload_json=json_set(payload_json,'$.status','resolved','$.decision','accept') WHERE runtime_request_id=${command.requestId}`;
+      expect((yield* guard.assertResponseExecution(input).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "command-mismatch",
+      });
+      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='pending',payload_json=(SELECT request_json FROM workbench_runtime_request_sources WHERE id='source') WHERE runtime_request_id=${command.requestId}`;
+      const [raw] = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_runtime_requests WHERE runtime_request_id=${command.requestId}`;
+      const request = yield* decodeRequest(raw!.payload_json);
+      const now = yield* DateTime.now;
+      yield* sink.commitCommand({
+        commandId: command.commandId,
+        commandType: command.type,
+        threadId,
+        responseCommand: command,
+        acceptedAt: now,
+        events: [
+          {
+            id: EventId.make("live-answer"),
+            type: "runtime-request.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...request, status: "resolved", decision: "accept", resolvedAt: now },
+          },
+        ],
+        effects: [
+          {
+            id: "live-answer-effect",
+            commandId: command.commandId,
+            threadId,
+            request: {
+              type: "runtime-request.respond",
+              providerSessionId: "session" as never,
+              responseId: "response",
+              requestId: command.requestId,
+              decision: "accept",
+            },
+          },
+        ],
+      });
+      expect((yield* guard.assertResponseExecution(input).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "command-mismatch",
+      });
+      const effect = Option.getOrThrow(yield* outbox.claimNext({ workerId: "worker" }));
+      yield* sql`UPDATE workbench_work_items SET attention_hold=1 WHERE id='item'`;
+      yield* sql`UPDATE workbench_runtime_request_sources SET version=2 WHERE id='source'`;
+      yield* guard.assertResponseExecution(input);
+      expect(
+        (yield* guard
+          .assertResponseExecution({ ...input, decision: "acceptAlways" })
+          .pipe(Effect.flip)).cause,
+      ).toMatchObject({ reason: "command-mismatch" });
+      yield* outbox.cancelUnsettled({
+        threadId,
+        effectTypes: [effect.request.type],
+        reason: "pause",
+      });
+      expect((yield* guard.assertResponseExecution(input).pipe(Effect.flip)).cause).toMatchObject({
+        reason: "claim-stale",
+      });
+    }).pipe(Effect.provide(eventLayer)),
+);
+
+it.effect(
+  "archives a successful live handoff without claiming provider delivery, including after retention",
+  () =>
+    Effect.gen(function* () {
+      const command = yield* seedResponse();
+      const sql = yield* SqlClient.SqlClient;
+      const outbox = yield* Outbox.EffectOutboxV2;
+      yield* outbox.enqueue([
+        {
+          id: "answer-effect",
+          commandId: command.commandId,
+          threadId,
+          request: {
+            type: "runtime-request.respond",
+            responseId: "response",
+            providerSessionId: "session" as never,
+            requestId: command.requestId,
+            decision: "accept",
+          },
+        },
+      ]);
+      yield* sql`UPDATE workbench_runtime_responses SET state='submitted',effect_id='answer-effect' WHERE id='response'`;
+      const effect = Option.getOrThrow(yield* outbox.claimNext({ workerId: "worker" }));
+      yield* outbox.succeed({ effectId: effect.id, workerId: "worker" });
+      const [receipt] =
+        yield* sql`SELECT state,evidence_level,delivered_at FROM workbench_runtime_responses WHERE id='response'`;
+      expect(receipt).toMatchObject({
+        state: "runtime_accepted",
+        evidence_level: "runtime_handoff",
+        delivered_at: null,
+      });
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET completed_at='1960-01-01T00:00:00.000Z' WHERE effect_id='answer-effect'`;
+      // Recover a crash between transport settlement and evidence publication before pruning its record.
+      yield* sql`UPDATE workbench_runtime_responses SET state='submitted',evidence_level='command_receipt',effect_state=NULL WHERE id='response'`;
+      yield* outbox.pruneSettled;
+      expect(Option.isNone(yield* outbox.get(effect.id))).toBe(true);
+      const [retained] =
+        yield* sql`SELECT state,evidence_level,effect_state FROM workbench_runtime_responses WHERE id='response'`;
+      expect(retained).toMatchObject({
+        state: "runtime_accepted",
+        evidence_level: "runtime_handoff",
+        effect_state: "succeeded",
+      });
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "requires an occupied original cycle or the durable claimed workbench response intent",
+  () =>
+    Effect.gen(function* () {
+      yield* seed();
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE workbench_queue_entries SET claim_id=NULL WHERE work_item_id='item'`;
+      const failure = yield* guard
+        .assertCommand({
+          type: "runtime-request.respond",
+          commandId: CommandId.make("unregistered-response"),
+          threadId,
+          requestId: RuntimeRequestId.make("original-request"),
+          decision: "accept",
+        })
+        .pipe(Effect.flip);
+      expect(failure.reason).toBe("response-mismatch");
+      expect(failure.cause).toMatchObject({ reason: "claim-stale" });
+      expect(
+        (yield* guard
+          .assertCommand({
+            type: "runtime-request.respond",
+            commandId: CommandId.make("workbench-response:missing"),
+            threadId,
+            requestId: RuntimeRequestId.make("original-request"),
+            decision: "accept",
+          })
+          .pipe(Effect.flip)).cause,
+      ).toMatchObject({ reason: "intent-missing" });
+    }).pipe(Effect.provide(layer)),
 );
 
 it.effect.each(["user_input", "command"] as const)(
@@ -89,12 +428,6 @@ it.effect(
       for (const input of [
         command,
         { type: "queue.resume" as const, commandId: command.commandId, threadId },
-        {
-          type: "runtime-request.respond" as const,
-          commandId: command.commandId,
-          threadId,
-          requestId: "request" as never,
-        },
       ]) {
         expect((yield* guard.assertCommand(input).pipe(Effect.flip)).reason).toBe("held");
       }

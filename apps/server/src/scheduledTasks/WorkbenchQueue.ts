@@ -262,6 +262,9 @@ const make = Effect.gen(function* () {
   const observeEntry = Effect.fn("WorkbenchQueue.observeEntry")(
     function* (row: EntryRow) {
       if (row.attention_hold === 1) return;
+      const responding =
+        yield* sql`SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${row.id} AND (a.state IN ('recorded','queued','submitted','unknown') OR EXISTS(SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.run_id=a.run_id AND r.thread_id=json_extract(a.source_json,'$.thread_id') AND r.status IN ('preparing','starting','running','waiting','queued'))) LIMIT 1`;
+      if (responding.length) return;
       const item = yield* items.observe(row);
       if (row.matter_id !== null) {
         const observedRun =
@@ -386,6 +389,22 @@ const make = Effect.gen(function* () {
       );
       const { childRun, taskWorkState } = delegatedTaskWorkProgress(child, task);
       if (childRun === undefined) return yield* new WorkbenchQueueError({ reason: "unavailable" });
+      const answeredRun = child.runs.find((run) => run.id === item.runId);
+      if (answeredRun !== undefined && answeredRun.id !== childRun.id) {
+        const active = ["preparing", "starting", "running", "waiting", "queued"].includes(
+          answeredRun.status,
+        );
+        const pending = yield* threads.delegatedTaskResultPending(
+          ThreadId.make(item.workThreadId),
+          answeredRun.delegatedTaskId,
+          [answeredRun.id],
+        );
+        if (active || pending || answeredRun.status !== "completed") {
+          yield* sql`UPDATE workbench_queue_entries SET work_state=${active || pending ? "working" : "unknown"},blocked_reason=${active || pending ? null : "state_unknown"},needs_dispatch=0
+            WHERE work_item_id=${row.id} AND state='occupied' AND claim_id=${row.claim_id} AND wake_generation=${row.wake_generation}`;
+          return;
+        }
+      }
       const held =
         task.result === null &&
         taskWorkState === "result_available" &&
@@ -399,7 +418,8 @@ const make = Effect.gen(function* () {
       const preparation = childRun.status === "preparing";
       yield* sql`UPDATE workbench_queue_entries SET state=${settled ? "finished" : "occupied"},work_state=${workState},needs_dispatch=${settled ? 0 : preparation ? 1 : 0},
       blocked_reason=${item.state === "blocked" ? "approval" : preparation ? "awaiting_dispatcher" : null},updated_at=${DateTime.formatIso(yield* DateTime.now)}
-      WHERE work_item_id=${row.id} AND state='occupied'`;
+      WHERE work_item_id=${row.id} AND state='occupied' AND claim_id=${row.claim_id} AND wake_generation=${row.wake_generation}
+      AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${row.id} AND a.state IN ('recorded','queued','submitted','unknown'))`;
     },
     (effect, row) =>
       effect.pipe(
@@ -529,7 +549,7 @@ const make = Effect.gen(function* () {
               const waiting = yield* sql<{
                 work_item_id: string;
               }>`SELECT e.work_item_id FROM workbench_queue_entries e JOIN workbench_work_items w ON w.id=e.work_item_id
-          WHERE e.queue_id=${queueId} AND e.state='queued' AND (w.attention_hold=0 OR EXISTS(SELECT 1 FROM workbench_attention_items a WHERE a.work_item_id=w.id AND a.phase='requeue_pending')) AND w.task_id IN ${sql.in(eligible)} ORDER BY e.priority DESC,e.enqueue_sequence LIMIT ${free}`;
+          WHERE e.queue_id=${queueId} AND e.state='queued' AND (w.attention_hold=0 OR EXISTS(SELECT 1 FROM workbench_attention_items a WHERE a.work_item_id=w.id AND a.phase='requeue_pending') OR EXISTS(SELECT 1 FROM workbench_runtime_responses r WHERE r.work_item_id=w.id AND r.state IN ('recorded','queued'))) AND w.task_id IN ${sql.in(eligible)} ORDER BY e.priority DESC,e.enqueue_sequence LIMIT ${free}`;
               for (const row of waiting) {
                 if (free-- <= 0) break;
                 yield* sql`UPDATE workbench_queue_entries SET state='occupied',claim_id='queue-claim:' || work_item_id || CASE WHEN wake_generation=0 THEN '' ELSE ':' || wake_generation END,blocked_reason='awaiting_dispatcher',wake_sent=0,

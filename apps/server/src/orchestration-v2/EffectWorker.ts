@@ -178,6 +178,7 @@ export const layerExecutor: Layer.Layer<
         .withAdmission(
           {
             threadId: effect.threadId,
+            commandId: effect.commandId,
             expectedEpoch: effect.attentionEpoch ?? null,
             ...("runId" in request ? { runId: request.runId } : {}),
             ...("messageId" in request ? { messageId: request.messageId } : {}),
@@ -542,6 +543,10 @@ export const layerExecutor: Layer.Layer<
             return runtimeRequests
               .respond({
                 threadId: effect.threadId,
+                commandId: effect.commandId,
+                ...(effect.request.responseId === undefined
+                  ? {}
+                  : { responseId: effect.request.responseId }),
                 providerSessionId: effect.request.providerSessionId,
                 requestId: effect.request.requestId,
                 ...(effect.request.decision === undefined

@@ -1,4 +1,5 @@
 import {
+  CommandId,
   ProviderApprovalDecision,
   ProviderSessionId,
   ProviderUserInputAnswers,
@@ -54,6 +55,8 @@ export interface RuntimeRequestServiceV2Shape {
     readonly threadId: ThreadId;
     readonly providerSessionId: ProviderSessionId;
     readonly requestId: RuntimeRequestId;
+    readonly commandId?: CommandId;
+    readonly responseId?: string;
     readonly decision?: ProviderApprovalDecision;
     readonly feedback?: string;
     readonly answers?: ProviderUserInputAnswers;
@@ -81,6 +84,7 @@ export const layer: Layer.Layer<
     return RuntimeRequestServiceV2.of({
       respond: Effect.fn("RuntimeRequestService.respond")(
         function* (input) {
+          yield* attentionGuard.assertResponseExecution(input);
           const request = yield* projections.getRuntimeRequest(input.threadId, input.requestId);
           if (request === undefined) {
             return yield* new RuntimeRequestResponseExecutionError({
@@ -120,7 +124,10 @@ export const layer: Layer.Layer<
             });
           }
           yield* attentionGuard.withAdmission(
-            { threadId: input.threadId },
+            {
+              threadId: input.threadId,
+              ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+            },
             session.value.respondToRuntimeRequest({
               requestId: input.requestId,
               ...(input.decision === undefined ? {} : { decision: input.decision }),

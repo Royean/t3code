@@ -18,6 +18,9 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as Etag from "effect/http/Etag";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+import * as Responses from "./WorkbenchResponses.ts";
+import * as ResponsesHttp from "./workbenchResponsesHttp.ts";
+import { digest } from "./workbenchLifecycle.ts";
 import * as Attention from "./WorkbenchAttention.ts";
 import * as AttentionHttp from "./workbenchAttentionHttp.ts";
 import * as WorkItems from "./WorkbenchQueue.ts";
@@ -27,7 +30,8 @@ import { failEnvironmentAuthInvalid } from "../auth/http.ts";
 
 class TestApi extends HttpApi.make("environment")
   .add(EnvironmentHttpApi.groups.workbenchQueue)
-  .add(EnvironmentHttpApi.groups.workbenchAttention) {}
+  .add(EnvironmentHttpApi.groups.workbenchAttention)
+  .add(EnvironmentHttpApi.groups.workbenchResponses) {}
 
 it.effect("requires both scopes before queue reads or control mutations", () =>
   Effect.gen(function* () {
@@ -122,10 +126,58 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         if (failure) return yield* failure;
         return attentionResult(kind) as never;
       });
+    let nativeAuditId: string | undefined;
+    const responseSnapshot = {
+      trackingId: "epoch",
+      queueId: "queue",
+      controllerId: "controller",
+      projectId: "project",
+      requests: [],
+      nextCursor: null,
+    };
+    const responseReceipt = {
+      trackingId: "epoch",
+      queueId: "queue",
+      controllerId: "controller",
+      projectId: "project",
+      response: {
+        id: "answer",
+        sourceIdentity: "source",
+        sourceVersion: 1,
+        workItemId: "one",
+        requestId: "request",
+        status: "recorded",
+        blockedReason: null,
+        recordedAt: "2026-11-27T00:00:00.000Z",
+        updatedAt: "2026-11-27T00:00:00.000Z",
+        delivery: { evidence: "none", confirmedAt: null },
+        claimedActor: { kind: "workbench_cookie", id: "claimed" },
+        nativePrincipal: { kind: "environment_session", id: digest("test") },
+        answerMessageId: null,
+        answerRunId: null,
+      },
+    };
+    const responseRead = (list: boolean) =>
+      Effect.gen(function* () {
+        calls++;
+        if (failure) return yield* failure;
+        return (list ? responseSnapshot : responseReceipt) as never;
+      });
     const web = HttpRouter.toWebHandler(
       HttpApiBuilder.layer(TestApi).pipe(
         Layer.provide(ExecutionsHttp.layer),
         Layer.provide(AttentionHttp.layer),
+        Layer.provide(ResponsesHttp.layer),
+        Layer.provide(
+          Layer.mock(Responses.WorkbenchResponses)({
+            list: () => responseRead(true),
+            get: () => responseRead(false),
+            respond: (_q, _input, principal) => {
+              nativeAuditId = principal;
+              return responseRead(false);
+            },
+          }),
+        ),
         Layer.provide(
           Layer.mock(Attention.WorkbenchAttention)({
             get: attentionRead,
@@ -235,6 +287,28 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
         ),
       );
     }
+    requests.push(
+      new Request(
+        "http://env.local/api/workbench/queues/queue/requests?controllerId=controller&projectId=project&expectedTrackingId=epoch",
+      ),
+      new Request(
+        "http://env.local/api/workbench/queues/queue/responses/answer?controllerId=controller&projectId=project&expectedTrackingId=epoch",
+      ),
+      new Request("http://env.local/api/workbench/queues/queue/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          controllerId: "controller",
+          projectId: "project",
+          expectedTrackingId: "epoch",
+          responseId: "answer",
+          sourceIdentity: "source",
+          expectedVersion: 1,
+          claimedActor: { kind: "workbench_cookie", id: "claimed" },
+          response: { type: "decision", decision: "decline" },
+        }),
+      }),
+    );
     for (const request of requests) {
       expect((yield* Effect.promise(() => web.handler(request.clone()))).status).toBe(401);
       for (const scope of ["orchestration:read", "orchestration:operate"]) {
@@ -255,17 +329,23 @@ it.effect("requires both scopes before queue reads or control mutations", () =>
       const response = yield* Effect.promise(() => web.handler(allowed));
       expect(response.status).toBe(200);
       expect(yield* Effect.promise(() => response.json())).toEqual({
-        ...(request.url.includes("/attention")
-          ? request.method === "GET"
-            ? attentionSnapshot
-            : attentionResult(request.url.split("/").at(-1) as "pause" | "record" | "requeue")
-          : request.url.endsWith("/delivery-intents")
-            ? receipt
-            : snapshot),
+        ...(request.url.includes("/requests")
+          ? responseSnapshot
+          : request.url.includes("/responses")
+            ? responseReceipt
+            : request.url.includes("/attention")
+              ? request.method === "GET"
+                ? attentionSnapshot
+                : attentionResult(request.url.split("/").at(-1) as "pause" | "record" | "requeue")
+              : request.url.endsWith("/delivery-intents")
+                ? receipt
+                : snapshot),
         environmentId: "env-test",
       });
     }
-    expect(calls).toBe(9);
+    expect(calls).toBe(12);
+    expect(nativeAuditId).toBe(digest("test"));
+    expect(nativeAuditId).not.toBe("claimed");
     failure = Object.defineProperty(new WorkbenchQueueError({ reason: "unavailable" }), "cause", {
       value: new Error("private SQL connection credential"),
     });

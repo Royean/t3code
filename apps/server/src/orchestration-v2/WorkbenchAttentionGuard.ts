@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Responses from "./WorkbenchResponseGuard.ts";
 
 export class WorkbenchAttentionGuardError extends Schema.TaggedError<WorkbenchAttentionGuardError>()(
   "WorkbenchAttentionGuardError",
@@ -24,6 +25,7 @@ export class WorkbenchAttentionGuardError extends Schema.TaggedError<WorkbenchAt
       "resume-mismatch",
       "unavailable",
       "runtime-request-pending",
+      "response-mismatch",
     ]),
     runtimeRequestId: Schema.optional(RuntimeRequestId),
     cause: Schema.optional(Schema.Defect()),
@@ -70,6 +72,9 @@ export class WorkbenchAttentionGuard extends Context.Service<
     readonly originalResume: (
       input: Admission,
     ) => Effect.Effect<OriginalResume | undefined, WorkbenchAttentionGuardError>;
+    readonly assertResponseExecution: (
+      input: Parameters<typeof Responses.assertResponseExecution>[0],
+    ) => Effect.Effect<void, WorkbenchAttentionGuardError>;
     /** Register before the durable read, so a pause cannot miss an external call already entering. */
     readonly withAdmission: <A, E, R>(
       input: Admission,
@@ -164,6 +169,12 @@ export const assertAutomaticPauseStop = Effect.fn(
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const responseFailure = (threadId: ThreadId) => (cause: unknown) =>
+    new WorkbenchAttentionGuardError({
+      threadId,
+      reason: "response-mismatch",
+      cause,
+    });
   const active = new Map<ThreadId, Set<Deferred.Deferred<void>>>();
   const originalResume = Effect.fn("WorkbenchAttentionGuard.originalResume")(
     function* (input: Admission) {
@@ -182,7 +193,11 @@ const make = Effect.gen(function* () {
           SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=i.thread_id
           AND r.run_id=${input.runId ?? null} AND json_extract(r.payload_json,'$.userMessageId')=i.message_id))))
       LIMIT 1`;
-      if (row === undefined) return;
+      if (row === undefined)
+        return yield* Responses.originalResponse(input).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError(responseFailure(input.threadId)),
+        );
       if (
         row.current_epoch !== row.attention_epoch ||
         row.binding_valid !== 1 ||
@@ -241,7 +256,15 @@ const make = Effect.gen(function* () {
             reason: "stale",
           });
         }
-        if (row.attention_hold === 1 && (yield* originalResume(input)) === undefined) {
+        const response = yield* Responses.responseAdmission(input).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError(responseFailure(input.threadId)),
+        );
+        if (
+          row.attention_hold === 1 &&
+          response === undefined &&
+          (yield* originalResume(input)) === undefined
+        ) {
           return yield* new WorkbenchAttentionGuardError({
             threadId: input.threadId,
             reason: "held",
@@ -270,6 +293,12 @@ const make = Effect.gen(function* () {
     if (command.type === "thread.stop")
       return yield* assertAutomaticPauseStop(command).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
+      );
+    if (command.type === "runtime-request.respond")
+      return yield* Responses.assertResponseCommand(command).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.asVoid,
+        Effect.mapError(responseFailure(command.threadId)),
       );
     const threadId =
       "threadId" in command
@@ -302,6 +331,13 @@ const make = Effect.gen(function* () {
       ...(command.type === "message.dispatch" ? { messageId: command.messageId } : {}),
     };
     yield* assertAdmission(input);
+    if (
+      (yield* Responses.responseAdmission(input).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(responseFailure(threadId)),
+      )) !== undefined
+    )
+      return yield* new WorkbenchAttentionGuardError({ threadId, reason: "response-mismatch" });
     const resume = yield* originalResume(input);
     if (
       resume !== undefined &&
@@ -321,6 +357,12 @@ const make = Effect.gen(function* () {
     assertAdmission,
     assertCommand,
     originalResume,
+    assertResponseExecution: Effect.fn("WorkbenchAttentionGuard.assertResponseExecution")((input) =>
+      Responses.assertResponseExecution(input).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(responseFailure(input.threadId)),
+      ),
+    ),
     withAdmission: Effect.fn("WorkbenchAttentionGuard.withAdmission")(function* <A, E, R>(
       input: Admission,
       effect: Effect.Effect<A, E, R>,

@@ -39,6 +39,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
+import * as WorkbenchResponseGuard from "./WorkbenchResponseGuard.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -197,6 +198,10 @@ export interface EventSinkV2Shape {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
     readonly commandType: string;
+    readonly responseCommand?: Extract<
+      import("@t3tools/contracts").OrchestrationV2ServerCommand,
+      { type: "runtime-request.respond" }
+    >;
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
@@ -416,6 +421,15 @@ const layerBase: Layer.Layer<
         yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
           concurrency: 1,
         });
+        for (const threadId of new Set(
+          storedEvents
+            .filter(({ event }) => event.type === "provider-turn.updated")
+            .map(({ event }) => event.threadId),
+        )) {
+          yield* WorkbenchResponseGuard.refreshResponseEvidence({ threadId }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+        }
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -766,6 +780,25 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          const existing = yield* commandReceipts.getByCommandId(input.commandId);
+          if (
+            input.commandType === "runtime-request.respond" &&
+            input.responseCommand === undefined &&
+            Option.isNone(existing)
+          ) {
+            const [owned] =
+              yield* sql`SELECT 1 FROM workbench_work_items WHERE work_thread_id=${input.threadId}`;
+            if (owned !== undefined)
+              return yield* new WorkbenchResponseGuard.WorkbenchResponseGuardError({
+                reason: "command-mismatch",
+              });
+          }
+          const responseProof =
+            input.responseCommand === undefined || Option.isSome(existing)
+              ? undefined
+              : yield* WorkbenchResponseGuard.assertResponseCommand(input.responseCommand).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                );
           if (
             input.commandType === "thread.stop" &&
             Option.isNone(yield* commandReceipts.getByCommandId(input.commandId))
@@ -853,6 +886,13 @@ const layerBase: Layer.Layer<
             error: null,
           };
           yield* commandReceipts.upsert(receipt);
+          if (responseProof !== undefined)
+            yield* WorkbenchResponseGuard.recordResponseCommit({
+              proof: responseProof,
+              events: storedEvents,
+              effects: input.effects,
+              sequence,
+            }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
           const cancelledEffectIds =
             input.cancelUnsettledEffects === undefined
               ? []

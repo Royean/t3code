@@ -72,6 +72,10 @@ import {
 } from "./speech.ts";
 import {
   WorkbenchAttentionQuery,
+  WorkbenchRuntimeResponseInput,
+  WorkbenchRuntimeRequestsSnapshot,
+  WorkbenchRuntimeResponseReceipt,
+  WorkbenchAttentionScope,
   WorkbenchAttentionPauseInput,
   WorkbenchAttentionRecordInput,
   WorkbenchAttentionRequeueInput,
@@ -1285,6 +1289,39 @@ class EnvironmentWorkbenchQueueHttpApi extends HttpApiGroup.make("workbenchQueue
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchResponsesHttpApi extends HttpApiGroup.make("workbenchResponses").add(
+  HttpApiEndpoint.get("list", "/api/workbench/queues/:queueId/requests", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchAttentionQuery,
+    success: WorkbenchRuntimeRequestsSnapshot,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("respond", "/api/workbench/queues/:queueId/responses", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchRuntimeResponseInput,
+    success: WorkbenchRuntimeResponseReceipt,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/responses/:responseId", {
+    params: { queueId: TrimmedNonEmptyString, responseId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchAttentionScope,
+    success: WorkbenchRuntimeResponseReceipt,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 class EnvironmentWorkbenchAttentionHttpApi extends HttpApiGroup.make("workbenchAttention").add(
   HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/attention", {
     params: { queueId: TrimmedNonEmptyString },
@@ -1342,5 +1379,6 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentWebhooksHttpApi)
   .add(EnvironmentWorkbenchQueueHttpApi)
   .add(EnvironmentWorkbenchAttentionHttpApi)
+  .add(EnvironmentWorkbenchResponsesHttpApi)
   .add(EnvironmentWorkbenchWorkItemsHttpApi)
   .add(EnvironmentScheduledTaskExecutionsHttpApi) {}

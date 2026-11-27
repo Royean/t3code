@@ -29,7 +29,7 @@ import {
 const decodeMatter = Schema.decodeUnknownEffect(Schema.fromJsonString(WorkbenchMatter));
 
 function batchRuns(
-  child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "nodes" | "runtimeRequests">,
   rootId: string,
 ) {
   const owned = new Set([rootId]);
@@ -44,6 +44,24 @@ function batchRuns(
         owned.add(run.id);
         grew = true;
       }
+    for (const request of child.runtimeRequests) {
+      if (request.status !== "resolved" || request.responseCapability.type !== "message") continue;
+      const source = child.nodes.find((node) => node.id === request.nodeId)?.runId;
+      const answer = child.messages.find(
+        (message) =>
+          message.id === `async-answer:${request.id}` && message.creationSource === "server",
+      );
+      if (
+        source !== undefined &&
+        source !== null &&
+        owned.has(source) &&
+        answer?.runId != null &&
+        !owned.has(answer.runId)
+      ) {
+        owned.add(answer.runId);
+        grew = true;
+      }
+    }
     for (const message of child.messages)
       if (
         message.runId !== null &&
@@ -188,6 +206,10 @@ const make = Effect.gen(function* () {
         run_id: string;
         message_id: string;
       }>`SELECT run_id,message_id FROM workbench_attention_resume_intents WHERE work_item_id=${row.id} AND batch_id=${batch.id} AND run_id IS NOT NULL AND state IN ('accepted','running','completed')`;
+      const responseRuns = yield* sql<{
+        run_id: string;
+        async_message_id: string;
+      }>`SELECT run_id,async_message_id FROM workbench_runtime_responses WHERE work_item_id=${row.id} AND json_extract(source_json,'$.batch_id')=${batch.id} AND run_id IS NOT NULL AND state NOT IN ('rejected')`;
       const resumeRuns = child.runs.filter((candidate) =>
         resumeIntents.some(
           (intent) =>
@@ -196,7 +218,17 @@ const make = Effect.gen(function* () {
       );
       const related = [
         ...new Map(
-          [run, ...resumeRuns]
+          [
+            run,
+            ...resumeRuns,
+            ...child.runs.filter((candidate) =>
+              responseRuns.some(
+                (response) =>
+                  response.run_id === candidate.id &&
+                  response.async_message_id === candidate.userMessageId,
+              ),
+            ),
+          ]
             .flatMap((root) => batchRuns(child, root.id))
             .map((candidate) => [candidate.id, candidate]),
         ).values(),
@@ -339,7 +371,7 @@ const make = Effect.gen(function* () {
         return yield* new ScheduledTaskError({
           message: "Work thread ownership does not match the dispatcher.",
         });
-      const runs = child.runs
+      const originalRuns = child.runs
         .filter(
           (run) =>
             run.delegatedTaskId === row.delegated_task_id ||
@@ -349,8 +381,27 @@ const make = Effect.gen(function* () {
               child.thread.forkedFrom.nodeId === row.delegated_task_id),
         )
         .toSorted((a, b) => b.ordinal - a.ordinal);
+      const responses = yield* sql<{
+        run_id: string;
+        async_message_id: string;
+      }>`SELECT run_id,async_message_id FROM workbench_runtime_responses WHERE work_item_id=${row.id} AND run_id IS NOT NULL AND state!='rejected'`;
+      const roots = [
+        ...originalRuns,
+        ...child.runs.filter((candidate) =>
+          responses.some(
+            (response) =>
+              candidate.id === response.run_id &&
+              candidate.userMessageId === response.async_message_id,
+          ),
+        ),
+      ];
+      const runs = [
+        ...new Map(
+          roots.flatMap((root) => batchRuns(child, root.id)).map((run) => [run.id, run]),
+        ).values(),
+      ].toSorted((a, b) => b.ordinal - a.ordinal);
       const run = runs[0];
-      const accepted = runs.at(-1);
+      const accepted = originalRuns.at(-1);
       const nodeIds = new Set(
         child.nodes.filter((node) => node.runId === run?.id).map((node) => node.id),
       );
@@ -588,7 +639,7 @@ const make = Effect.gen(function* () {
         handoff_ref=${input.handoffRef},preserved_ref=${input.preservedRef}
         WHERE id=${input.workItemId} AND version=${input.expectedVersion} AND latest_event_sequence=${input.expectedLatestEventSequence}
         AND processed_through_sequence=${input.processedThroughSequence} AND processed_through_sequence=latest_event_sequence AND business_state='awaiting_delivery'
-        AND recovery_ref IS NULL AND NOT EXISTS(SELECT 1 FROM workbench_work_batches b WHERE b.work_item_id=${input.workItemId} AND b.state!='completed')
+        AND recovery_ref IS NULL AND NOT EXISTS(SELECT 1 FROM workbench_runtime_responses a WHERE a.work_item_id=${input.workItemId} AND a.state IN ('recorded','queued','submitted','unknown')) AND NOT EXISTS(SELECT 1 FROM workbench_work_batches b WHERE b.work_item_id=${input.workItemId} AND b.state!='completed')
         AND NOT EXISTS(SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=${saved.work_thread_id} AND r.status IN ('preparing','starting','running','waiting','queued'))
         AND NOT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r WHERE r.thread_id=${saved.work_thread_id} AND r.status='pending')
         RETURNING id`;

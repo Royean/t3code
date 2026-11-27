@@ -6,6 +6,7 @@ import {
   IsoDateTime,
   ProjectId,
   RunId,
+  RuntimeRequestId,
   ScheduledTaskId,
   SecretRef,
   ThreadId,
@@ -17,7 +18,12 @@ import {
   OrchestrationV2CreationSource,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
 } from "./orchestrationV2.ts";
-import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
+import {
+  ProviderApprovalDecision,
+  ProviderInteractionMode,
+  ProviderRequestKind,
+  RuntimeMode,
+} from "./providerPolicy.ts";
 
 const TimeOfDay = TrimmedNonEmptyString.check(
   Schema.isPattern(/^([01]?\d|2[0-3]):([0-5]\d)$/),
@@ -796,3 +802,145 @@ export const WorkbenchAttentionMutationResult = Schema.Struct({
   queue: WorkbenchQueueSnapshot,
 });
 export type WorkbenchAttentionMutationResult = typeof WorkbenchAttentionMutationResult.Type;
+
+const ResponseId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
+const ResponseText = Schema.String.check(Schema.isMaxLength(16000));
+export const WorkbenchRuntimeQuestion = Schema.Struct({
+  id: ResponseId,
+  header: Schema.String.check(Schema.isMaxLength(1024)),
+  question: ResponseText,
+  options: Schema.Array(
+    Schema.Struct({
+      label: Schema.String.check(Schema.isMaxLength(4096)),
+      description: Schema.String.check(Schema.isMaxLength(8192)),
+      value: Schema.String.check(Schema.isMaxLength(4096)),
+    }),
+  ).check(Schema.isMaxLength(100)),
+  multiSelect: Schema.Boolean,
+  allowCustomAnswer: Schema.Boolean,
+  required: Schema.Boolean,
+});
+export const WorkbenchRuntimeApproval = Schema.Struct({
+  requestKind: ProviderRequestKind,
+  prompt: Schema.NullOr(ResponseText),
+  reason: Schema.NullOr(Schema.String.check(Schema.isMaxLength(8192))),
+  appName: Schema.NullOr(Schema.String.check(Schema.isMaxLength(1024))),
+  fullAccessOverride: Schema.NullOr(Schema.Literals(["ask_rule", "provider_check"])),
+  options: Schema.Array(
+    Schema.Struct({
+      decision: ProviderApprovalDecision,
+      label: Schema.String.check(Schema.isMaxLength(1024)),
+      warning: Schema.NullOr(Schema.String.check(Schema.isMaxLength(4096))),
+    }),
+  ).check(Schema.isMaxLength(20)),
+});
+export const WorkbenchRuntimeRequestSummary = Schema.Struct({
+  sourceIdentity: ResponseId,
+  version: AttentionVersion,
+  workItemId: ResponseId,
+  taskId: ScheduledTaskId,
+  taskCreatedAt: IsoDateTime,
+  dispatcherThreadId: ThreadId,
+  workThreadId: ThreadId,
+  requestId: RuntimeRequestId,
+  sourceRunId: RunId,
+  batchId: Schema.NullOr(Schema.String),
+  kind: Schema.Literals(["user_input", "approval"]),
+  requestStatus: Schema.Literals(["pending", "resolved", "expired", "cancelled"]),
+  responseCapability: Schema.Union([
+    Schema.Struct({ type: Schema.Literal("live"), supportsFeedback: Schema.Boolean }),
+    Schema.Struct({ type: Schema.Literal("message") }),
+    Schema.Struct({ type: Schema.Literal("not_resumable"), reason: AttentionAction }),
+  ]),
+  questions: Schema.Array(WorkbenchRuntimeQuestion).check(Schema.isMaxLength(20)),
+  approval: Schema.NullOr(WorkbenchRuntimeApproval),
+  canRespond: Schema.Boolean,
+  blockedReason: Schema.NullOr(
+    Schema.Literals([
+      "not_pending",
+      "not_resumable",
+      "details_unavailable",
+      "source_unknown",
+      "state_unknown",
+      "response_recorded",
+    ]),
+  ),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkbenchRuntimeRequestSummary = typeof WorkbenchRuntimeRequestSummary.Type;
+export const WorkbenchRuntimeResponseInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  responseId: ResponseId,
+  sourceIdentity: ResponseId,
+  expectedVersion: AttentionVersion,
+  claimedActor: Schema.Struct({ kind: Schema.Literal("workbench_cookie"), id: ResponseId }),
+  response: Schema.Union([
+    Schema.Struct({
+      type: Schema.Literal("answers"),
+      answers: Schema.Record(ResponseId, Schema.Array(ResponseText).check(Schema.isMaxLength(100))),
+    }),
+    Schema.Struct({
+      type: Schema.Literal("decision"),
+      decision: ProviderApprovalDecision,
+      feedback: Schema.optional(ResponseText),
+    }),
+  ]),
+});
+export type WorkbenchRuntimeResponseInput = typeof WorkbenchRuntimeResponseInput.Type;
+export const WorkbenchRuntimeResponseSummary = Schema.Struct({
+  id: ResponseId,
+  sourceIdentity: ResponseId,
+  sourceVersion: AttentionVersion,
+  workItemId: ResponseId,
+  requestId: RuntimeRequestId,
+  status: Schema.Literals([
+    "recorded",
+    "queued",
+    "submitted",
+    "runtime_accepted",
+    "delivered",
+    "delivery_unconfirmed",
+    "unknown",
+    "rejected",
+  ]),
+  blockedReason: Schema.NullOr(
+    Schema.Literals([
+      "queue_full",
+      "not_pending",
+      "not_resumable",
+      "source_changed",
+      "provider_context_unavailable",
+      "state_unknown",
+      "delivery_failed",
+    ]),
+  ),
+  recordedAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  delivery: Schema.Struct({
+    evidence: Schema.Literals([
+      "none",
+      "command_receipt",
+      "runtime_handoff",
+      "provider_ack",
+      "unconfirmed",
+    ]),
+    confirmedAt: Schema.NullOr(IsoDateTime),
+  }),
+  claimedActor: WorkbenchRuntimeResponseInput.fields.claimedActor,
+  nativePrincipal: Schema.Struct({ kind: Schema.Literal("environment_session"), id: ResponseId }),
+  answerMessageId: Schema.NullOr(Schema.String),
+  answerRunId: Schema.NullOr(RunId),
+});
+export type WorkbenchRuntimeResponseSummary = typeof WorkbenchRuntimeResponseSummary.Type;
+export const WorkbenchRuntimeRequestsSnapshot = Schema.Struct({
+  ...AttentionIdentity.fields,
+  requests: Schema.Array(WorkbenchRuntimeRequestSummary),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+export type WorkbenchRuntimeRequestsSnapshot = typeof WorkbenchRuntimeRequestsSnapshot.Type;
+export const WorkbenchRuntimeResponseReceipt = Schema.Struct({
+  ...AttentionIdentity.fields,
+  response: WorkbenchRuntimeResponseSummary,
+});
+export type WorkbenchRuntimeResponseReceipt = typeof WorkbenchRuntimeResponseReceipt.Type;

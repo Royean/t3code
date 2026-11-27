@@ -6,6 +6,9 @@ import * as AttentionGuard from "./WorkbenchAttentionGuard.ts";
 import * as RuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as RunExecution from "./RunExecutionService.ts";
+import * as ProviderSessions from "./ProviderSessionManager.ts";
+import * as EffectWorker from "./EffectWorker.ts";
+import * as WorkbenchResponses from "../scheduledTasks/WorkbenchResponses.ts";
 import * as WorkbenchAttention from "../scheduledTasks/WorkbenchAttention.ts";
 import * as WorkbenchLifecycle from "../scheduledTasks/workbenchLifecycle.ts";
 import * as ExecutionLedger from "../scheduledTasks/executionLedger.ts";
@@ -36,6 +39,8 @@ import {
   EventId,
   NodeId,
   RuntimeRequestId,
+  RunId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
   ChatAttachmentId,
   ComposerContextId,
@@ -5561,6 +5566,643 @@ it.live("retains dirty workbench context before releasing a paused reservation",
           itemsLayer,
           dependencies,
         ),
+      ),
+    );
+  }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
+);
+
+it.live("records source-bound workbench answers without replacing the original child", () =>
+  Effect.gen(function* () {
+    const { parentId, taskId, stamp, task, dependencies, itemsLayer, queues, dispatchLayer } =
+      yield* setupWorkbenchMattersFixture();
+    const responseLayer = WorkbenchResponses.layer.pipe(
+      Layer.provide(queues),
+      Layer.provide(itemsLayer),
+      Layer.provide(dependencies),
+    );
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService,
+        threads = yield* ThreadManagement.ThreadManagementService,
+        sql = yield* SqlClient.SqlClient,
+        queue = yield* WorkbenchQueue.WorkbenchQueue,
+        dispatch = yield* WorkbenchDispatch.WorkbenchDispatch,
+        responses = yield* WorkbenchResponses.WorkbenchResponses,
+        sink = yield* EventSink.EventSinkV2;
+      yield* launches.launch(launchInput({ command: "answers:parent", thread: parentId }));
+      const owner = { controllerId: "controller:matter", projectId };
+      const bound = yield* queue.bind("queue:matter", {
+        ...owner,
+        taskId,
+        dispatcherThreadId: parentId,
+      });
+      const scope = { ...owner, expectedTrackingId: bound.trackingId };
+      const bodyText = JSON.stringify({
+        deliveryId: "answers-event",
+        issue: { number: 1 },
+        action: "opened",
+      });
+      yield* queue.prepareDeliveryIntent("queue:matter", {
+        ...scope,
+        taskId,
+        taskCreatedAt: stamp,
+        dispatcherThreadId: parentId,
+        intentId: "intent:answers",
+        subscriptionScopeId: "subscription:matter",
+        businessDeliveryId: "answers-event",
+        bodySha256: WorkbenchLifecycle.digest(bodyText),
+        matter: {
+          provider: "github",
+          namespace: "https://github.com/repositories/7",
+          kind: "issue",
+          key: "1",
+          label: "Issue #1",
+        },
+      });
+      yield* sql.withTransaction(
+        ExecutionLedger.recordAlias({
+          task: task as never,
+          attemptId: "answers",
+          deliveryId: "native:answers",
+          businessDeliveryId: "answers-event",
+          outcome: "accepted",
+          executionId: "execution:answers",
+          receivedAt: stamp,
+          create: true,
+          rawBody: new TextEncoder().encode(bodyText),
+          request: { method: "POST", path: "/secret", query: "", headers: {}, bodyText },
+        }),
+      );
+      yield* queue.reconcile("queue:matter", scope);
+      const caller: McpInvocationScope = {
+        environmentId: EnvironmentId.make("env-test"),
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 0,
+        requestNamespace: "session:answers",
+        thread: {
+          threadId: parentId,
+          providerSessionId: "session:answers",
+          providerInstanceId: modelSelection.instanceId,
+        },
+        client: undefined,
+      };
+      const prepared = yield* sink.stream({ afterSequence: yield* sink.latestSequence() }).pipe(
+        Stream.filter(
+          (e) =>
+            e.event.type === "run.updated" &&
+            e.event.threadId !== parentId &&
+            e.event.payload.status === "starting",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* dispatch.dispatch(caller, { taskId });
+      yield* Fiber.join(prepared);
+      const started = (yield* (yield* WorkbenchWorkItems.WorkbenchWorkItems).get(
+        taskId,
+        "answers-event",
+      )).workItems[0]!;
+      const threadId = ThreadId.make(started.workThreadId!);
+      let projection = yield* threads.getThreadProjection(threadId);
+      const native = projection.providerThreads.find(
+        (t) => t.id === projection.runs.find((r) => r.id === started.runId)?.providerThreadId,
+      )!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:native"),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...native,
+              nativeThreadRef: {
+                driver: ProviderDriverKind.make("codex"),
+                nativeId: "native:answers",
+                strength: "strong",
+              },
+            },
+          },
+        ],
+      });
+      projection = yield* threads.getThreadProjection(threadId);
+      const run = projection.runs.find((r) => r.id === started.runId)!;
+      const requestId = RuntimeRequestId.make("answers:question");
+      const now = yield* DateTime.now;
+      const request = {
+        id: requestId,
+        nodeId: run.rootNodeId!,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:question-opened"),
+            type: "runtime-request.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: request,
+          },
+          {
+            id: EventId.make("answers:question-item"),
+            type: "turn-item.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("answers:item"),
+              threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId!,
+              providerThreadId: run.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 50,
+              type: "user_input_request",
+              requestId,
+              questions: [
+                {
+                  id: "target",
+                  header: "Target",
+                  question: "Choose the target",
+                  options: [
+                    { label: "Staging", description: "An isolated target", value: "staging" },
+                  ],
+                  allowCustomAnswer: false,
+                  required: true,
+                },
+              ],
+              responseMode: "message",
+              status: "pending",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      const requests = yield* responses.list("queue:matter", scope);
+      assert.equal(requests.requests.length, 1);
+      const source = requests.requests[0]!;
+      assert.equal(source.requestId, requestId);
+      assert.equal(source.questions[0]?.question, "Choose the target");
+      assert.equal(source.questions[0]?.options[0]?.value, "staging");
+      assert.equal(source.responseCapability.type, "message");
+      assert.equal(source.canRespond, true);
+      const input = {
+        ...scope,
+        responseId: "response:answers",
+        sourceIdentity: source.sourceIdentity,
+        expectedVersion: source.version,
+        claimedActor: { kind: "workbench_cookie" as const, id: "claimed:human" },
+        response: { type: "answers" as const, answers: { target: ["staging"] } },
+      };
+      const heldRunId = RunId.make("answers:held-run"),
+        heldMessageId = MessageId.make("answers:held-message");
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:held-message-added"),
+            type: "message.updated",
+            threadId,
+            runId: heldRunId,
+            occurredAt: now,
+            payload: {
+              ...projection.messages.find((m) => m.id === run.userMessageId)!,
+              id: heldMessageId,
+              runId: heldRunId,
+              createdBy: "user",
+              text: "Unrelated held work",
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make("answers:held-run-added"),
+            type: "run.updated",
+            threadId,
+            runId: heldRunId,
+            occurredAt: now,
+            payload: {
+              ...run,
+              id: heldRunId,
+              userMessageId: heldMessageId,
+              ordinal: run.ordinal + 1,
+              status: "queued",
+              queueHeld: true,
+              delegatedTaskId: undefined,
+              rootNodeId: null,
+              activeAttemptId: null,
+              startedAt: null,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+      yield* sql`UPDATE workbench_work_items SET attention_hold=1,attention_epoch=attention_epoch+1 WHERE id=${started.id}`;
+      const receipt = yield* responses.respond("queue:matter", input, "native-audit-ref");
+      assert.equal(receipt.response.status, "submitted");
+      assert.equal(receipt.response.delivery.evidence, "command_receipt");
+      assert.equal(receipt.response.answerMessageId, `async-answer:${requestId}`);
+      assert.isNotNull(receipt.response.answerRunId);
+      const answered = yield* threads.getThreadProjection(threadId);
+      assert.equal(answered.runtimeRequests.find((r) => r.id === requestId)?.status, "resolved");
+      const answerRun = answered.runs.find((r) => r.id === receipt.response.answerRunId)!;
+      assert.equal(answerRun.status, "queued");
+      assert.notEqual(
+        answerRun.queueHeld,
+        true,
+        "the exact answer must not inherit the unrelated queue hold",
+      );
+      assert.equal(answered.runs.find((r) => r.id === heldRunId)?.queueHeld, true);
+      assert.equal(
+        (yield* sql<{
+          attention_hold: number;
+        }>`SELECT attention_hold FROM workbench_work_items WHERE id=${started.id}`)[0]
+          ?.attention_hold,
+        1,
+      );
+      assert.equal(answerRun.userMessageId, `async-answer:${requestId}`);
+      assert.equal(
+        (yield* responses.respond("queue:matter", input, "different-native-session")).response.id,
+        receipt.response.id,
+      );
+      assert.equal(
+        (yield* threads.getThreadProjection(threadId)).runs.length,
+        answered.runs.length,
+      );
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      assert.equal(
+        (yield* responses.get("queue:matter", input.responseId, scope)).response.nativePrincipal.id,
+        "native-audit-ref",
+      );
+      assert.equal(
+        (yield* responses.get("queue:matter", input.responseId, scope)).response.claimedActor.id,
+        "claimed:human",
+      );
+      assert.equal(
+        (yield* responses
+          .respond(
+            "queue:matter",
+            { ...input, response: { type: "answers", answers: { target: ["other"] } } },
+            "native-audit-ref",
+          )
+          .pipe(Effect.flip)).reason,
+        "stale_state",
+      );
+      assert.equal(
+        (yield* responses
+          .get("queue:matter", input.responseId, { ...scope, controllerId: "other" })
+          .pipe(Effect.flip)).reason,
+        "invalid_binding",
+      );
+      const sourceRows = yield* responses.list("queue:matter", scope);
+      assert.equal(sourceRows.requests[0]?.requestStatus, "resolved");
+      assert.equal(sourceRows.requests[0]?.canRespond, false);
+      assert.equal(sourceRows.requests[0]?.blockedReason, "response_recorded");
+      assert.equal(
+        (yield* responses
+          .respond("queue:matter", { ...input, responseId: "late-duplicate" }, "native-audit-ref")
+          .pipe(Effect.flip)).reason,
+        "stale_state",
+      );
+      const promoting = yield* sink.stream({ afterSequence: yield* sink.latestSequence() }).pipe(
+        Stream.filter(
+          (e) =>
+            e.event.type === "run.updated" &&
+            e.event.threadId === threadId &&
+            e.event.payload.id === answerRun.id &&
+            e.event.payload.status === "starting",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:source-finished"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...run, status: "completed", completedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      yield* Fiber.join(promoting);
+      const promoted = yield* threads.getThreadProjection(threadId);
+      assert.equal(promoted.runs.find((r) => r.id === answerRun.id)?.status, "starting");
+      assert.equal(promoted.runs.find((r) => r.id === heldRunId)?.status, "queued");
+      assert.equal(promoted.runs.find((r) => r.id === heldRunId)?.queueHeld, true);
+      assert.equal(promoted.thread.worktreePath, started.worktreePath);
+      assert.equal(promoted.thread.branch, started.branch);
+      assert.equal(
+        (yield* sql<{
+          attention_hold: number;
+        }>`SELECT attention_hold FROM workbench_work_items WHERE id=${started.id}`)[0]
+          ?.attention_hold,
+        1,
+      );
+      const linked = (yield* (yield* WorkbenchWorkItems.WorkbenchWorkItems).get(
+        taskId,
+        "answers-event",
+      )).workItems[0]!;
+      assert.equal(linked.activeBatch?.runId, answerRun.id);
+      assert.equal(linked.activeBatch?.acceptedRunId, started.acceptedRunId);
+      assert.equal(linked.processedThroughSequence, 0);
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      const actualRun = promoted.runs.find((r) => r.id === answerRun.id)!,
+        actualAttempt = promoted.attempts.find((a) => a.id === actualRun.activeAttemptId)!;
+      assert.equal(actualRun.providerThreadId, native.id);
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:running-without-native-ack"),
+            type: "run.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: { ...actualRun, status: "running", startedAt: now },
+          },
+          {
+            id: EventId.make("answers:attempt-loaded"),
+            type: "run-attempt.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: {
+              ...actualAttempt,
+              status: "running",
+              startedAt: now,
+              nativeThreadId: "native:answers",
+            },
+          },
+        ],
+      });
+      assert.notEqual(
+        (yield* responses.get("queue:matter", input.responseId, scope)).response.status,
+        "delivered",
+      );
+      const turn = {
+        id: ProviderTurnId.make("turn:answers"),
+        providerThreadId: actualRun.providerThreadId!,
+        nodeId: actualRun.rootNodeId!,
+        runAttemptId: actualAttempt.id,
+        nativeTurnRef: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "native-answer-turn",
+          strength: "strong" as const,
+        },
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "wrong-context",
+          strength: "strong" as const,
+        },
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:wrong-turn-context"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: turn,
+          },
+        ],
+      });
+      assert.notEqual(
+        (yield* responses.get("queue:matter", input.responseId, scope)).response.status,
+        "delivered",
+      );
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:weak-turn-context"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: {
+              ...turn,
+              nativeThreadRef: { ...turn.nativeThreadRef, nativeId: "native:answers" },
+              nativeTurnRef: { ...turn.nativeTurnRef, strength: "weak" },
+            },
+          },
+        ],
+      });
+      assert.notEqual(
+        (yield* responses.get("queue:matter", input.responseId, scope)).response.status,
+        "delivered",
+      );
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:matching-turn-context"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: {
+              ...turn,
+              nativeThreadRef: { ...turn.nativeThreadRef, nativeId: "native:answers" },
+            },
+          },
+        ],
+      });
+      const confirmed = yield* responses.get("queue:matter", input.responseId, scope);
+      assert.equal(confirmed.response.status, "delivered");
+      assert.equal(confirmed.response.delivery.evidence, "provider_ack");
+      assert.isNotNull(confirmed.response.delivery.confirmedAt);
+      const reconstructed = yield* Effect.gen(function* () {
+        const service = yield* WorkbenchResponses.WorkbenchResponses;
+        return yield* service.get("queue:matter", input.responseId, scope);
+      }).pipe(Effect.provide(Layer.fresh(responseLayer)));
+      assert.equal(reconstructed.response.status, "delivered");
+      assert.equal(reconstructed.response.sourceVersion, input.expectedVersion);
+      assert.equal(reconstructed.response.claimedActor.id, "claimed:human");
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      for (const id of [parentId, threadId]) {
+        const effects = yield* sql<{
+          effect_type: EffectOutbox.OrchestrationEffectV2["request"]["type"];
+        }>`SELECT DISTINCT effect_type FROM orchestration_v2_effect_outbox WHERE thread_id=${id} AND status IN ('pending','running')`;
+        yield* outbox.cancelUnsettled({
+          threadId: id,
+          effectTypes: effects.map((e) => e.effect_type),
+          reason: "The isolated fixture already ingested its synthetic native events",
+        });
+      }
+      const liveSessionId = ProviderSessionId.make("session:live-answers");
+      const session = {
+        id: liveSessionId,
+        driver: ProviderDriverKind.make("codex"),
+        providerInstanceId: modelSelection.instanceId,
+        status: "waiting" as const,
+        cwd: started.worktreePath!,
+        model: modelSelection.model,
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      };
+      const liveId = RuntimeRequestId.make("answers:approval");
+      const liveRequest = {
+        ...request,
+        id: liveId,
+        nodeId: actualRun.rootNodeId!,
+        providerTurnId: turn.id,
+        kind: "command" as const,
+        responseCapability: {
+          type: "live" as const,
+          providerSessionId: liveSessionId,
+          supportsFeedback: true,
+        },
+      };
+      const approvalItem = {
+        ...promoted.turnItems.find((i) => i.type === "user_input_request")!,
+        id: TurnItemId.make("answers:approval-item"),
+        runId: actualRun.id,
+        nodeId: actualRun.rootNodeId!,
+        providerThreadId: actualRun.providerThreadId,
+        providerTurnId: turn.id,
+        type: "approval_request" as const,
+        requestId: liveId,
+        requestKind: "command" as const,
+        prompt: "Read the isolated fixtures",
+        reason: "Inspect the registered workspace",
+        options: [
+          { decision: "accept" as const, label: "Allow once" },
+          { decision: "decline" as const, label: "Decline" },
+        ],
+        status: "pending" as const,
+        ordinal: 100,
+        completedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("answers:live-session"),
+            type: "provider-session.attached",
+            threadId,
+            occurredAt: now,
+            payload: session,
+          },
+          {
+            id: EventId.make("answers:live-provider"),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...promoted.providerThreads.find((p) => p.id === native.id)!,
+              providerSessionId: liveSessionId,
+              status: "active",
+            },
+          },
+          {
+            id: EventId.make("answers:approval-pending"),
+            type: "runtime-request.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: liveRequest,
+          },
+          {
+            id: EventId.make("answers:approval-options"),
+            type: "turn-item.updated",
+            threadId,
+            runId: actualRun.id,
+            occurredAt: now,
+            payload: approvalItem,
+          },
+        ],
+      });
+      const liveSource = (yield* responses.list("queue:matter", scope)).requests.find(
+        (r) => r.requestId === liveId,
+      )!;
+      assert.equal(liveSource.kind, "approval");
+      assert.equal(liveSource.canRespond, true);
+      assert.deepEqual(
+        liveSource.approval?.options.map((o) => o.decision),
+        ["accept", "decline"],
+      );
+      const approval = {
+        ...scope,
+        responseId: "response:approval",
+        sourceIdentity: liveSource.sourceIdentity,
+        expectedVersion: liveSource.version,
+        claimedActor: { kind: "workbench_cookie" as const, id: "claimed:approver" },
+        response: { type: "decision" as const, decision: "accept" as const },
+      };
+      assert.equal(
+        (yield* responses
+          .respond(
+            "queue:matter",
+            { ...approval, response: { type: "decision", decision: "acceptAlways" } },
+            "native-approval-audit",
+          )
+          .pipe(Effect.flip)).reason,
+        "stale_state",
+      );
+      const sessions = yield* ProviderSessions.ProviderSessionManagerV2;
+      const delivered =
+        yield* Deferred.make<ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput>();
+      let callbackCount = 0;
+      const originalGet = sessions.get;
+      const runtimeSpy = vi.spyOn(sessions, "get").mockImplementation((id) =>
+        id === liveSessionId
+          ? Effect.succeedSome({
+              providerSession: session,
+              respondToRuntimeRequest: (
+                input: ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput,
+              ) =>
+                Effect.gen(function* () {
+                  callbackCount++;
+                  yield* Deferred.succeed(delivered, input);
+                }),
+            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime)
+          : originalGet(id),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => runtimeSpy.mockRestore()));
+      const accepted = yield* responses.respond("queue:matter", approval, "native-approval-audit");
+      assert.equal(accepted.response.status, "submitted");
+      assert.equal(callbackCount, 0);
+      yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).runOnce();
+      const callback = yield* Deferred.await(delivered);
+      assert.equal(callback.requestId, liveId);
+      assert.equal(callback.decision, "accept");
+      assert.equal(callbackCount, 1);
+      const handed = yield* responses.get("queue:matter", approval.responseId, scope);
+      assert.equal(handed.response.status, "runtime_accepted");
+      assert.equal(handed.response.delivery.evidence, "runtime_handoff");
+      assert.isNull(handed.response.delivery.confirmedAt);
+      assert.equal(
+        (yield* sql<{
+          attention_hold: number;
+        }>`SELECT attention_hold FROM workbench_work_items WHERE id=${started.id}`)[0]
+          ?.attention_hold,
+        1,
+      );
+      assert.equal((yield* queue.get("queue:matter", scope)).occupied, 1);
+      yield* responses.respond("queue:matter", approval, "another-native-audit");
+      yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).runOnce();
+      assert.equal(callbackCount, 1);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(responseLayer, dispatchLayer, queues, itemsLayer, dependencies),
       ),
     );
   }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),

@@ -106,6 +106,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as WorkbenchAttentionGuard from "./WorkbenchAttentionGuard.ts";
+import * as WorkbenchResponseGuard from "./WorkbenchResponseGuard.ts";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
@@ -2380,6 +2381,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly userStarted?: boolean;
       },
     ) {
+      let authorizedQueuedRunId = options?.queuedRunId;
       const admitted = yield* attentionGuard
         .assertAdmission({
           threadId,
@@ -2389,7 +2391,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.as(true),
           Effect.catchTags({ WorkbenchAttentionGuardError: () => Effect.succeed(false) }),
         );
-      if (!admitted) return;
+      if (!admitted) {
+        authorizedQueuedRunId = undefined;
+        // A held work item may run only its claimed answer; ordinary queued work stays held.
+        const answers = yield* sql<{
+          run_id: string;
+        }>`SELECT x.run_id FROM workbench_runtime_responses x
+          JOIN orchestration_v2_projection_runs r ON r.run_id=x.run_id AND r.thread_id=${threadId}
+          WHERE json_extract(x.source_json,'$.thread_id')=${threadId} AND x.state IN ('submitted','delivery_unconfirmed')
+            AND r.status='queued' AND json_extract(r.payload_json,'$.queueHeld') IS NOT 1
+            AND (${options?.queuedRunId ?? null} IS NULL OR r.run_id=${options?.queuedRunId ?? null})
+          ORDER BY r.ordinal`.pipe(
+          Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+        );
+        for (const answer of answers) {
+          const runId = RunId.make(answer.run_id);
+          if (
+            yield* attentionGuard
+              .assertAdmission({ threadId, runId })
+              .pipe(
+                Effect.as(true),
+                Effect.catchTags({ WorkbenchAttentionGuardError: () => Effect.succeed(false) }),
+              )
+          ) {
+            authorizedQueuedRunId = runId;
+            break;
+          }
+        }
+        if (authorizedQueuedRunId === undefined) return;
+      }
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
       let projection = yield* readCommandProjection(threadId);
       if (
@@ -2404,10 +2434,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projection = yield* readCommandProjection(threadId);
       }
       let storedQueuedRun =
-        options?.queuedRunId === undefined
+        authorizedQueuedRunId === undefined
           ? nextQueuedRun(projection)
           : projection.runs.find(
-              (run) => run.id === options.queuedRunId && run.status === "queued",
+              (run) => run.id === authorizedQueuedRunId && run.status === "queued",
             );
       while (
         storedQueuedRun !== undefined &&
@@ -10902,6 +10932,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
       effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
     ) {
+      const responseProof = yield* WorkbenchResponseGuard.assertResponseCommand(command).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        mapDispatchError(command),
+      );
+      const [workbench] =
+        yield* sql`SELECT 1 FROM workbench_work_items WHERE work_thread_id=${command.threadId}`.pipe(
+          mapDispatchError(command),
+        );
       const context = yield* projectionStore
         .getRuntimeResponseContext(command.threadId, command.requestId)
         .pipe(
@@ -11198,7 +11236,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } = yield* projectionStore
           .getRunningTurnContext(command.threadId)
           .pipe(mapDispatchError(command));
-        if (activeRun && activeProviderTurn && activeProviderThread?.providerSessionId) {
+        if (
+          workbench === undefined &&
+          activeRun &&
+          activeProviderTurn &&
+          activeProviderThread?.providerSessionId
+        ) {
           const activeSession = yield* providerSessions
             .get(activeProviderThread.providerSessionId)
             .pipe(
@@ -11230,6 +11273,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           dispatchMode,
         };
         yield* dispatchMessage(answer, events, effects);
+        if (responseProof !== undefined)
+          yield* Ref.update(events, (planned) =>
+            planned.map((event) =>
+              (event.type === "run.created" || event.type === "run.updated") &&
+              event.payload.userMessageId === answer.messageId &&
+              event.payload.status === "queued"
+                ? { ...event, payload: { ...event.payload, queueHeld: false } }
+                : event,
+            ),
+          );
         return yield* recordSubagentFollowup(answer, events).pipe(mapDispatchError(answer));
       }
       if (providerSessionId === null) return;
@@ -11255,6 +11308,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           request: {
             type: "runtime-request.respond",
+            ...(responseProof === undefined ? {} : { responseId: responseProof.response.id }),
             providerSessionId,
             requestId: command.requestId,
             ...(command.decision === undefined ? {} : { decision: command.decision }),
@@ -15709,6 +15763,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: command.commandId,
         threadId: commandThreadId(command),
         commandType: command.type,
+        ...(command.type === "runtime-request.respond" ? { responseCommand: command } : {}),
         acceptedAt,
         events:
           cancelledTask === undefined

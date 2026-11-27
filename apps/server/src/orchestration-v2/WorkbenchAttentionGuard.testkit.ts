@@ -7,6 +7,7 @@ export const layer = Layer.mock(Guard.WorkbenchAttentionGuard)({
   assertAdmission: () => Effect.void,
   assertCommand: () => Effect.void,
   originalResume: () => Effect.undefined,
+  assertResponseExecution: () => Effect.void,
   withAdmission: (_input, effect) => effect,
   awaitAdmissions: () => Effect.void,
 });

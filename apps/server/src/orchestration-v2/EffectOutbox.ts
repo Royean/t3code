@@ -29,6 +29,7 @@ import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as WorkbenchResponseGuard from "./WorkbenchResponseGuard.ts";
 
 import { forkParked } from "../serverActivation.ts";
 
@@ -93,6 +94,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("runtime-request.respond"),
+    responseId: Schema.optional(Schema.String),
     providerSessionId: ProviderSessionId,
     requestId: RuntimeRequestId,
     decision: Schema.optional(ProviderApprovalDecision),
@@ -443,6 +445,16 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             { concurrency: 1, discard: true },
           );
           // EventSink owns the corresponding post-commit notification.
+          for (const effect of effects) {
+            if (
+              effect.request.type !== "provider-turn.start" &&
+              effect.request.type !== "provider-turn.restart"
+            )
+              continue;
+            yield* sql`UPDATE workbench_runtime_responses SET effect_id=${effect.id},effect_state='pending'
+              WHERE run_id=${effect.request.runId} AND json_extract(source_json,'$.thread_id')=${effect.threadId}
+                AND state IN ('submitted','delivery_unconfirmed')`;
+          }
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "enqueue", cause })),
       ),
@@ -494,6 +506,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               AND effect_type IN ${sql.in(effectTypes)}
             RETURNING effect_id
           `;
+          for (const { effect_id } of rows)
+            yield* WorkbenchResponseGuard.refreshResponseEvidence({ effectId: effect_id }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
           return rows.map(({ effect_id }) => effect_id);
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "cancel-unsettled", cause })),
@@ -539,6 +555,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             AND effect_type IN ${sql.in(PROCESS_BOUND_EFFECT_TYPES)}
           RETURNING effect_id
         `;
+        for (const { effect_id } of cancelledRows)
+          yield* WorkbenchResponseGuard.refreshResponseEvidence({ effectId: effect_id }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
         const requeuedRows = yield* sql<{ readonly effect_id: string }>`
           UPDATE orchestration_v2_effect_outbox
           SET
@@ -655,6 +675,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             RETURNING effect_id
           `;
           if (rows.length === 1) {
+            yield* WorkbenchResponseGuard.refreshResponseEvidence({ effectId }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
             cancellationSignals.delete(effectId);
             yield* signalSettled([effectId]);
             yield* notifyAvailable();
@@ -718,6 +741,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             RETURNING effect_id
           `;
           if (rows.length === 1) {
+            yield* WorkbenchResponseGuard.refreshResponseEvidence({ effectId }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
             cancellationSignals.delete(effectId);
             yield* signalSettled([effectId]);
             yield* notifyAvailable();
@@ -760,7 +786,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         `;
         let pruned = 0;
         while (true) {
-          const deleted = (yield* deleteBatch).length;
+          const deleted = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const answers = yield* sql<{
+                effect_id: string;
+              }>`SELECT r.effect_id FROM workbench_runtime_responses r
+              JOIN orchestration_v2_effect_outbox e ON e.effect_id=r.effect_id
+              WHERE e.status IN ('succeeded','cancelled') AND e.completed_at<${cutoff}`;
+              for (const { effect_id } of answers)
+                yield* WorkbenchResponseGuard.refreshResponseEvidence({ effectId: effect_id }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                );
+              return (yield* deleteBatch).length;
+            }),
+          );
           pruned += deleted;
           if (deleted < PRUNE_BATCH_SIZE) return pruned;
           yield* Effect.yieldNow;
