@@ -230,54 +230,79 @@ it.effect("rejects an unregistered raw command at the event sink and never creat
   }).pipe(Effect.provide(layer)),
 );
 
-it.effect("keeps delegation within its charged repair and fences descendants after a hold", () =>
-  Effect.gen(function* () {
-    yield* seed();
-    const sink = yield* EventSink.EventSinkV2;
-    const guard = yield* Guard.WorkbenchAttentionGuard;
-    const sql = yield* SqlClient.SqlClient;
-    yield* sink.commitCommand(yield* planned());
-    yield* sql`UPDATE orchestration_v2_projection_runs SET status='running',payload_json=json_set(payload_json,'$.status','running') WHERE run_id='third-run'`;
-    yield* sql`INSERT INTO orchestration_v2_projection_nodes(node_id,thread_id,run_id,root_node_id,kind,status,provider_thread_id,payload_json)
+it.effect.each([false, true])(
+  "keeps delegation within its charged repair and fences descendants after a hold (answered: %s)",
+  (answered) =>
+    Effect.gen(function* () {
+      yield* seed();
+      const sink = yield* EventSink.EventSinkV2;
+      const guard = yield* Guard.WorkbenchAttentionGuard;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sink.commitCommand(yield* planned());
+      yield* sql`UPDATE orchestration_v2_projection_runs SET status='running',payload_json=json_set(payload_json,'$.status','running') WHERE run_id='third-run'`;
+      yield* sql`INSERT INTO orchestration_v2_projection_nodes(node_id,thread_id,run_id,root_node_id,kind,status,provider_thread_id,payload_json)
       VALUES('repair-parent-node',${threadId},'third-run','repair-parent-node','root_turn','running',${providerThreadId},'{}')`;
-    const delegation = {
-      type: "delegated_task.request" as const,
-      commandId: CommandId.make("repair-child-task"),
-      parentThreadId: threadId,
-      parentRunId: RunId.make("third-run"),
-      parentNodeId: NodeId.make("repair-parent-node"),
-      task: "Investigate this check within the current repair.",
-      modelSelection,
-      runtimeMode: "full-access" as const,
-      interactionMode: "default" as const,
-      createdBy: "agent" as const,
-      creationSource: "server" as const,
-    };
-    yield* guard.assertCommand(delegation);
-    expect(yield* sql`SELECT used FROM workbench_repair_generations`).toEqual([{ used: 3 }]);
-    expect(
-      (yield* guard
-        .assertCommand({ ...delegation, parentRunId: RunId.make("different-run") })
-        .pipe(Effect.result))._tag,
-    ).toBe("Failure");
-    yield* sql`INSERT INTO orchestration_v2_projection_subagents(subagent_id,thread_id,run_id,parent_node_id,provider,child_thread_id,origin,status,updated_at,payload_json)
-      VALUES('repair-task',${threadId},'third-run','repair-parent-node','codex','repair-grandchild','app_owned','running','2026-11-27','{}')`;
-    const child = { threadId: ThreadId.make("repair-grandchild"), expectedEpoch: 0 };
-    yield* guard.assertAdmission(child);
-    yield* sql`UPDATE workbench_work_items SET attention_hold=1,attention_epoch=1 WHERE id='repair-item'`;
-    let called = false;
-    expect(
-      (yield* guard
-        .withAdmission(
-          child,
-          Effect.sync(() => {
-            called = true;
-          }),
-        )
-        .pipe(Effect.result))._tag,
-    ).toBe("Failure");
-    expect(called).toBe(false);
-  }).pipe(Effect.provide(layer)),
+      let parentRunId = RunId.make("third-run");
+      let parentNodeId = NodeId.make("repair-parent-node");
+      if (answered) {
+        parentRunId = RunId.make("native-answer-run");
+        parentNodeId = NodeId.make("native-answer-node");
+        yield* sql`UPDATE orchestration_v2_projection_runs SET status='completed' WHERE run_id='third-run'`;
+        yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests(runtime_request_id,thread_id,node_id,kind,status,created_at,payload_json)
+        VALUES('question',${threadId},'repair-parent-node','user_input','resolved','2026-11-27','{"responseCapability":{"type":"message"}}')`;
+        yield* sql`INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,ordinal,provider,status,requested_at,payload_json)
+        VALUES(${parentRunId},${threadId},3,'codex','running','2026-11-27',${yield* encodeJson({ userMessageId: "async-answer:question", providerInstanceId, providerThreadId, modelSelection })})`;
+        yield* sql`INSERT INTO orchestration_v2_projection_nodes(node_id,thread_id,run_id,root_node_id,kind,status,provider_thread_id,payload_json)
+        VALUES(${parentNodeId},${threadId},${parentRunId},${parentNodeId},'root_turn','running',${providerThreadId},'{}')`;
+        yield* sql`INSERT INTO orchestration_v2_projection_messages(message_id,thread_id,run_id,role,streaming,created_at,updated_at,payload_json)
+        VALUES('async-answer:question',${threadId},${parentRunId},'user',0,'2026-11-27','2026-11-27','{"creationSource":"server"}')`;
+        yield* sql`INSERT INTO orchestration_command_receipts(command_id,aggregate_kind,aggregate_id,command_type,accepted_at,result_sequence,status)
+        VALUES('native-answer','thread',${threadId},'runtime-request.respond','2026-11-27',2,'accepted')`;
+        yield* sql`INSERT INTO workbench_repair_native_answers(command_id,generation_id,work_item_id,queue_id,repair_attempt_id,claim_id,wake_generation,attention_epoch,thread_id,request_id,source_run_id,message_id,run_id,created_at)
+        VALUES('native-answer','generation','repair-item','repair-queue','third','claim',2,0,${threadId},'question','third-run','async-answer:question',${parentRunId},'2026-11-27')`;
+        yield* guard.assertAdmission({ threadId, runId: parentRunId });
+        expect(
+          (yield* guard.originalResume({ threadId, runId: parentRunId }))?.nativeThreadId,
+        ).toBe("original-native-thread");
+      }
+      const delegation = {
+        type: "delegated_task.request" as const,
+        commandId: CommandId.make("repair-child-task"),
+        parentThreadId: threadId,
+        parentRunId,
+        parentNodeId,
+        task: "Investigate this check within the current repair.",
+        modelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        createdBy: "agent" as const,
+        creationSource: "server" as const,
+      };
+      yield* guard.assertCommand(delegation);
+      expect(yield* sql`SELECT used FROM workbench_repair_generations`).toEqual([{ used: 3 }]);
+      expect(
+        (yield* guard
+          .assertCommand({ ...delegation, parentRunId: RunId.make("different-run") })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* sql`INSERT INTO orchestration_v2_projection_subagents(subagent_id,thread_id,run_id,parent_node_id,provider,child_thread_id,origin,status,updated_at,payload_json)
+      VALUES('repair-task',${threadId},${parentRunId},${parentNodeId},'codex','repair-grandchild','app_owned','running','2026-11-27','{}')`;
+      const child = { threadId: ThreadId.make("repair-grandchild"), expectedEpoch: 0 };
+      yield* guard.assertAdmission(child);
+      yield* sql`UPDATE workbench_work_items SET attention_hold=1,attention_epoch=1 WHERE id='repair-item'`;
+      let called = false;
+      expect(
+        (yield* guard
+          .withAdmission(
+            child,
+            Effect.sync(() => {
+              called = true;
+            }),
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(called).toBe(false);
+    }).pipe(Effect.provide(layer)),
 );
 
 it.effect("preserves a registered original run's delegation while watching its checks", () =>

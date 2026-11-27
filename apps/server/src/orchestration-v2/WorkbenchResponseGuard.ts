@@ -122,7 +122,12 @@ const assertNativeResponse = Effect.fn("WorkbenchResponseGuard.assertNativeRespo
             AND g.dispatcher_thread_id=w.dispatcher_thread_id AND g.queue_id=e.queue_id
             AND a.queue_id=e.queue_id AND a.project_id=w.project_id AND a.claim_id=e.claim_id
             AND a.attention_epoch=w.attention_epoch AND a.wake_generation=e.wake_generation
-            AND (g.phase='repairing' OR (g.phase='awaiting_user' AND g.reason IN ('user_input','approval')))))`;
+            AND (g.phase='repairing' OR (g.phase='awaiting_user' AND g.reason IN ('user_input','approval')))) OR EXISTS(
+        SELECT 1 FROM workbench_repair_native_answers answer JOIN workbench_repair_generations g ON g.id=answer.generation_id
+          WHERE answer.work_item_id=w.id AND answer.thread_id=w.work_thread_id AND answer.run_id=n.run_id
+            AND g.work_item_id=w.id AND g.superseded_at IS NULL AND g.queue_id=e.queue_id
+            AND answer.queue_id=e.queue_id AND answer.claim_id=e.claim_id
+            AND answer.attention_epoch=w.attention_epoch AND answer.wake_generation=e.wake_generation))`;
   if (allowed === undefined) return yield* fail("claim-stale");
 });
 
@@ -370,6 +375,54 @@ export const recordResponseCommit = Effect.fn("WorkbenchResponseGuard.recordResp
   },
   Effect.mapError(normalizeFailure),
 );
+
+/** Native UI answers retain their accepted source without impersonating a Workbench human response. */
+export const recordNativeRepairAnswer = Effect.fn(
+  "WorkbenchResponseGuard.recordNativeRepairAnswer",
+)(function* (input: {
+  readonly command: RespondCommand;
+  readonly events: ReadonlyArray<OrchestrationV2StoredEvent>;
+  readonly acceptedAt: DateTime.Utc;
+}) {
+  const sql = yield* SqlClient.SqlClient;
+  const [row] = yield* sql<{
+    generation_id: string;
+    work_item_id: string;
+    queue_id: string;
+    claim_id: string;
+    wake_generation: number;
+    attention_epoch: number;
+    source_run_id: string;
+    repair_attempt_id: string | null;
+  }>`SELECT g.id AS generation_id,w.id AS work_item_id,e.queue_id,e.claim_id,e.wake_generation,w.attention_epoch,
+        n.run_id AS source_run_id,COALESCE(a.id,prior.repair_attempt_id) AS repair_attempt_id
+      FROM workbench_work_items w JOIN workbench_repair_generations g ON g.work_item_id=w.id AND g.superseded_at IS NULL
+      JOIN workbench_queue_entries e ON e.work_item_id=w.id AND e.queue_id=g.queue_id
+      JOIN orchestration_v2_projection_runtime_requests q ON q.thread_id=w.work_thread_id AND q.runtime_request_id=${input.command.requestId} AND q.status='resolved'
+      JOIN orchestration_v2_projection_nodes n ON n.thread_id=q.thread_id AND n.node_id=q.node_id
+      LEFT JOIN workbench_repair_attempts a ON a.generation_id=g.id AND a.run_id=n.run_id AND a.charged=1 AND a.state IN ('accepted','running')
+      LEFT JOIN workbench_repair_native_answers prior ON prior.generation_id=g.id AND prior.run_id=n.run_id
+      WHERE w.work_thread_id=${input.command.threadId} AND w.attention_hold=0 AND e.state='occupied' AND e.claim_id IS NOT NULL`;
+  if (row === undefined) return;
+  const message = input.events.find(
+    ({ event }) =>
+      event.type === "message.updated" &&
+      event.payload.id === `async-answer:${input.command.requestId}`,
+  );
+  const messageId = message?.event.type === "message.updated" ? message.event.payload.id : null;
+  const runId = message?.event.type === "message.updated" ? message.event.payload.runId : null;
+  yield* sql`INSERT OR IGNORE INTO workbench_repair_native_answers ${sql.insert({
+    command_id: input.command.commandId,
+    ...row,
+    thread_id: input.command.threadId,
+    request_id: input.command.requestId,
+    message_id: messageId,
+    run_id: runId,
+    created_at: DateTime.formatIso(input.acceptedAt),
+  })}`;
+  yield* sql`UPDATE workbench_repair_generations SET phase=${row.repair_attempt_id === null ? "watching" : "repairing"},reason=NULL,attention_id=NULL,version=version+1
+      WHERE id=${row.generation_id} AND (phase='succeeded' OR (phase='awaiting_user' AND reason IN ('user_input','approval')))`;
+}, Effect.mapError(normalizeFailure));
 
 /** Persist evidence before outbox retention can discard the transport record. No external IO. */
 export const refreshResponseEvidence = Effect.fn("WorkbenchResponseGuard.refreshResponseEvidence")(

@@ -857,6 +857,7 @@ export const WorkbenchRepairAttemptSummary = Schema.Struct({
   messageId: Schema.String,
   runId: Schema.NullOr(RunId),
   nativeAttemptId: Schema.NullOr(Schema.String),
+  continuationRunIds: Schema.optional(Schema.Array(RunId).check(Schema.isMaxLength(1000))),
   createdAt: IsoDateTime,
   acceptedAt: Schema.NullOr(IsoDateTime),
   completedAt: Schema.NullOr(IsoDateTime),

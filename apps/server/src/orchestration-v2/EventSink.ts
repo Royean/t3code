@@ -907,6 +907,12 @@ const layerBase: Layer.Layer<
               effects: input.effects,
               sequence,
             }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+          if (input.responseCommand !== undefined)
+            yield* WorkbenchResponseGuard.recordNativeRepairAnswer({
+              command: input.responseCommand,
+              events: storedEvents,
+              acceptedAt: input.acceptedAt,
+            }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
           const cancelledEffectIds =
             input.cancelUnsettledEffects === undefined
               ? []

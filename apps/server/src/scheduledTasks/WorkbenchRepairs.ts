@@ -242,7 +242,7 @@ const make = Effect.gen(function* () {
       const [source] = yield* sql<{
         payload_json: string;
       }>`SELECT payload_json FROM orchestration_v2_projection_runs WHERE thread_id=${w.work_thread_id}
-      AND (run_id=${w.run_id ?? w.accepted_run_id} OR run_id IN (SELECT run_id FROM workbench_repair_attempts WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_work_batches WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_attention_resume_intents WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_runtime_responses WHERE work_item_id=${w.id} AND state!='rejected')) ORDER BY ordinal DESC LIMIT 1`;
+      AND (run_id=${w.run_id ?? w.accepted_run_id} OR run_id IN (SELECT run_id FROM workbench_repair_attempts WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_work_batches WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_attention_resume_intents WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_repair_native_answers WHERE work_item_id=${w.id}) OR run_id IN (SELECT run_id FROM workbench_runtime_responses WHERE work_item_id=${w.id} AND state!='rejected')) ORDER BY ordinal DESC LIMIT 1`;
       if (!source) return { kind: "none" } as const;
       const run = yield* decodeRun(source.payload_json);
       const pending = yield* sql<{
@@ -314,6 +314,8 @@ const make = Effect.gen(function* () {
         native_attempt_id: string | null;
       }>`WITH RECURSIVE related(attempt_id,run_id) AS (
         SELECT id,run_id FROM workbench_repair_attempts WHERE generation_id=${g.id} AND state IN ('accepted','running') AND charged=1
+        UNION SELECT x.repair_attempt_id,x.run_id FROM workbench_repair_native_answers x
+          WHERE x.generation_id=${g.id} AND x.repair_attempt_id IS NOT NULL AND x.run_id IS NOT NULL
         UNION SELECT related.attempt_id,r.run_id FROM related JOIN workbench_runtime_responses r ON json_extract(r.source_json,'$.source_run_id')=related.run_id
           WHERE r.work_item_id=${w.id} AND r.run_id IS NOT NULL AND r.state!='rejected'
       ) SELECT related.attempt_id,json_extract(root.payload_json,'$.activeAttemptId') AS native_attempt_id FROM related
@@ -346,6 +348,26 @@ const make = Effect.gen(function* () {
         payload_json: string;
         sequence: number;
       }>`SELECT payload_json,sequence FROM orchestration_events WHERE stream_id=${w.work_thread_id} AND event_type='turn-item.updated' AND json_extract(payload_json,'$.runId')=${run.id} ORDER BY sequence`;
+      if (
+        g.phase === "succeeded" &&
+        g.source_run_id === run.id &&
+        rows.every((row) => row.sequence <= g.source_sequence)
+      ) {
+        const saved = yield* sql<{
+          check_id: string;
+          definition_hash: string;
+          exit_code: number;
+        }>`SELECT check_id,definition_hash,exit_code FROM workbench_repair_evidence
+          WHERE generation_id=${g.id} AND run_id=${run.id} AND run_attempt_id=${run.activeAttemptId}
+          ORDER BY sequence DESC`;
+        if (
+          policy.every((check) => {
+            const result = saved.find((item) => item.check_id === check.scriptId);
+            return result?.definition_hash === check.definitionHash && result.exit_code === 0;
+          })
+        )
+          return { kind: "none" } as const;
+      }
       for (const row of rows) {
         const decoded = yield* decodeItem(row.payload_json).pipe(Effect.option);
         if (Option.isNone(decoded)) continue;
@@ -425,7 +447,7 @@ const make = Effect.gen(function* () {
           }
           if (active)
             yield* sql`UPDATE workbench_repair_attempts SET state=${succeeded ? "succeeded" : failed.length ? "failed" : "blocked"},native_attempt_id=COALESCE(native_attempt_id,${owned?.native_attempt_id ?? null}),completed_at=${stamp},updated_at=${stamp} WHERE id=${active.id}`;
-          yield* sql`UPDATE workbench_repair_generations SET source_run_id=${run.id},source_sequence=${evidence.at(-1)?.sequence ?? g.source_sequence},context_json=${yield* encodeJson(original)} WHERE id=${g.id}`;
+          yield* sql`UPDATE workbench_repair_generations SET source_run_id=${run.id},source_sequence=${rows.at(-1)?.sequence ?? g.source_sequence},context_json=${yield* encodeJson(original)} WHERE id=${g.id}`;
           if (succeeded) {
             yield* sql`UPDATE workbench_repair_generations SET phase='succeeded',reason=NULL,version=version+CASE WHEN phase='succeeded' AND source_run_id=${run.id} THEN 0 ELSE 1 END,updated_at=${stamp} WHERE id=${g.id}`;
             return { kind: "none" } as const;
@@ -503,6 +525,11 @@ const make = Effect.gen(function* () {
         });
         const attempts =
           yield* sql<AttemptRow>`SELECT * FROM workbench_repair_attempts WHERE generation_id=${g.id} ORDER BY ordinal`;
+        const answers = yield* sql<{
+          repair_attempt_id: string;
+          run_id: string;
+        }>`SELECT repair_attempt_id,run_id
+          FROM workbench_repair_native_answers WHERE generation_id=${g.id} AND repair_attempt_id IS NOT NULL AND run_id IS NOT NULL`;
         return {
           id: g.id,
           workItemId: g.work_item_id,
@@ -522,19 +549,31 @@ const make = Effect.gen(function* () {
             g.policy_json === null ? null : yield* decodeFrozenRepairPolicy(g.policy_json),
           ),
           checks: checks.filter((c) => c.run_id === g.source_run_id).map(safe),
-          attempts: attempts.map((a) => ({
-            id: a.id,
-            ordinal: a.ordinal,
-            state: a.state,
-            commandId: a.command_id,
-            messageId: a.message_id,
-            runId: a.run_id,
-            nativeAttemptId: a.native_attempt_id,
-            createdAt: a.created_at,
-            acceptedAt: a.accepted_at,
-            completedAt: a.completed_at,
-            checks: checks.filter((c) => c.repair_attempt_id === a.id).map(safe),
-          })),
+          attempts: attempts.map((a) => {
+            const attemptChecks = checks.filter((c) => c.repair_attempt_id === a.id);
+            const checkedRuns = new Set(attemptChecks.map((c) => c.run_id));
+            const continuationRunIds = [
+              ...new Set(
+                answers
+                  .filter((x) => x.repair_attempt_id === a.id && checkedRuns.has(x.run_id))
+                  .map((x) => x.run_id),
+              ),
+            ];
+            return {
+              id: a.id,
+              ordinal: a.ordinal,
+              state: a.state,
+              commandId: a.command_id,
+              messageId: a.message_id,
+              runId: a.run_id,
+              nativeAttemptId: a.native_attempt_id,
+              ...(continuationRunIds.length ? { continuationRunIds } : {}),
+              createdAt: a.created_at,
+              acceptedAt: a.accepted_at,
+              completedAt: a.completed_at,
+              checks: attemptChecks.map(safe),
+            };
+          }),
           createdAt: g.created_at,
           updatedAt: g.updated_at,
         };

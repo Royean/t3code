@@ -228,7 +228,7 @@ it.effect("admits prepared same-subscription events into one durable matter cycl
       );
       yield* sql`UPDATE scheduled_tasks SET thread_id='thread-1' WHERE task_id=${task.id}`;
       yield* sql`INSERT INTO workbench_queues VALUES('queue:matter','controller',${task.projectId})`;
-      yield* sql`INSERT INTO workbench_queue_bindings VALUES(${task.id},${task.createdAt},'queue:matter',${task.projectId},'thread-1')`;
+      yield* sql`INSERT INTO workbench_queue_bindings(task_id,task_created_at,queue_id,project_id,dispatcher_thread_id) VALUES(${task.id},${task.createdAt},'queue:matter',${task.projectId},'thread-1')`;
       const [metadata] = yield* sql<{
         tracking_id: string;
       }>`SELECT tracking_id FROM scheduled_task_execution_metadata WHERE singleton=1`;

@@ -186,14 +186,58 @@ it.effect.each(["superseded", "uncharged", "claim", "epoch", "wake", "finished"]
       VALUES('response-repair','response-generation','item','queue',1,1,'accepted','original-work','[]',${threadId},'project','claim',0,0,'repair-command','repair-message','source-run','provider','provider-thread','session','codex','native-thread','/workspace','/workspace','feature','/repo/.git','{"model":"model"}','full-access','default','{}','2026-11-27','2026-11-27')`;
       const native = { ...recorded, commandId: CommandId.make("repair-original-ui-answer") };
       yield* guard.assertCommand(native);
-      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='resolved',payload_json=json_set(payload_json,'$.status','resolved','$.decision','accept') WHERE runtime_request_id=${native.requestId}`;
-      yield* guard.assertResponseExecution({
+      yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.activeProviderThreadId','provider-thread','$.worktreePath','/workspace','$.branch','feature')`;
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json=json_set(payload_json,'$.providerInstanceId','provider','$.nativeThreadRef.strength','strong')`;
+      yield* sql`UPDATE orchestration_v2_projection_runs SET payload_json='{"userMessageId":"repair-message","providerInstanceId":"provider","providerThreadId":"provider-thread","modelSelection":{"model":"model"}}' WHERE run_id='source-run'`;
+      const [pending] = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_runtime_requests WHERE runtime_request_id=${native.requestId}`;
+      const request = yield* decodeRequest(pending!.payload_json);
+      const now = yield* DateTime.now;
+      yield* (yield* EventSink.EventSinkV2).commitCommand({
+        commandId: native.commandId,
+        commandType: native.type,
+        threadId,
+        responseCommand: native,
+        executionCommand: native,
+        acceptedAt: now,
+        effects: [],
+        events: [
+          {
+            id: EventId.make("native-live-answer"),
+            type: "runtime-request.updated",
+            threadId,
+            runId: RunId.make("source-run"),
+            occurredAt: now,
+            payload: { ...request, status: "resolved", decision: "accept", resolvedAt: now },
+          },
+        ],
+      });
+      const execution = {
         threadId,
         commandId: native.commandId,
         requestId: native.requestId,
         providerSessionId: "session",
         decision: "accept",
-      });
+      };
+      let callbacks = 0;
+      const admission = {
+        threadId,
+        commandId: native.commandId,
+        expectedEpoch: 0,
+        effectType: "runtime-request.respond",
+      };
+      yield* guard.withAdmission(
+        admission,
+        guard.assertResponseExecution(execution).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              callbacks++;
+            }),
+          ),
+        ),
+      );
+      expect(callbacks).toBe(1);
       yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='pending',payload_json=json_remove(json_set(payload_json,'$.status','pending'),'$.decision') WHERE runtime_request_id=${native.requestId}`;
       if (drift === "superseded")
         yield* sql`UPDATE workbench_repair_generations SET superseded_at='2026-11-27'`;
@@ -205,8 +249,20 @@ it.effect.each(["superseded", "uncharged", "claim", "epoch", "wake", "finished"]
       expect((yield* guard.assertCommand(native).pipe(Effect.flip)).cause).toMatchObject({
         reason: "claim-stale",
       });
+      yield* sql`UPDATE orchestration_v2_projection_runtime_requests SET status='resolved' WHERE runtime_request_id=${native.requestId}`;
+      expect(
+        (yield* guard
+          .withAdmission(
+            admission,
+            Effect.sync(() => {
+              callbacks++;
+            }),
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(callbacks).toBe(1);
       expect(yield* sql`SELECT used FROM workbench_repair_generations`).toEqual([{ used: 1 }]);
-    }).pipe(Effect.provide(layer)),
+    }).pipe(Effect.provide(eventLayer)),
 );
 
 it.effect.each([false, true])(

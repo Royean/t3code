@@ -42,6 +42,14 @@ export default Effect.gen(function* () {
   )`;
   yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_workbench_repair_live_attempt ON workbench_repair_attempts(generation_id) WHERE state IN ('reserved','accepted','running','unknown')`;
   yield* sql`CREATE INDEX IF NOT EXISTS idx_workbench_repair_attempt_thread ON workbench_repair_attempts(thread_id,run_id)`;
+  yield* sql`CREATE TABLE IF NOT EXISTS workbench_repair_native_answers (
+    command_id TEXT PRIMARY KEY,generation_id TEXT NOT NULL REFERENCES workbench_repair_generations(id),
+    work_item_id TEXT NOT NULL,queue_id TEXT NOT NULL,repair_attempt_id TEXT REFERENCES workbench_repair_attempts(id),
+    claim_id TEXT NOT NULL,wake_generation INTEGER NOT NULL,attention_epoch INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,request_id TEXT NOT NULL,source_run_id TEXT NOT NULL,
+    message_id TEXT,run_id TEXT UNIQUE,created_at TEXT NOT NULL,
+    UNIQUE(thread_id,request_id)
+  )`;
   yield* sql`CREATE TABLE IF NOT EXISTS workbench_repair_evidence (
     id TEXT PRIMARY KEY,generation_id TEXT NOT NULL,repair_attempt_id TEXT,check_id TEXT NOT NULL,check_name TEXT NOT NULL,definition_hash TEXT NOT NULL,
     thread_id TEXT NOT NULL,item_id TEXT NOT NULL,run_id TEXT NOT NULL,run_attempt_id TEXT NOT NULL,node_id TEXT NOT NULL,

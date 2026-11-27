@@ -11273,7 +11273,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           dispatchMode,
         };
         yield* dispatchMessage(answer, events, effects);
-        if (responseProof !== undefined)
+        if (responseProof !== undefined || workbench !== undefined)
           yield* Ref.update(events, (planned) =>
             planned.map((event) =>
               (event.type === "run.created" || event.type === "run.updated") &&

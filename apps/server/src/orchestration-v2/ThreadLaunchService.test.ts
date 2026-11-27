@@ -5040,9 +5040,9 @@ it.live(
     }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
 );
 
-it.live(
-  "saves exhausted repair evidence and dirty Git context before a human creates the next budget",
-  () =>
+it.live.each(["workbench", "native"] as const)(
+  "saves exhausted repair evidence and dirty Git context before a human creates the next budget (%s)",
+  (answerChannel) =>
     Effect.gen(function* () {
       const {
         root,
@@ -5422,19 +5422,52 @@ it.live(
             const source = (yield* responses.list("queue:matter", scope)).requests.find(
               (r) => r.requestId === requestId,
             )!;
-            const answer = yield* responses.respond(
-              "queue:matter",
-              {
-                ...scope,
-                responseId: "repair:answer",
-                sourceIdentity: source.sourceIdentity,
-                expectedVersion: source.version,
-                claimedActor: { kind: "workbench_cookie", id: "cookie:human" },
-                response: { type: "answers", answers: { scope: ["local"] } },
-              },
-              "native-principal",
-            );
-            assert.equal(answer.response.status, "submitted");
+            if (answerChannel === "native") {
+              const commandId = CommandId.make("native:repair:answer");
+              yield* (yield* Orchestrator.OrchestratorV2).dispatch({
+                type: "runtime-request.respond",
+                commandId,
+                threadId: childId,
+                requestId,
+                answers: { scope: ["local"] },
+              });
+              const answerRun = (yield* threads.getThreadRecords(childId, ["runs"])).runs.toSorted(
+                (a, b) => b.ordinal - a.ordinal,
+              )[0]!;
+              const guard = yield* AttentionGuard.WorkbenchAttentionGuard;
+              assert.notEqual(answerRun.queueHeld, true);
+              yield* guard.withAdmission(
+                {
+                  threadId: childId,
+                  commandId,
+                  runId: answerRun.id,
+                  messageId: answerRun.userMessageId,
+                  effectType: "provider-turn.start",
+                  expectedEpoch: 0,
+                },
+                Effect.void,
+              );
+              assert.equal(
+                (yield* guard.originalResume({ threadId: childId, runId: answerRun.id }))
+                  ?.worktreePath,
+                path,
+              );
+              assert.equal((yield* sql`SELECT id FROM workbench_runtime_responses`).length, 0);
+            } else {
+              const answer = yield* responses.respond(
+                "queue:matter",
+                {
+                  ...scope,
+                  responseId: "repair:answer",
+                  sourceIdentity: source.sourceIdentity,
+                  expectedVersion: source.version,
+                  claimedActor: { kind: "workbench_cookie", id: "cookie:human" },
+                  response: { type: "answers", answers: { scope: ["local"] } },
+                },
+                "native-principal",
+              );
+              assert.equal(answer.response.status, "submitted");
+            }
             yield* (yield* WorkbenchWorkItems.WorkbenchWorkItems).get(taskId, "repair-event");
             yield* repairs.observe(started.id);
             const continuing = (yield* repairs.list("queue:matter", scope)).repairs[0]!;
@@ -5459,6 +5492,10 @@ it.live(
           generation = view.repairs[0]!;
         assert.equal(generation.used, 3);
         assert.equal(generation.attempts.length, 3);
+        const continued = generation.attempts[0]!;
+        const answeredCheck = continued.checks.find((check) => check.runId !== continued.runId);
+        assert.exists(answeredCheck);
+        assert.include(continued.continuationRunIds ?? [], answeredCheck!.runId);
         const points = yield* sql<{
           checkpoint_ref: string;
           manifest_json: string;
@@ -5551,6 +5588,7 @@ it.live(
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
+            AttentionGuard.layer.pipe(Layer.provide(dependencies)),
             responseLayer,
             reactorLayer,
             repairLayer,

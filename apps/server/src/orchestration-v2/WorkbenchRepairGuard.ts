@@ -39,6 +39,7 @@ interface RepairProof {
   command_id: string;
   message_id: string;
   run_id: string | null;
+  admitted_run_id?: string | null;
   attention_epoch: number;
   project_id: string;
   provider_instance_id: string;
@@ -65,10 +66,57 @@ const normalizeFailure = (cause: unknown) =>
 const fail = (reason: WorkbenchRepairGuardError["reason"]) =>
   new WorkbenchRepairGuardError({ reason });
 
+const nativeAnswerAdmission = Effect.fn("WorkbenchRepairGuard.nativeAnswerAdmission")(function* (
+  input: Admission,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const [answer] = yield* sql<{
+    command_id: string;
+    message_id: string | null;
+    run_id: string | null;
+    repair_attempt_id: string | null;
+  }>`SELECT x.command_id,x.message_id,x.run_id,x.repair_attempt_id FROM workbench_repair_native_answers x
+    JOIN workbench_repair_generations g ON g.id=x.generation_id AND g.work_item_id=x.work_item_id AND g.queue_id=x.queue_id
+    JOIN workbench_work_items w ON w.id=x.work_item_id AND w.work_thread_id=x.thread_id
+    JOIN workbench_queue_bindings b ON b.queue_id=x.queue_id AND b.task_id=w.task_id AND b.task_created_at=w.task_created_at
+      AND b.project_id=w.project_id AND b.dispatcher_thread_id=w.dispatcher_thread_id
+    JOIN workbench_queue_entries e ON e.work_item_id=w.id AND e.queue_id=x.queue_id
+    JOIN orchestration_v2_projection_runtime_requests q ON q.thread_id=x.thread_id AND q.runtime_request_id=x.request_id AND q.status='resolved'
+    JOIN orchestration_command_receipts c ON c.command_id=x.command_id AND c.aggregate_kind='thread' AND c.aggregate_id=x.thread_id AND c.status='accepted' AND c.command_type='runtime-request.respond'
+    WHERE x.thread_id=${input.threadId} AND g.superseded_at IS NULL AND g.task_id=w.task_id AND g.task_created_at=w.task_created_at
+      AND g.project_id=w.project_id AND g.dispatcher_thread_id=w.dispatcher_thread_id
+      AND w.attention_hold=0 AND w.attention_epoch=x.attention_epoch AND e.state='occupied'
+      AND e.claim_id=x.claim_id AND e.wake_generation=x.wake_generation
+      AND g.phase IN ('watching','repairing','succeeded')
+      AND (${input.expectedEpoch ?? null} IS NULL OR ${input.expectedEpoch ?? null}=x.attention_epoch)
+      AND ((x.run_id IS NULL AND json_extract(q.payload_json,'$.responseCapability.type')='live' AND ${input.effectType ?? null}='runtime-request.respond' AND x.command_id=${input.commandId ?? null}) OR
+        (x.run_id IS NOT NULL AND json_extract(q.payload_json,'$.responseCapability.type')='message' AND EXISTS(SELECT 1 FROM orchestration_v2_projection_messages m
+          JOIN orchestration_v2_projection_runs r ON r.run_id=m.run_id AND r.thread_id=m.thread_id
+          WHERE m.thread_id=x.thread_id AND m.message_id=x.message_id AND m.run_id=x.run_id
+            AND m.message_id='async-answer:'||x.request_id AND json_extract(m.payload_json,'$.creationSource')='server'
+            AND json_extract(r.payload_json,'$.userMessageId')=m.message_id
+            AND COALESCE(json_extract(r.payload_json,'$.freshContext'),0)=0
+            AND json_extract(r.payload_json,'$.restartContinuationOfRunId') IS NULL)
+          AND (x.run_id=${input.runId ?? null} OR x.message_id=${input.messageId ?? null} OR x.command_id=${input.commandId ?? null})))`;
+  if (
+    answer !== undefined &&
+    (input.effectType === "provider-turn.restart" || input.effectType === "provider-turn.steer")
+  )
+    return yield* fail("command-mismatch");
+  if (answer === undefined) {
+    const [known] = yield* sql`SELECT 1 FROM workbench_repair_native_answers
+      WHERE thread_id=${input.threadId} AND (command_id=${input.commandId ?? null}
+        OR message_id=${input.messageId ?? null} OR run_id=${input.runId ?? null})`;
+    if (known !== undefined) return yield* fail("intent-stale");
+  }
+  return answer;
+});
+
 export const repairAdmission = Effect.fn("WorkbenchRepairGuard.repairAdmission")(function* (
   input: Admission,
 ) {
   const sql = yield* SqlClient.SqlClient;
+  const native = yield* nativeAnswerAdmission(input);
   const rows = yield* sql<RepairProof>`SELECT a.*,g.used,g.phase,g.superseded_at,
     CASE WHEN g.work_item_id=a.work_item_id AND g.queue_id=a.queue_id AND g.project_id=a.project_id
       AND g.thread_id=a.thread_id AND g.task_id=w.task_id AND g.task_created_at=w.task_created_at
@@ -99,7 +147,8 @@ export const repairAdmission = Effect.fn("WorkbenchRepairGuard.repairAdmission")
     WHERE a.thread_id=${input.threadId} AND (
       (${input.commandId ?? null} IS NOT NULL AND a.command_id=${input.commandId ?? null}) OR
       (${input.messageId ?? null} IS NOT NULL AND a.message_id=${input.messageId ?? null}) OR
-      (${input.runId ?? null} IS NOT NULL AND a.run_id=${input.runId ?? null})) LIMIT 2`;
+      (${input.runId ?? null} IS NOT NULL AND a.run_id=${input.runId ?? null}) OR
+      a.id=${native?.repair_attempt_id ?? null}) LIMIT 2`;
   if (rows.length === 0) return;
   if (rows.length !== 1) return yield* fail("intent-stale");
   const row = rows[0]!;
@@ -112,9 +161,10 @@ export const repairAdmission = Effect.fn("WorkbenchRepairGuard.repairAdmission")
     return yield* fail("intent-stale");
   if (row.context_valid !== 1) return yield* fail("context-mismatch");
   if (
-    (input.commandId !== undefined && input.commandId !== row.command_id) ||
-    (input.messageId !== undefined && input.messageId !== row.message_id) ||
-    (input.runId !== undefined && input.runId !== row.run_id)
+    native === undefined &&
+    ((input.commandId !== undefined && input.commandId !== row.command_id) ||
+      (input.messageId !== undefined && input.messageId !== row.message_id) ||
+      (input.runId !== undefined && input.runId !== row.run_id))
   )
     return yield* fail("command-mismatch");
   if (row.state === "reserved") {
@@ -146,7 +196,7 @@ export const repairAdmission = Effect.fn("WorkbenchRepairGuard.repairAdmission")
         AND json_extract(r.payload_json,'$.restartContinuationOfRunId') IS NULL`;
     if (run === undefined) return yield* fail("context-mismatch");
   }
-  return row;
+  return { ...row, admitted_run_id: native?.run_id ?? row.run_id };
 }, Effect.mapError(normalizeFailure));
 
 export const originalRepair = Effect.fn("WorkbenchRepairGuard.originalRepair")(function* (
@@ -182,7 +232,10 @@ export const assertRepairDescendant = Effect.fn("WorkbenchRepairGuard.assertRepa
         SELECT s.thread_id,s.run_id FROM orchestration_v2_projection_subagents s
           JOIN owners o ON o.thread_id=s.child_thread_id WHERE s.origin='app_owned'
       ) SELECT DISTINCT a.thread_id,a.run_id FROM owners o
-        JOIN workbench_repair_attempts a ON a.thread_id=o.thread_id AND a.run_id=o.run_id`;
+        JOIN workbench_repair_attempts a ON a.thread_id=o.thread_id AND a.run_id=o.run_id
+      UNION SELECT a.thread_id,a.run_id FROM owners o
+        JOIN workbench_repair_native_answers x ON x.thread_id=o.thread_id AND x.run_id=o.run_id
+        JOIN workbench_repair_attempts a ON a.id=x.repair_attempt_id`;
     for (const ancestor of ancestors)
       yield* repairAdmission({
         threadId: ThreadId.make(ancestor.thread_id),
@@ -197,6 +250,11 @@ export const assertUnregisteredAdmission = Effect.fn(
   "WorkbenchRepairGuard.assertUnregisteredAdmission",
 )(function* (input: Admission) {
   const sql = yield* SqlClient.SqlClient;
+  if (
+    (yield* repairAdmission(input)) !== undefined ||
+    (yield* nativeAnswerAdmission(input)) !== undefined
+  )
+    return;
   const [generation] = yield* sql<{
     phase: string;
     work_item_id: string;
@@ -271,7 +329,7 @@ export const assertRepairCommand = Effect.fn("WorkbenchRepairGuard.assertRepairC
     const sql = yield* SqlClient.SqlClient;
     const [parent] = yield* sql`SELECT 1 FROM orchestration_v2_projection_runs r
       JOIN orchestration_v2_projection_nodes n ON n.thread_id=r.thread_id AND n.run_id=r.run_id
-      WHERE r.run_id=${proof.run_id} AND r.thread_id=${threadId} AND n.node_id=${command.parentNodeId}
+      WHERE r.run_id=${proof.admitted_run_id ?? proof.run_id} AND r.thread_id=${threadId} AND n.node_id=${command.parentNodeId}
         AND r.status IN ('starting','running','waiting')`;
     if (proof.charged !== 1 || parent === undefined) return yield* fail("command-mismatch");
     return { ...proof, admissionKind: "delegate" as const };
