@@ -1378,7 +1378,7 @@ it.live.each([false, true])(
           state: "deployed" as const,
           merge: { ...delivered.merge!, state: "verifying" as const },
         };
-        const rollback = new Error("Restore the delivery guard fixture");
+        const rollback = { _tag: "DeliveryGuardTestRollback" as const };
         for (const [name, invalidate] of [
           ["task deleted", f.sql`DELETE FROM scheduled_tasks WHERE task_id='task'`],
           [

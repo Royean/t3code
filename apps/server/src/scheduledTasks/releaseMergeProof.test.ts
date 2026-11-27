@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "@effect/vitest";
 import type { WorkbenchMergeObservation, WorkbenchMergePlan } from "@t3tools/contracts";
 import { mergeObservationReason } from "./releaseMergeProof.ts";
 import { releaseDigest } from "./workbenchReleaseProfile.ts";
@@ -23,7 +23,7 @@ const check = {
   headSha: subject.sourceSha,
   checkId: "check=",
   state: "passed" as const,
-  conclusion: "success",
+  conclusion: "success" as const,
 };
 const pin: WorkbenchMergeObservation = {
   schemaVersion: 1,
