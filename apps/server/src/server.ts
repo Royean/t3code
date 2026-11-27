@@ -172,6 +172,8 @@ import * as WorkbenchQueue from "./scheduledTasks/WorkbenchQueue.ts";
 import * as WorkbenchQueueHttp from "./scheduledTasks/workbenchQueueHttp.ts";
 import * as WorkItemsHttp from "./scheduledTasks/workItemsHttp.ts";
 import * as WorkItems from "./scheduledTasks/WorkbenchWorkItems.ts";
+import * as WorkbenchRelease from "./scheduledTasks/WorkbenchReleaseEvidence.ts";
+import * as WorkbenchReleaseHttp from "./scheduledTasks/workbenchReleaseHttp.ts";
 import * as WorkbenchTaskProgress from "./scheduledTasks/WorkbenchTaskProgress.ts";
 import * as WorkbenchTaskProgressHttp from "./scheduledTasks/workbenchTaskProgressHttp.ts";
 import * as ScheduledTaskExecutionsHttp from "./scheduledTasks/executionsHttp.ts";
@@ -899,6 +901,7 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(
         WorkbenchTaskProgressHttp.layer.pipe(Layer.provide(WorkbenchTaskProgress.layer)),
       ),
+      Layer.provide(WorkbenchReleaseHttp.layer.pipe(Layer.provide(WorkbenchRelease.layer))),
       Layer.provide(WorkbenchRepairsHttp.layer.pipe(Layer.provide(WorkbenchRepairs.layer))),
       Layer.provide(
         WorkbenchQueueHttp.layer.pipe(

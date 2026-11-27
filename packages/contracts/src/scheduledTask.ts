@@ -1129,3 +1129,298 @@ export const WorkbenchRuntimeResponseReceipt = Schema.Struct({
   response: WorkbenchRuntimeResponseSummary,
 });
 export type WorkbenchRuntimeResponseReceipt = typeof WorkbenchRuntimeResponseReceipt.Type;
+
+const ReleaseId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/));
+const ReleaseHash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const ReleaseGitSha = Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/));
+const ReleaseCount = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+const ReleasePositive = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+const ReleaseText = Schema.String.check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(1024),
+  Schema.isPattern(/^[^\x00-\x1f\x7f]+$/),
+);
+const ReleaseScript = Schema.Struct({ scriptId: ReleaseId, definitionHash: ReleaseHash });
+const ReleaseScriptSummary = Schema.Struct({
+  id: ReleaseId,
+  name: ReleaseText,
+  definitionHash: ReleaseHash,
+});
+const ReleaseTarget = Schema.Struct({
+  serviceId: ReleaseId,
+  origin: ReleaseText,
+  versionPath: ReleaseText,
+});
+const ReleaseMain = Schema.Struct({ remote: ReleaseId, ref: ReleaseText });
+export const WorkbenchReleaseObservation = Schema.Struct({
+  durationSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 86400 })),
+  intervalSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3600 })),
+  consecutiveSuccesses: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
+});
+export const WorkbenchReleasePolicy = Schema.Struct({
+  main: ReleaseMain,
+  target: ReleaseTarget,
+  build: ReleaseScript,
+  artifact: Schema.Struct({ relativePath: ReleaseText }),
+  checks: Schema.Array(ReleaseScript).check(Schema.isMinLength(1), Schema.isMaxLength(10)),
+  health: ReleaseScript,
+  core: ReleaseScript,
+  observation: WorkbenchReleaseObservation,
+  rollback: Schema.Struct({
+    artifactRelativePath: ReleaseText,
+    execute: ReleaseScript,
+    verify: ReleaseScript,
+  }),
+});
+export const WorkbenchReleaseHostProfile = Schema.Struct({
+  id: ReleaseId,
+  version: ReleasePositive,
+  projectId: ProjectId,
+  name: ReleaseText,
+  enabled: Schema.Boolean,
+  policy: WorkbenchReleasePolicy,
+});
+export const WorkbenchReleaseProfileFile = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  profiles: Schema.Array(WorkbenchReleaseHostProfile).check(Schema.isMaxLength(100)),
+});
+export const WorkbenchPublicReleaseProfile = Schema.Struct({
+  id: ReleaseId,
+  version: ReleasePositive,
+  digest: ReleaseHash,
+  projectId: ProjectId,
+  name: ReleaseText,
+  main: ReleaseMain,
+  target: ReleaseTarget,
+  artifactLabel: ReleaseText,
+  rollbackArtifactLabel: ReleaseText,
+  scripts: Schema.Struct({
+    build: ReleaseScriptSummary,
+    checks: Schema.Array(ReleaseScriptSummary),
+    health: ReleaseScriptSummary,
+    core: ReleaseScriptSummary,
+    rollbackExecute: ReleaseScriptSummary,
+    rollbackVerify: ReleaseScriptSummary,
+  }),
+  observation: WorkbenchReleaseObservation,
+});
+export type WorkbenchPublicReleaseProfile = typeof WorkbenchPublicReleaseProfile.Type;
+export type WorkbenchReleaseHostProfile = typeof WorkbenchReleaseHostProfile.Type;
+export const WorkbenchReleaseCatalogQuery = Schema.Struct({
+  projectId: Schema.optional(ProjectId),
+});
+export const WorkbenchReleaseCatalog = Schema.Struct({
+  environmentId: ReleaseId,
+  configured: Schema.Boolean,
+  profiles: Schema.Array(WorkbenchPublicReleaseProfile),
+});
+export type WorkbenchReleaseCatalog = typeof WorkbenchReleaseCatalog.Type;
+export const WorkbenchReleasePrepareInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  preparationId: ReleaseId,
+  workItemId: ReleaseId,
+  expectedWorkItemVersion: ReleaseCount,
+  profileId: ReleaseId,
+  profileDigest: ReleaseHash,
+});
+export type WorkbenchReleasePrepareInput = typeof WorkbenchReleasePrepareInput.Type;
+export const WorkbenchReleaseRevalidateInput = Schema.Struct({
+  ...WorkbenchAttentionScope.fields,
+  expectedEvidenceDigest: ReleaseHash,
+});
+export type WorkbenchReleaseRevalidateInput = typeof WorkbenchReleaseRevalidateInput.Type;
+export const WorkbenchReleaseReason = Schema.Literals([
+  "profile_missing",
+  "profile_changed",
+  "profile_invalid",
+  "task_not_ready",
+  "work_active",
+  "binding_changed",
+  "source_dirty",
+  "source_changed",
+  "base_changed",
+  "base_not_integrated",
+  "diff_too_large",
+  "artifact_missing",
+  "artifact_invalid",
+  "artifact_changed",
+  "build_failed",
+  "check_failed",
+  "preflight_failed",
+  "rollback_missing",
+  "rollback_mismatch",
+  "rollback_failed",
+  "target_unavailable",
+  "target_changed",
+  "evidence_unavailable",
+  "preparation_interrupted",
+  "timeout",
+  "output_limit",
+]);
+export type WorkbenchReleaseReason = typeof WorkbenchReleaseReason.Type;
+const ReleaseBlob = Schema.Struct({
+  ref: ReleaseId,
+  sha256: ReleaseHash,
+  bytes: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 64 * 1024 * 1024 })),
+});
+const ReleaseDiff = Schema.Struct({
+  ref: ReleaseId,
+  digest: ReleaseHash,
+  byteCount: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1024 * 1024 })),
+  filesChanged: ReleaseCount,
+  insertions: ReleaseCount,
+  deletions: ReleaseCount,
+  complete: Schema.Literal(true),
+});
+export const WorkbenchReleaseReceipt = Schema.Struct({
+  id: ReleaseId,
+  role: Schema.Literals(["build", "check", "health", "core", "rollback_verify"]),
+  phase: Schema.Literals(["build", "source_check", "preflight"]),
+  scriptId: ReleaseId,
+  definitionHash: ReleaseHash,
+  subject: Schema.Literals(["source", "candidate_artifact", "rollback_artifact"]),
+  sourceSha: ReleaseGitSha,
+  profileDigest: ReleaseHash,
+  subjectArtifactSha256: Schema.NullOr(ReleaseHash),
+  outputArtifactSha256: Schema.NullOr(ReleaseHash),
+  exitCode: Schema.Literal(0),
+  outputDigest: ReleaseHash,
+  startedAt: IsoDateTime,
+  completedAt: IsoDateTime,
+});
+export type WorkbenchReleaseReceipt = typeof WorkbenchReleaseReceipt.Type;
+export const WorkbenchReleaseEvidence = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: ReleaseId,
+  digest: ReleaseHash,
+  preparationId: ReleaseId,
+  createdAt: IsoDateTime,
+  binding: Schema.Struct({
+    environmentId: ReleaseId,
+    trackingId: ReleaseId,
+    queueId: ReleaseId,
+    controllerId: ReleaseId,
+    projectId: ProjectId,
+    workItemId: ReleaseId,
+    taskId: ScheduledTaskId,
+    taskCreatedAt: IsoDateTime,
+    dispatcherThreadId: ThreadId,
+    workThreadId: ThreadId,
+    cycleNumber: ReleasePositive,
+    workItemVersion: ReleaseCount,
+    latestEventSequence: ReleaseCount,
+    processedThroughSequence: ReleaseCount,
+  }),
+  profile: Schema.Struct({ id: ReleaseId, version: ReleasePositive, digest: ReleaseHash }),
+  source: Schema.Struct({
+    branch: Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(500),
+      Schema.isPattern(/^[^\x00-\x1f\x7f]+$/),
+    ),
+    commitSha: ReleaseGitSha,
+    treeSha: ReleaseGitSha,
+    clean: Schema.Literal(true),
+    main: Schema.Struct({
+      ...ReleaseMain.fields,
+      commitSha: ReleaseGitSha,
+      integrated: Schema.Literal(true),
+    }),
+  }),
+  diff: ReleaseDiff,
+  artifact: Schema.Struct({
+    ...ReleaseBlob.fields,
+    manifestDigest: ReleaseHash,
+    fileCount: Schema.Literal(1),
+  }),
+  target: Schema.Struct({
+    ...ReleaseTarget.fields,
+    basis: Schema.Struct({
+      version: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+      sourceSha: ReleaseGitSha,
+      artifactSha256: ReleaseHash,
+    }),
+    observedAt: IsoDateTime,
+  }),
+  receipts: Schema.Array(WorkbenchReleaseReceipt).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(14),
+  ),
+  rollback: Schema.Struct({
+    artifact: ReleaseBlob,
+    basisVersion: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+    targetServiceId: ReleaseId,
+    execute: ReleaseScript,
+    verifyReceiptId: ReleaseId,
+  }),
+  observation: WorkbenchReleaseObservation,
+});
+export type WorkbenchReleaseEvidence = typeof WorkbenchReleaseEvidence.Type;
+export const WorkbenchReleasePreparation = Schema.Struct({
+  id: ReleaseId,
+  workItemId: ReleaseId,
+  taskId: ScheduledTaskId,
+  taskCreatedAt: IsoDateTime,
+  dispatcherThreadId: ThreadId,
+  workThreadId: ThreadId,
+  cycleNumber: ReleasePositive,
+  workItemVersion: ReleaseCount,
+  profileDigest: ReleaseHash,
+  version: ReleasePositive,
+  state: Schema.Literals(["queued", "preparing", "ready", "blocked", "unknown", "invalidated"]),
+  reasons: Schema.Array(WorkbenchReleaseReason),
+  evidence: Schema.NullOr(WorkbenchReleaseEvidence),
+  validation: Schema.Struct({
+    state: Schema.Literals(["current", "unknown", "invalidated"]),
+    version: ReleasePositive,
+    observedAt: IsoDateTime,
+  }),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkbenchReleasePreparation = typeof WorkbenchReleasePreparation.Type;
+const ReleaseEnvelope = {
+  environmentId: ReleaseId,
+  trackingId: ReleaseId,
+  queueId: ReleaseId,
+  controllerId: ReleaseId,
+  projectId: ProjectId,
+};
+export const WorkbenchReleaseResult = Schema.Struct({
+  ...ReleaseEnvelope,
+  preparation: WorkbenchReleasePreparation,
+});
+export type WorkbenchReleaseResult = typeof WorkbenchReleaseResult.Type;
+export const WorkbenchReleaseDiffResult = Schema.Struct({
+  ...ReleaseEnvelope,
+  preparationId: ReleaseId,
+  diff: Schema.Struct({
+    ref: ReleaseId,
+    digest: ReleaseHash,
+    byteCount: ReleaseCount,
+    complete: Schema.Literal(true),
+    patch: Schema.String.check(Schema.isMaxLength(1024 * 1024)),
+  }),
+});
+export type WorkbenchReleaseDiffResult = typeof WorkbenchReleaseDiffResult.Type;
+export class WorkbenchReleaseError extends Schema.TaggedError<WorkbenchReleaseError>()(
+  "WorkbenchReleaseError",
+  {
+    reason: Schema.Literals([
+      "invalid_request",
+      "not_found",
+      "conflict",
+      "stale_state",
+      "invalid_binding",
+      "profile_changed",
+      "profile_invalid",
+      "unavailable",
+    ]),
+  },
+) {}

@@ -72,6 +72,13 @@ import {
 } from "./speech.ts";
 import {
   WorkbenchAttentionQuery,
+  WorkbenchReleaseCatalogQuery,
+  WorkbenchReleaseCatalog,
+  WorkbenchReleasePrepareInput,
+  WorkbenchReleaseRevalidateInput,
+  WorkbenchReleaseResult,
+  WorkbenchReleaseDiffResult,
+  WorkbenchReleaseError,
   WorkbenchTaskProgressQuery,
   WorkbenchTaskProgressResult,
   WorkbenchRuntimeResponseInput,
@@ -1338,6 +1345,71 @@ class EnvironmentWorkbenchRepairsHttpApi extends HttpApiGroup.make("workbenchRep
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+const releaseErrors = [
+  ...EnvironmentScopedOperationErrors,
+  WorkbenchReleaseError.check(Schema.makeFilter((e) => e.reason === "invalid_request")).pipe(
+    HttpApiSchema.status(400),
+  ),
+  WorkbenchReleaseError.check(Schema.makeFilter((e) => e.reason === "not_found")).pipe(
+    HttpApiSchema.status(404),
+  ),
+  WorkbenchReleaseError.check(
+    Schema.makeFilter((e) =>
+      ["conflict", "stale_state", "invalid_binding", "profile_changed"].includes(e.reason),
+    ),
+  ).pipe(HttpApiSchema.status(409)),
+  WorkbenchReleaseError.check(Schema.makeFilter((e) => e.reason === "profile_invalid")).pipe(
+    HttpApiSchema.status(422),
+  ),
+  WorkbenchReleaseError.check(Schema.makeFilter((e) => e.reason === "unavailable")).pipe(
+    HttpApiSchema.status(503),
+  ),
+] as const;
+class EnvironmentWorkbenchReleaseHttpApi extends HttpApiGroup.make("workbenchRelease").add(
+  HttpApiEndpoint.get("catalog", "/api/workbench/release-profiles", {
+    headers: OptionalBearerHeaders,
+    query: WorkbenchReleaseCatalogQuery,
+    success: WorkbenchReleaseCatalog,
+    error: releaseErrors,
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post("prepare", "/api/workbench/queues/:queueId/release-preparations", {
+    params: { queueId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    payload: WorkbenchReleasePrepareInput,
+    success: WorkbenchReleaseResult.pipe(HttpApiSchema.status(202)),
+    error: releaseErrors,
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/release-preparations/:preparationId", {
+    params: { queueId: TrimmedNonEmptyString, preparationId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchAttentionScope,
+    success: WorkbenchReleaseResult,
+    error: releaseErrors,
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.post(
+    "revalidate",
+    "/api/workbench/queues/:queueId/release-preparations/:preparationId/revalidate",
+    {
+      params: { queueId: TrimmedNonEmptyString, preparationId: TrimmedNonEmptyString },
+      headers: OptionalBearerHeaders,
+      payload: WorkbenchReleaseRevalidateInput,
+      success: WorkbenchReleaseResult,
+      error: releaseErrors,
+    },
+  ).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.get(
+    "diff",
+    "/api/workbench/queues/:queueId/release-preparations/:preparationId/diff",
+    {
+      params: { queueId: TrimmedNonEmptyString, preparationId: TrimmedNonEmptyString },
+      headers: OptionalBearerHeaders,
+      query: WorkbenchAttentionScope,
+      success: WorkbenchReleaseDiffResult,
+      error: releaseErrors,
+    },
+  ).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 class EnvironmentWorkbenchTaskProgressHttpApi extends HttpApiGroup.make(
   "workbenchTaskProgress",
 ).add(
@@ -1410,6 +1482,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentWebhooksHttpApi)
   .add(EnvironmentWorkbenchQueueHttpApi)
   .add(EnvironmentWorkbenchTaskProgressHttpApi)
+  .add(EnvironmentWorkbenchReleaseHttpApi)
   .add(EnvironmentWorkbenchAttentionHttpApi)
   .add(EnvironmentWorkbenchRepairsHttpApi)
   .add(EnvironmentWorkbenchResponsesHttpApi)

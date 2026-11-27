@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { isWindowsCommandNotFound } from "@t3tools/provider-core/server/snapshotProbe";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -299,3 +300,19 @@ describe("isWindowsCommandNotFound", () => {
     }),
   );
 });
+
+it.live("a preparation can launch a real child without inheriting the host environment", () =>
+  Effect.gen(function* () {
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const output = yield* runner.run({
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write(JSON.stringify({only:process.env.T3_RELEASE_FIXTURE,home:process.env.HOME}))",
+      ],
+      env: { T3_RELEASE_FIXTURE: "isolated" },
+      extendEnv: false,
+    });
+    expect(JSON.parse(output.stdout)).toEqual({ only: "isolated" });
+  }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer)))),
+);

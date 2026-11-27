@@ -64,3 +64,58 @@ The original thread, branch, worktree and native conversation must still be avai
 workspaces or provider context remain blocked, and re-entry preserves the user's repairs instead
 of restoring an older checkpoint over them. Retry each mutation with its original client request
 id. A changed version or changed request body requires reading the current state first.
+
+## Prepare a production candidate for human review
+
+An environment administrator registers release profiles in
+`<stateDir>/workbench-release-profiles.json`, outside project source. The file has
+`schemaVersion: 1` and a `profiles` array. Each entry fixes `id`, positive `version`,
+`projectId`, `name`, `enabled`, and a release `policy`: the registered main remote/ref,
+production service/version endpoint, build/check/health/core script references,
+artifact path, observation requirements, and rollback artifact/execute/verify references.
+A script reference is its saved project script id and SHA-256 of
+`JSON.stringify({id, command})`. Profiles must select synchronous single commands
+without shell interpolation; quoted paths/arguments and escaped spaces use the shared
+CLI tokenizer. Unclosed quotes, unsupported escapes, shell operators and unquoted
+expansions are rejected by the catalog. Use a checked-in wrapper executable when
+several steps are needed. This producer currently supports macOS and Linux; an enabled
+profile on another host platform is rejected before preparation. Changing a definition or profile requires a new candidate and approval.
+
+The authenticated profile catalog at `GET /api/workbench/release-profiles` exposes
+names, script hashes and target identity, without commands or private artifact paths.
+Workbench's human settings select a registered profile id/digest. There is no profile
+write API, and webhook or agent data cannot supply a new release command or target.
+
+`POST /api/workbench/queues/:queueId/release-preparations` accepts a stable preparation
+id and exact task version/profile digest and returns a durable 202 receipt. Read its
+status with GET; a lost response must reuse the same id. Every endpoint requires both
+orchestration read and operate scopes and the current queue/controller/project/tracking
+binding. The producer requires a clean registered source workspace, fully processed
+current events, no active descendant/background work, and a freshly observed main
+commit already integrated into source. Its private tracked-tree export omits ignored
+files, dependencies and credentials; it runs no setup scripts or hooks. Symlinks,
+submodules and exports that alter/omit tracked bytes remain blocked. Builds requiring
+Git metadata must use `T3_RELEASE_SOURCE_SHA`; the export has no shared `.git`, and Git
+cannot discover a repository above the preparation directory.
+
+Preparation directly runs the pinned build/source checks, then health/core preflight
+against sealed candidate bytes and rollback verification against the independently
+observed baseline artifact. Scripts receive `T3_RELEASE_ARTIFACT`,
+`T3_RELEASE_ROLLBACK_ARTIFACT` and `T3_RELEASE_SOURCE_SHA` in a minimal environment.
+The production version endpoint must return `{serviceId,version,sourceSha,artifactSha256}`;
+its artifact digest must match actual rollback bytes. It forwards no credentials and
+follows no redirects. Rollback execution is retained as a plan and is never run here.
+Observation remains a requirement for the later deployment, not a completed check.
+
+The producer retains sealed artifact/rollback/diff bytes and immutable evidence under
+`<stateDir>/workbench-release-evidence`; temporary exported source is removed when the
+prepare ends. An interrupted preparation becomes unknown and is not blindly rebuilt.
+GET never starts work. Explicit revalidation rereads source/main/config/task watermarks,
+sealed bytes and target version; observed drift permanently invalidates the packet,
+while unavailable facts remain unknown. The scoped `/diff` read returns its sealed
+patch. Native evidence and runtime approvals do not approve deployment: only the
+Workbench user's exact candidate decision can do that, and approval is not deployment
+success or task completion.
+
+Diff insertion/deletion totals count text lines only; binary files still count as changed files,
+and their complete Git binary patches remain available in the sealed diff.

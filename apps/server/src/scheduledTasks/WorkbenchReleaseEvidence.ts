@@ -1,0 +1,1106 @@
+import {
+  WorkbenchReleaseError,
+  WorkbenchReleaseEvidence as EvidenceSchema,
+  WorkbenchReleasePreparation as PreparationSchema,
+  ScheduledTaskId,
+  ThreadId,
+  type WorkbenchAttentionScope,
+  type WorkbenchReleaseCatalog,
+  WorkbenchReleasePrepareInput,
+  type WorkbenchReleaseRevalidateInput,
+  type WorkbenchReleaseResult,
+  type WorkbenchReleaseDiffResult,
+  type WorkbenchReleasePreparation,
+  type WorkbenchReleaseHostProfile,
+  type WorkbenchReleaseReason,
+  type WorkbenchReleaseReceipt,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as Config from "../config.ts";
+import * as Environment from "../environment/ServerEnvironment.ts";
+import * as Git from "../vcs/GitVcsDriver.ts";
+import * as Runner from "../processRunner.ts";
+import {
+  canonicalReleaseJson,
+  readReleaseProfiles,
+  publicReleaseProfile,
+  releaseProfileScripts,
+  releaseDigest,
+  releaseHash,
+  releaseBlobHash,
+  releaseScriptHash,
+  releaseCommandArgv,
+  safeReleasePath,
+} from "./workbenchReleaseProfile.ts";
+
+type Scope = typeof WorkbenchAttentionScope.Type;
+type Task = {
+  id: string;
+  task_id: string;
+  task_created_at: string;
+  project_id: string;
+  dispatcher_thread_id: string;
+  work_thread_id: string;
+  worktree_path: string;
+  branch: string;
+  cycle_number: number;
+  version: number;
+  latest_event_sequence: number;
+  processed_through_sequence: number;
+  business_state: string;
+  attention_hold: number;
+  thread_json: string;
+  workspace_root: string;
+};
+type Source = {
+  task: Task;
+  real: string;
+  common: string;
+  head: string;
+  tree: string;
+  base: string;
+};
+type Row = {
+  id: string;
+  queue_id: string;
+  controller_id: string;
+  project_id: string;
+  tracking_id: string;
+  work_item_id: string;
+  input_json: string;
+  profile_json: string;
+  snapshot_json: string;
+  preparation_json: string;
+  state: string;
+};
+class Blocked extends Schema.TaggedError<Blocked>()("ReleasePreparationBlocked", {
+  reason: Schema.String,
+}) {}
+const problem = (reason: WorkbenchReleaseReason) => new Blocked({ reason });
+const isBlocked = Schema.is(Blocked);
+const isReleaseError = Schema.is(WorkbenchReleaseError);
+const failure = (cause: unknown) =>
+  isReleaseError(cause) ? cause : new WorkbenchReleaseError({ reason: "unavailable" });
+const decodePreparation = Schema.decodeEffect(Schema.fromJsonString(PreparationSchema));
+const decodeEvidence = Schema.decodeUnknownEffect(EvidenceSchema);
+const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeThread = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      projectId: Schema.String,
+      worktreePath: Schema.NullOr(Schema.String),
+      branch: Schema.NullOr(Schema.String),
+    }),
+  ),
+);
+const decodeTarget = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    serviceId: Schema.String,
+    version: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+    sourceSha: Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)),
+    artifactSha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  }),
+);
+const decodePrepareInput = Schema.decodeEffect(Schema.fromJsonString(WorkbenchReleasePrepareInput));
+const MAX_ARTIFACT = 64 * 1024 * 1024;
+const MAX_DIFF = 1024 * 1024;
+
+export class WorkbenchReleaseEvidence extends Context.Service<
+  WorkbenchReleaseEvidence,
+  {
+    readonly catalog: (query: {
+      projectId?: string | undefined;
+    }) => Effect.Effect<WorkbenchReleaseCatalog, WorkbenchReleaseError>;
+    readonly prepare: (
+      queueId: string,
+      input: WorkbenchReleasePrepareInput,
+    ) => Effect.Effect<WorkbenchReleaseResult, WorkbenchReleaseError>;
+    readonly get: (
+      queueId: string,
+      id: string,
+      scope: Scope,
+    ) => Effect.Effect<WorkbenchReleaseResult, WorkbenchReleaseError>;
+    readonly revalidate: (
+      queueId: string,
+      id: string,
+      input: WorkbenchReleaseRevalidateInput,
+    ) => Effect.Effect<WorkbenchReleaseResult, WorkbenchReleaseError>;
+    readonly diff: (
+      queueId: string,
+      id: string,
+      scope: Scope,
+    ) => Effect.Effect<WorkbenchReleaseDiffResult, WorkbenchReleaseError>;
+    readonly awaitPrepared: (
+      queueId: string,
+      id: string,
+      scope: Scope,
+    ) => Effect.Effect<WorkbenchReleaseResult, WorkbenchReleaseError>;
+  }
+>()("t3/scheduledTasks/WorkbenchReleaseEvidence") {}
+
+const make = Effect.gen(function* () {
+  const environment = yield* Environment.ServerEnvironmentIdentity,
+    sql = yield* SqlClient.SqlClient,
+    fs = yield* FileSystem.FileSystem,
+    path = yield* Path.Path,
+    config = yield* Config.ServerConfig,
+    git = yield* Git.GitVcsDriver,
+    runner = yield* Runner.ProcessRunner;
+  const serviceScope = yield* Effect.scope;
+  const context = Context.make(FileSystem.FileSystem, fs).pipe(
+    Context.add(Path.Path, path),
+    Context.add(Config.ServerConfig, config),
+    Context.add(SqlClient.SqlClient, sql),
+  );
+  const locks = yield* KeyedLock.make<string>();
+  const jobs = new Map<string, Deferred.Deferred<void>>();
+  const stamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const root = path.join(config.stateDir, "workbench-release-evidence");
+  const directory = (id: string) => path.join(root, releaseHash(id));
+  const authorize = Effect.fn("WorkbenchReleaseEvidence.authorize")(function* (
+    queueId: string,
+    scope: Scope,
+  ) {
+    const [binding] =
+      yield* sql`SELECT 1 FROM workbench_queues q,scheduled_task_execution_metadata m WHERE q.id=${queueId} AND q.controller_id=${scope.controllerId} AND q.project_id=${scope.projectId} AND m.singleton=1 AND m.tracking_id=${scope.expectedTrackingId}`;
+    if (!binding) return yield* new WorkbenchReleaseError({ reason: "invalid_binding" });
+  });
+  const read = Effect.fn("WorkbenchReleaseEvidence.read")(function* (
+    queueId: string,
+    id: string,
+    scope: Scope,
+  ) {
+    yield* authorize(queueId, scope);
+    const [row] =
+      yield* sql<Row>`SELECT * FROM workbench_release_preparations WHERE id=${id} AND queue_id=${queueId} AND controller_id=${scope.controllerId} AND project_id=${scope.projectId} AND tracking_id=${scope.expectedTrackingId}`;
+    if (!row) return yield* new WorkbenchReleaseError({ reason: "not_found" });
+    return row;
+  });
+  const envelope = Effect.fn("WorkbenchReleaseEvidence.envelope")(function* (
+    queueId: string,
+    scope: Scope,
+    p: WorkbenchReleasePreparation,
+  ) {
+    return {
+      environmentId: yield* environment.getEnvironmentId,
+      trackingId: scope.expectedTrackingId,
+      queueId,
+      controllerId: scope.controllerId,
+      projectId: scope.projectId,
+      preparation: p,
+    };
+  });
+  const save = Effect.fn("WorkbenchReleaseEvidence.save")(function* (
+    p: WorkbenchReleasePreparation,
+  ) {
+    yield* sql`UPDATE workbench_release_preparations SET preparation_json=${canonicalReleaseJson(p)},state=${p.state},updated_at=${p.updatedAt} WHERE id=${p.id}`;
+  });
+  const profile = Effect.fn("WorkbenchReleaseEvidence.profile")(function* (
+    id: string,
+    hash: string,
+    projectId: string,
+  ) {
+    const registry = yield* readReleaseProfiles().pipe(
+      Effect.mapError(() => problem("profile_invalid")),
+    );
+    const found = registry.profiles.find(
+      (p) => p.id === id && p.projectId === projectId && p.enabled,
+    );
+    if (!found) return yield* problem("profile_missing");
+    if (releaseDigest(found) !== hash) return yield* problem("profile_changed");
+    yield* releaseProfileScripts(found).pipe(Effect.mapError(() => problem("profile_changed")));
+    return found;
+  });
+  const task = Effect.fn("WorkbenchReleaseEvidence.task")(function* (
+    queueId: string,
+    input: WorkbenchReleasePrepareInput,
+  ) {
+    yield* authorize(queueId, input);
+    const [row] =
+      yield* sql<Task>`SELECT w.id,w.task_id,w.task_created_at,w.project_id,w.dispatcher_thread_id,w.work_thread_id,w.worktree_path,w.branch,w.cycle_number,w.version,w.latest_event_sequence,w.processed_through_sequence,w.business_state,w.attention_hold,t.payload_json AS thread_json,p.workspace_root
+      FROM workbench_work_items w JOIN workbench_queue_bindings b ON b.task_id=w.task_id AND b.task_created_at=w.task_created_at AND b.queue_id=${queueId} AND b.project_id=w.project_id AND b.dispatcher_thread_id=w.dispatcher_thread_id
+      JOIN scheduled_tasks st ON st.task_id=w.task_id AND st.created_at=w.task_created_at AND st.project_id=w.project_id AND st.thread_id=w.dispatcher_thread_id
+      JOIN orchestration_v2_projection_threads t ON t.thread_id=w.work_thread_id AND t.project_id=w.project_id AND t.deleted_at IS NULL
+      JOIN projection_projects p ON p.project_id=w.project_id AND p.deleted_at IS NULL
+      WHERE w.id=${input.workItemId} AND w.project_id=${input.projectId}`;
+    if (!row) return yield* problem("binding_changed");
+    if (
+      row.version !== input.expectedWorkItemVersion ||
+      row.latest_event_sequence !== row.processed_through_sequence ||
+      row.business_state !== "awaiting_delivery" ||
+      row.attention_hold !== 0 ||
+      !row.worktree_path ||
+      !row.branch
+    )
+      return yield* problem("task_not_ready");
+    const active = yield* sql`WITH RECURSIVE related(thread_id) AS (
+      SELECT ${row.work_thread_id} UNION SELECT s.child_thread_id FROM orchestration_v2_projection_subagents s JOIN related r ON s.thread_id=r.thread_id WHERE s.child_thread_id IS NOT NULL
+    ) SELECT 1 FROM orchestration_v2_projection_runs WHERE thread_id IN (SELECT thread_id FROM related) AND status IN ('preparing','starting','running','waiting','queued')
+      UNION SELECT 1 FROM orchestration_v2_projection_subagents WHERE thread_id IN (SELECT thread_id FROM related) AND (status IN ('pending','running','waiting') OR completion_delivery_state IN ('pending','claimed'))
+      UNION SELECT 1 FROM orchestration_v2_projection_provider_threads WHERE thread_id IN (SELECT thread_id FROM related) AND json_array_length(json_extract(payload_json,'$.pendingBackgroundTasks'))>0
+      UNION SELECT 1 FROM orchestration_v2_projection_runtime_requests WHERE thread_id IN (SELECT thread_id FROM related) AND status='pending'
+      UNION SELECT 1 FROM workbench_work_batches WHERE work_item_id=${row.id} AND state!='completed'
+      UNION SELECT 1 FROM workbench_runtime_responses WHERE work_item_id=${row.id} AND state IN ('recorded','queued','submitted','unknown') LIMIT 1`;
+    if (active.length) return yield* problem("work_active");
+    const t = yield* decodeThread(row.thread_json);
+    if (
+      t.projectId !== row.project_id ||
+      t.worktreePath !== row.worktree_path ||
+      t.branch !== row.branch
+    )
+      return yield* problem("binding_changed");
+    return row;
+  });
+  const localFence = Effect.fn("WorkbenchReleaseEvidence.localFence")(function* (
+    queueId: string,
+    input: WorkbenchReleasePrepareInput,
+    original: Source,
+  ) {
+    const w = original.task;
+    const run = (args: ReadonlyArray<string>) =>
+      git.execute({
+        operation: "WorkbenchReleaseEvidence.localFence",
+        cwd: w.worktree_path,
+        args,
+        timeoutMs: 10000,
+        maxOutputBytes: MAX_DIFF + 1,
+      });
+    const before = yield* task(queueId, input);
+    if (canonicalReleaseJson(before) !== canonicalReleaseJson(w))
+      return yield* problem("source_changed");
+    const branch = yield* run(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const head = (yield* git.resolveCommit({ cwd: w.worktree_path, revision: "HEAD" })).commitSha;
+    const tree = yield* run(["rev-parse", "--verify", "HEAD^{tree}"]);
+    const clean = yield* run(["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (clean.stdoutTruncated || clean.stdout.trim()) return yield* problem("source_dirty");
+    const common = yield* run(["rev-parse", "--git-common-dir"]);
+    if (
+      branch.stdoutTruncated ||
+      tree.stdoutTruncated ||
+      common.stdoutTruncated ||
+      branch.stdout.trim() !== w.branch ||
+      head !== original.head ||
+      tree.stdout.trim() !== original.tree ||
+      (yield* fs.realPath(w.worktree_path)) !== original.real ||
+      (yield* fs.realPath(path.resolve(w.worktree_path, common.stdout.trim()))) !==
+        original.common ||
+      (yield* git.resolveCommit({ cwd: w.worktree_path, revision: "HEAD" })).commitSha !==
+        original.head
+    )
+      return yield* problem("source_changed");
+    if (canonicalReleaseJson(yield* task(queueId, input)) !== canonicalReleaseJson(w))
+      return yield* problem("source_changed");
+  });
+  const saveFenced = Effect.fn("WorkbenchReleaseEvidence.saveFenced")(function* (
+    queueId: string,
+    input: WorkbenchReleasePrepareInput,
+    original: Source,
+    p: WorkbenchReleasePreparation,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const checked = yield* task(queueId, input).pipe(
+          Effect.match({
+            onSuccess: (value) =>
+              canonicalReleaseJson(value) === canonicalReleaseJson(original.task)
+                ? null
+                : ("source_changed" as const),
+            onFailure: (e) =>
+              isBlocked(e)
+                ? (e.reason as WorkbenchReleaseReason)
+                : ("evidence_unavailable" as const),
+          }),
+        );
+        const result: WorkbenchReleasePreparation = checked
+          ? {
+              ...p,
+              state: checked === "evidence_unavailable" ? "unknown" : "invalidated",
+              reasons: [checked],
+              validation: {
+                ...p.validation,
+                state: checked === "evidence_unavailable" ? "unknown" : "invalidated",
+              },
+            }
+          : p;
+        yield* save(result);
+        return result;
+      }),
+    );
+  });
+  const source = Effect.fn("WorkbenchReleaseEvidence.source")(function* (
+    queueId: string,
+    input: WorkbenchReleasePrepareInput,
+    p: WorkbenchReleaseHostProfile,
+  ) {
+    const w = yield* task(queueId, input);
+    const run = (args: ReadonlyArray<string>) =>
+      git.execute({
+        operation: "WorkbenchReleaseEvidence.source",
+        cwd: w.worktree_path,
+        args,
+        timeoutMs: 10000,
+        maxOutputBytes: MAX_DIFF + 1,
+      });
+    const real = yield* fs.realPath(w.worktree_path);
+    const common = yield* fs.realPath(
+      path.resolve(real, (yield* run(["rev-parse", "--git-common-dir"])).stdout.trim()),
+    );
+    const projectCommon = yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.project",
+      cwd: w.workspace_root,
+      args: ["rev-parse", "--git-common-dir"],
+    });
+    if (
+      common !==
+        (yield* fs.realPath(path.resolve(w.workspace_root, projectCommon.stdout.trim()))) ||
+      !(yield* git.listWorktreePaths(w.workspace_root)).includes(real)
+    )
+      return yield* problem("binding_changed");
+    const branch = yield* run(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    if (branch.stdoutTruncated || branch.stdout.trim() !== w.branch)
+      return yield* problem("source_changed");
+    const status = yield* run(["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (status.stdoutTruncated || status.stdout.trim()) return yield* problem("source_dirty");
+    const head = (yield* git.resolveCommit({ cwd: real, revision: "HEAD" })).commitSha;
+    const tree = (yield* run(["rev-parse", "--verify", `${head}^{tree}`])).stdout.trim();
+    const remote = yield* run([
+      "ls-remote",
+      "--refs",
+      "--exit-code",
+      p.policy.main.remote,
+      p.policy.main.ref,
+    ]);
+    const line = remote.stdout.trim().split(/\r?\n/);
+    const match = /^([a-f0-9]{40}|[a-f0-9]{64})\s+(.+)$/.exec(line[0] ?? "");
+    if (remote.stdoutTruncated || line.length !== 1 || !match || match[2] !== p.policy.main.ref)
+      return yield* problem("evidence_unavailable");
+    const base = match[1]!;
+    const integrated = yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.ancestry",
+      cwd: real,
+      args: ["merge-base", "--is-ancestor", base, head],
+      allowNonZeroExit: true,
+    });
+    if (integrated.exitCode !== 0) return yield* problem("base_not_integrated");
+    const observed = { task: w, real, common, head, tree, base };
+    yield* localFence(queueId, input, observed);
+    return observed satisfies Source;
+  });
+  const regular = Effect.fn("WorkbenchReleaseEvidence.regular")(function* (
+    parent: string,
+    relative: string,
+    reason: WorkbenchReleaseReason,
+  ) {
+    const invalid = reason === "artifact_missing" ? "artifact_invalid" : reason;
+    if (!safeReleasePath(relative)) return yield* problem(invalid);
+    let current = parent;
+    for (const part of relative.split("/")) {
+      current = path.join(current, part);
+      const info = yield* fs.stat(current).pipe(Effect.mapError(() => problem(reason)));
+      if (info.type === "SymbolicLink") return yield* problem(invalid);
+      if ((yield* fs.realPath(current)) !== current) return yield* problem(invalid);
+    }
+    const info = yield* fs.stat(current);
+    if (info.type !== "File" || info.size > MAX_ARTIFACT) return yield* problem(invalid);
+    const bytes = yield* fs.readFile(current);
+    if (bytes.byteLength !== Number(info.size) || bytes.byteLength > MAX_ARTIFACT)
+      return yield* problem(reason);
+    return bytes;
+  });
+  const target = Effect.fn("WorkbenchReleaseEvidence.target")(function* (
+    p: WorkbenchReleaseHostProfile,
+  ) {
+    const result = yield* Effect.tryPromise({
+      try: async (signal) => {
+        // @effect-diagnostics-next-line globalFetchInEffect:off -- This pinned endpoint adapter bounds bytes, disables redirects and forwards cancellation.
+        const response = await fetch(new URL(p.policy.target.versionPath, p.policy.target.origin), {
+          signal,
+          redirect: "error",
+          credentials: "omit",
+          headers: { accept: "application/json" },
+        });
+        if (!response.ok || !response.body) throw new Error("Target unavailable");
+        const reader = response.body.getReader();
+        let size = 0;
+        const chunks: Uint8Array[] = [];
+        try {
+          for (;;) {
+            const next = await reader.read();
+            if (next.done) break;
+            size += next.value.byteLength;
+            if (size > 16384) throw new Error("Target too large");
+            chunks.push(next.value);
+          }
+        } finally {
+          await reader.cancel();
+        }
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const c of chunks) {
+          bytes.set(c, offset);
+          offset += c.byteLength;
+        }
+        return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      },
+      catch: () => problem("target_unavailable"),
+    }).pipe(
+      Effect.timeout("10 seconds"),
+      Effect.mapError(() => problem("target_unavailable")),
+    );
+    const decoded = yield* decodeTarget(yield* decodeJson(result)).pipe(
+      Effect.mapError(() => problem("target_unavailable")),
+    );
+    if (decoded.serviceId !== p.policy.target.serviceId) return yield* problem("target_changed");
+    return {
+      ...p.policy.target,
+      basis: {
+        version: decoded.version,
+        sourceSha: decoded.sourceSha,
+        artifactSha256: decoded.artifactSha256,
+      },
+      observedAt: yield* stamp,
+    };
+  });
+  const catalog = Effect.fn("WorkbenchReleaseEvidence.catalog")(
+    function* (query: { projectId?: string | undefined }) {
+      const registry = yield* readReleaseProfiles();
+      const profiles = yield* Effect.forEach(
+        registry.profiles.filter(
+          (p) => p.enabled && (!query.projectId || p.projectId === query.projectId),
+        ),
+        publicReleaseProfile,
+      );
+      return {
+        environmentId: yield* environment.getEnvironmentId,
+        configured: registry.configured,
+        profiles,
+      };
+    },
+    Effect.provide(context),
+    Effect.mapError(failure),
+  );
+  const get = Effect.fn("WorkbenchReleaseEvidence.get")(function* (
+    queueId: string,
+    id: string,
+    scope: Scope,
+  ) {
+    const row = yield* read(queueId, id, scope);
+    let p = yield* decodePreparation(row.preparation_json);
+    if ((p.state === "preparing" || p.state === "queued") && !jobs.has(id)) {
+      const now = yield* stamp;
+      p = {
+        ...p,
+        state: "unknown",
+        reasons: ["preparation_interrupted"],
+        version: p.version + 1,
+        updatedAt: now,
+        validation: { state: "unknown", version: p.validation.version + 1, observedAt: now },
+      };
+      yield* save(p);
+    }
+    return yield* envelope(queueId, scope, p);
+  }, Effect.mapError(failure));
+  const revalidate = Effect.fn("WorkbenchReleaseEvidence.revalidate")(
+    function* (queueId: string, id: string, input: WorkbenchReleaseRevalidateInput) {
+      return yield* locks.withLock(
+        id,
+        Effect.gen(function* () {
+          const row = yield* read(queueId, id, input),
+            p = yield* decodePreparation(row.preparation_json);
+          if (!p.evidence || p.evidence.digest !== input.expectedEvidenceDigest)
+            return yield* new WorkbenchReleaseError({ reason: "conflict" });
+          if (p.state === "invalidated") return yield* envelope(queueId, input, p);
+          const evidence = p.evidence;
+          const original = (yield* decodeJson(row.snapshot_json)) as Source;
+          const prepInput = yield* decodePrepareInput(row.input_json);
+          const checked = yield* Effect.gen(function* () {
+            const registered = yield* profile(
+              prepInput.profileId,
+              prepInput.profileDigest,
+              prepInput.projectId,
+            );
+            const observed = yield* source(queueId, prepInput, registered);
+            if (observed.base !== original.base) return yield* problem("base_changed");
+            if (canonicalReleaseJson(observed) !== canonicalReleaseJson(original))
+              return yield* problem("source_changed");
+            const bytes = yield* regular(directory(id), "artifact", "artifact_changed");
+            const rollback = yield* regular(directory(id), "rollback", "rollback_mismatch");
+            const diffBytes = yield* regular(directory(id), "diff", "artifact_changed");
+            if (diffBytes.byteLength > MAX_DIFF || releaseHash(diffBytes) !== evidence.diff.digest)
+              return yield* problem("artifact_changed");
+            if (
+              releaseHash(bytes) !== evidence.artifact.sha256 ||
+              releaseHash(rollback) !== evidence.rollback.artifact.sha256
+            )
+              return yield* problem("artifact_changed");
+            const current = yield* target(registered);
+            if (canonicalReleaseJson(current.basis) !== canonicalReleaseJson(evidence.target.basis))
+              return yield* problem("target_changed");
+            const baseline = yield* regular(
+              observed.real,
+              registered.policy.rollback.artifactRelativePath,
+              "rollback_missing",
+            );
+            if (releaseHash(baseline) !== evidence.rollback.artifact.sha256)
+              return yield* problem("rollback_mismatch");
+            const { digest, ...unsigned } = evidence;
+            if (releaseDigest(unsigned) !== digest) return yield* problem("evidence_unavailable");
+            const finalProfile = yield* profile(
+              prepInput.profileId,
+              prepInput.profileDigest,
+              prepInput.projectId,
+            );
+            const finalSource = yield* source(queueId, prepInput, finalProfile);
+            if (finalSource.base !== original.base) return yield* problem("base_changed");
+            if (canonicalReleaseJson(finalSource) !== canonicalReleaseJson(original))
+              return yield* problem("source_changed");
+            const finalTarget = yield* target(finalProfile);
+            if (
+              canonicalReleaseJson(finalTarget.basis) !==
+              canonicalReleaseJson(evidence.target.basis)
+            )
+              return yield* problem("target_changed");
+            yield* profile(prepInput.profileId, prepInput.profileDigest, prepInput.projectId);
+            if (
+              releaseHash(yield* regular(directory(id), "artifact", "artifact_changed")) !==
+                evidence.artifact.sha256 ||
+              releaseHash(yield* regular(directory(id), "rollback", "rollback_mismatch")) !==
+                evidence.rollback.artifact.sha256 ||
+              releaseHash(yield* regular(directory(id), "diff", "artifact_changed")) !==
+                evidence.diff.digest
+            )
+              return yield* problem("artifact_changed");
+            yield* localFence(queueId, prepInput, original);
+          }).pipe(
+            Effect.match({
+              onSuccess: () => null,
+              onFailure: (error) =>
+                isBlocked(error)
+                  ? (error.reason as WorkbenchReleaseReason)
+                  : ("evidence_unavailable" as const),
+            }),
+          );
+          const now = yield* stamp;
+          const unknown = checked === "target_unavailable" || checked === "evidence_unavailable";
+          const next: WorkbenchReleasePreparation = {
+            ...p,
+            state: checked ? (unknown ? "unknown" : "invalidated") : "ready",
+            reasons: checked ? [checked] : [],
+            version: p.version + 1,
+            updatedAt: now,
+            validation: {
+              state: checked ? (unknown ? "unknown" : "invalidated") : "current",
+              version: p.validation.version + 1,
+              observedAt: now,
+            },
+          };
+          let saved = next;
+          if (next.state === "ready") saved = yield* saveFenced(queueId, prepInput, original, next);
+          else yield* save(next);
+          return yield* envelope(queueId, input, saved);
+        }),
+      );
+    },
+    Effect.provide(context),
+    Effect.mapError(failure),
+  );
+  const produce = Effect.fn("WorkbenchReleaseEvidence.produce")(function* (
+    queueId: string,
+    input: WorkbenchReleasePrepareInput,
+    p: WorkbenchReleaseHostProfile,
+    initial: Source,
+  ) {
+    const id = input.preparationId,
+      dir = directory(id),
+      snapshot = path.join(dir, "source");
+    const loaded = yield* read(queueId, id, input);
+    let state = yield* decodePreparation(loaded.preparation_json);
+    state = { ...state, state: "preparing", updatedAt: yield* stamp };
+    yield* save(state);
+    yield* fs.makeDirectory(snapshot, { recursive: true, mode: 0o700 });
+    const list = yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.tree",
+      cwd: initial.real,
+      args: ["ls-tree", "-rz", "--full-tree", initial.head],
+      maxOutputBytes: MAX_DIFF,
+    });
+    if (list.stdoutTruncated) return yield* problem("artifact_invalid");
+    const tracked = list.stdout
+      .split("\0")
+      .filter(Boolean)
+      .map((line) => /^([0-9]+) blob ([a-f0-9]+)\t(.+)$/.exec(line));
+    if (tracked.some((m) => !m || !["100644", "100755"].includes(m[1]!) || !safeReleasePath(m[3]!)))
+      return yield* problem("artifact_invalid");
+    const archive = path.join(dir, "source.tar");
+    yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.export",
+      cwd: initial.real,
+      args: ["archive", "--format=tar", `--output=${archive}`, initial.head],
+    });
+    const unpack = yield* runner.run({
+      command: "/usr/bin/tar",
+      args: ["-xf", archive, "-C", snapshot],
+      env: { PATH: "/usr/bin:/bin" },
+      extendEnv: false,
+      timeout: "120 seconds",
+      maxOutputBytes: MAX_DIFF,
+    });
+    if (unpack.code !== 0) return yield* problem("artifact_invalid");
+    yield* fs.remove(archive);
+    const unchanged = Effect.fn("WorkbenchReleaseEvidence.snapshotUnchanged")(function* () {
+      for (const m of tracked) {
+        const bytes = yield* regular(snapshot, m![3]!, "source_changed");
+        if (releaseBlobHash(bytes, m![2]!.length === 40 ? "sha1" : "sha256") !== m![2])
+          return yield* problem("source_changed");
+      }
+    });
+    yield* unchanged();
+    const observedTarget = yield* target(p);
+    const rollback = yield* regular(
+      initial.real,
+      p.policy.rollback.artifactRelativePath,
+      "rollback_missing",
+    );
+    const rollbackHash = releaseHash(rollback);
+    if (rollbackHash !== observedTarget.basis.artifactSha256)
+      return yield* problem("rollback_mismatch");
+    yield* fs.writeFile(path.join(dir, "rollback"), rollback, { mode: 0o400 });
+    yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.diff",
+      cwd: initial.real,
+      args: [
+        "-c",
+        "core.quotePath=true",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--binary",
+        `--output=${path.join(dir, "diff")}`,
+        initial.base,
+        initial.head,
+        "--",
+      ],
+      maxOutputBytes: MAX_DIFF,
+      appendTruncationMarker: false,
+    });
+    const patchStat = yield* fs.stat(path.join(dir, "diff"));
+    if (patchStat.size > MAX_DIFF) return yield* problem("diff_too_large");
+    const patchBytes = yield* regular(dir, "diff", "evidence_unavailable");
+    yield* Effect.try({
+      try: () => new TextDecoder("utf-8", { fatal: true }).decode(patchBytes),
+      catch: () => problem("evidence_unavailable"),
+    });
+    yield* fs.chmod(path.join(dir, "diff"), 0o400);
+    const stats = yield* git.execute({
+      operation: "WorkbenchReleaseEvidence.diffStats",
+      cwd: initial.real,
+      args: [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--numstat",
+        initial.base,
+        initial.head,
+        "--",
+      ],
+      maxOutputBytes: MAX_DIFF,
+    });
+    if (stats.stdoutTruncated) return yield* problem("diff_too_large");
+    const records = stats.stdout.trim() ? stats.stdout.trim().split("\n") : [];
+    let insertions = 0,
+      deletions = 0;
+    for (const r of records) {
+      const [a, b] = r.split("\t");
+      insertions += Number(a) || 0;
+      deletions += Number(b) || 0;
+    }
+    const scripts = yield* releaseProfileScripts(p);
+    const receipts: WorkbenchReleaseReceipt[] = [];
+    let artifactHash: string | null = null;
+    let artifactBytes = 0;
+    const roles = [
+      "build",
+      ...p.policy.checks.map(() => "check" as const),
+      "health",
+      "core",
+      "rollback_verify",
+    ] as const;
+    const selected = [
+      scripts[0]!,
+      ...scripts.slice(1, p.policy.checks.length + 3),
+      scripts.at(-1)!,
+    ];
+    for (let i = 0; i < roles.length; i++) {
+      const role = roles[i]!,
+        script = selected[i]!,
+        startedAt = yield* stamp;
+      yield* unchanged();
+      yield* sql`INSERT INTO workbench_release_stages(preparation_id,ordinal,role,state,started_at) VALUES(${id},${i},${role},'running',${startedAt})`;
+      const argv = releaseCommandArgv(script.command);
+      if (!argv) return yield* problem("profile_changed");
+      const [command, ...args] = argv;
+      const env = {
+        PATH: path.dirname(process.execPath) + ":/usr/bin:/bin",
+        HOME: dir,
+        TMPDIR: dir,
+        GIT_CEILING_DIRECTORIES: dir,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: path.join(dir, "empty.gitconfig"),
+        T3_RELEASE_SOURCE_SHA: initial.head,
+        T3_RELEASE_ARTIFACT: path.join(dir, "artifact"),
+        T3_RELEASE_ROLLBACK_ARTIFACT: path.join(dir, "rollback"),
+      };
+      const result = yield* runner
+        .run({
+          command: command!,
+          args,
+          cwd: snapshot,
+          env,
+          extendEnv: false,
+          timeout: "120 seconds",
+          maxOutputBytes: MAX_DIFF,
+          outputMode: "error",
+        })
+        .pipe(
+          Effect.mapError((e) =>
+            problem(
+              e._tag === "ProcessTimeoutError"
+                ? "timeout"
+                : e._tag === "ProcessOutputLimitError"
+                  ? "output_limit"
+                  : role === "build"
+                    ? "build_failed"
+                    : role === "check"
+                      ? "check_failed"
+                      : role === "rollback_verify"
+                        ? "rollback_failed"
+                        : "preflight_failed",
+            ),
+          ),
+        );
+      const completedAt = yield* stamp,
+        outputDigest = releaseDigest({ stdout: result.stdout, stderr: result.stderr });
+      if (
+        result.code !== 0 ||
+        result.timedOut ||
+        result.stdoutTruncated ||
+        result.stderrTruncated
+      ) {
+        yield* sql`UPDATE workbench_release_stages SET state='failed',exit_code=${result.code},output_digest=${outputDigest},completed_at=${completedAt} WHERE preparation_id=${id} AND ordinal=${i}`;
+        return yield* problem(
+          role === "build"
+            ? "build_failed"
+            : role === "check"
+              ? "check_failed"
+              : role === "rollback_verify"
+                ? "rollback_failed"
+                : "preflight_failed",
+        );
+      }
+      yield* unchanged();
+      if (role === "build") {
+        const bytes = yield* regular(snapshot, p.policy.artifact.relativePath, "artifact_missing");
+        artifactHash = releaseHash(bytes);
+        artifactBytes = bytes.byteLength;
+        yield* fs.writeFile(path.join(dir, "artifact"), bytes, { mode: 0o400 });
+      }
+      if (
+        releaseHash(yield* regular(dir, "artifact", "artifact_changed")) !== artifactHash ||
+        releaseHash(yield* regular(dir, "rollback", "rollback_mismatch")) !== rollbackHash
+      )
+        return yield* problem("artifact_changed");
+      const receipt: WorkbenchReleaseReceipt = {
+        id: `stage:${releaseHash(id)}:${i}`,
+        role,
+        phase: role === "build" ? "build" : role === "check" ? "source_check" : "preflight",
+        scriptId: script.id,
+        definitionHash: releaseScriptHash(script),
+        subject:
+          role === "build" || role === "check"
+            ? "source"
+            : role === "rollback_verify"
+              ? "rollback_artifact"
+              : "candidate_artifact",
+        sourceSha: initial.head,
+        profileDigest: input.profileDigest,
+        subjectArtifactSha256:
+          role === "build" || role === "check"
+            ? null
+            : role === "rollback_verify"
+              ? rollbackHash
+              : artifactHash,
+        outputArtifactSha256: role === "build" ? artifactHash : null,
+        exitCode: 0,
+        outputDigest,
+        startedAt,
+        completedAt,
+      };
+      receipts.push(receipt);
+      yield* sql`UPDATE workbench_release_stages SET state='completed',receipt_json=${canonicalReleaseJson(receipt)},exit_code=0,output_digest=${outputDigest},completed_at=${completedAt} WHERE preparation_id=${id} AND ordinal=${i}`;
+    }
+    const finalProfile = yield* profile(input.profileId, input.profileDigest, input.projectId);
+    const finalSource = yield* source(queueId, input, finalProfile);
+    if (finalSource.base !== initial.base) return yield* problem("base_changed");
+    if (canonicalReleaseJson(finalSource) !== canonicalReleaseJson(initial))
+      return yield* problem("source_changed");
+    const finalTarget = yield* target(finalProfile);
+    if (canonicalReleaseJson(finalTarget.basis) !== canonicalReleaseJson(observedTarget.basis))
+      return yield* problem("target_changed");
+    if (
+      releaseHash(
+        yield* regular(initial.real, p.policy.rollback.artifactRelativePath, "rollback_missing"),
+      ) !== rollbackHash
+    )
+      return yield* problem("rollback_mismatch");
+    const sealedProfile = yield* profile(input.profileId, input.profileDigest, input.projectId);
+    const sealedSource = yield* source(queueId, input, sealedProfile);
+    if (sealedSource.base !== initial.base) return yield* problem("base_changed");
+    if (canonicalReleaseJson(sealedSource) !== canonicalReleaseJson(initial))
+      return yield* problem("source_changed");
+    const lastTarget = yield* target(sealedProfile);
+    if (canonicalReleaseJson(lastTarget.basis) !== canonicalReleaseJson(observedTarget.basis))
+      return yield* problem("target_changed");
+    yield* profile(input.profileId, input.profileDigest, input.projectId);
+    if (
+      releaseHash(yield* regular(dir, "artifact", "artifact_changed")) !== artifactHash ||
+      releaseHash(yield* regular(dir, "rollback", "rollback_mismatch")) !== rollbackHash ||
+      releaseHash(yield* regular(dir, "diff", "artifact_changed")) !== releaseHash(patchBytes)
+    )
+      return yield* problem("artifact_changed");
+    yield* localFence(queueId, input, initial);
+    const now = yield* stamp,
+      w = initial.task;
+    const unsigned = {
+      schemaVersion: 1 as const,
+      id: `evidence:${releaseHash(id)}`,
+      preparationId: id,
+      createdAt: now,
+      binding: {
+        environmentId: yield* environment.getEnvironmentId,
+        trackingId: input.expectedTrackingId,
+        queueId,
+        controllerId: input.controllerId,
+        projectId: input.projectId,
+        workItemId: w.id,
+        taskId: ScheduledTaskId.make(w.task_id),
+        taskCreatedAt: w.task_created_at,
+        dispatcherThreadId: ThreadId.make(w.dispatcher_thread_id),
+        workThreadId: ThreadId.make(w.work_thread_id),
+        cycleNumber: w.cycle_number,
+        workItemVersion: w.version,
+        latestEventSequence: w.latest_event_sequence,
+        processedThroughSequence: w.processed_through_sequence,
+      },
+      profile: { id: p.id, version: p.version, digest: input.profileDigest },
+      source: {
+        branch: w.branch,
+        commitSha: initial.head,
+        treeSha: initial.tree,
+        clean: true as const,
+        main: { ...p.policy.main, commitSha: initial.base, integrated: true as const },
+      },
+      diff: {
+        ref: `diff:${releaseHash(id)}`,
+        digest: releaseHash(patchBytes),
+        byteCount: patchBytes.byteLength,
+        filesChanged: records.length,
+        insertions,
+        deletions,
+        complete: true as const,
+      },
+      artifact: {
+        ref: `artifact:${releaseHash(id)}`,
+        sha256: artifactHash!,
+        bytes: artifactBytes,
+        manifestDigest: releaseDigest([
+          {
+            relativePath: p.policy.artifact.relativePath,
+            bytes: artifactBytes,
+            sha256: artifactHash,
+          },
+        ]),
+        fileCount: 1 as const,
+      },
+      target: observedTarget,
+      receipts,
+      rollback: {
+        artifact: {
+          ref: `rollback:${releaseHash(id)}`,
+          sha256: rollbackHash,
+          bytes: rollback.byteLength,
+        },
+        basisVersion: observedTarget.basis.version,
+        targetServiceId: p.policy.target.serviceId,
+        execute: p.policy.rollback.execute,
+        verifyReceiptId: receipts.at(-1)!.id,
+      },
+      observation: p.policy.observation,
+    };
+    const evidence = yield* decodeEvidence({ ...unsigned, digest: releaseDigest(unsigned) });
+    state = {
+      ...state,
+      state: "ready",
+      reasons: [],
+      evidence,
+      version: state.version + 1,
+      updatedAt: now,
+      validation: { state: "current", version: state.validation.version + 1, observedAt: now },
+    };
+    yield* saveFenced(queueId, input, initial, state);
+    yield* fs.remove(snapshot, { recursive: true });
+  });
+  const prepare = Effect.fn("WorkbenchReleaseEvidence.prepare")(
+    function* (queueId: string, input: WorkbenchReleasePrepareInput) {
+      return yield* locks.withLock(
+        input.preparationId,
+        Effect.gen(function* () {
+          yield* authorize(queueId, input);
+          const [prior] =
+            yield* sql<Row>`SELECT * FROM workbench_release_preparations WHERE id=${input.preparationId}`;
+          if (prior) {
+            if (prior.queue_id !== queueId || prior.input_json !== canonicalReleaseJson(input))
+              return yield* new WorkbenchReleaseError({ reason: "conflict" });
+            return yield* get(queueId, input.preparationId, input);
+          }
+          const registered = yield* profile(
+            input.profileId,
+            input.profileDigest,
+            input.projectId,
+          ).pipe(
+            Effect.mapError(
+              (e) =>
+                new WorkbenchReleaseError({
+                  reason:
+                    isBlocked(e) && e.reason === "profile_changed"
+                      ? "profile_changed"
+                      : "profile_invalid",
+                }),
+            ),
+          );
+          const initial = yield* source(queueId, input, registered).pipe(
+            Effect.mapError(() => new WorkbenchReleaseError({ reason: "stale_state" })),
+          );
+          const now = yield* stamp,
+            w = initial.task;
+          const p: WorkbenchReleasePreparation = {
+            id: input.preparationId,
+            workItemId: w.id,
+            taskId: ScheduledTaskId.make(w.task_id),
+            taskCreatedAt: w.task_created_at,
+            dispatcherThreadId: ThreadId.make(w.dispatcher_thread_id),
+            workThreadId: ThreadId.make(w.work_thread_id),
+            cycleNumber: w.cycle_number,
+            workItemVersion: w.version,
+            profileDigest: input.profileDigest,
+            version: 1,
+            state: "queued",
+            reasons: [],
+            evidence: null,
+            validation: { state: "unknown", version: 1, observedAt: now },
+            createdAt: now,
+            updatedAt: now,
+          };
+          yield* sql`INSERT INTO workbench_release_preparations(id,queue_id,controller_id,project_id,tracking_id,work_item_id,input_json,profile_json,snapshot_json,preparation_json,state,created_at,updated_at) VALUES(${input.preparationId},${queueId},${input.controllerId},${input.projectId},${input.expectedTrackingId},${input.workItemId},${canonicalReleaseJson(input)},${canonicalReleaseJson(registered)},${canonicalReleaseJson(initial)},${canonicalReleaseJson(p)},'queued',${now},${now})`;
+          const done = yield* Deferred.make<void>();
+          jobs.set(input.preparationId, done);
+          yield* produce(queueId, input, registered, initial).pipe(
+            Effect.timeout("20 minutes"),
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                const row = yield* read(queueId, input.preparationId, input),
+                  saved = yield* decodePreparation(row.preparation_json),
+                  now = yield* stamp;
+                const reason = isBlocked(error)
+                  ? (error.reason as WorkbenchReleaseReason)
+                  : isReleaseError(error) && error.reason === "profile_changed"
+                    ? "profile_changed"
+                    : "evidence_unavailable";
+                yield* save({
+                  ...saved,
+                  state: "blocked",
+                  reasons: [reason],
+                  version: saved.version + 1,
+                  updatedAt: now,
+                  validation: {
+                    state: "unknown",
+                    version: saved.validation.version + 1,
+                    observedAt: now,
+                  },
+                });
+              }),
+            ),
+            Effect.ensuring(
+              Effect.all([
+                fs.remove(path.join(directory(input.preparationId), "source"), {
+                  recursive: true,
+                  force: true,
+                }),
+                fs.remove(path.join(directory(input.preparationId), "source.tar"), { force: true }),
+              ]).pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("Release preparation temporary source cleanup failed", {
+                    preparationId: input.preparationId,
+                  }),
+                ),
+              ),
+            ),
+            Effect.ensuring(Deferred.succeed(done, undefined)),
+            Effect.ensuring(Effect.sync(() => jobs.delete(input.preparationId))),
+            Effect.forkIn(serviceScope),
+          );
+          return yield* envelope(queueId, input, p);
+        }),
+      );
+    },
+    Effect.provide(context),
+    Effect.mapError(failure),
+  );
+  const diff = Effect.fn("WorkbenchReleaseEvidence.diff")(function* (
+    queueId: string,
+    id: string,
+    scope: Scope,
+  ) {
+    const row = yield* read(queueId, id, scope),
+      p = yield* decodePreparation(row.preparation_json);
+    if (!p.evidence) return yield* new WorkbenchReleaseError({ reason: "not_found" });
+    const bytes = yield* regular(directory(id), "diff", "evidence_unavailable");
+    if (bytes.byteLength > MAX_DIFF || releaseHash(bytes) !== p.evidence.diff.digest)
+      return yield* new WorkbenchReleaseError({ reason: "unavailable" });
+    return {
+      environmentId: yield* environment.getEnvironmentId,
+      trackingId: scope.expectedTrackingId,
+      queueId,
+      controllerId: scope.controllerId,
+      projectId: scope.projectId,
+      preparationId: id,
+      diff: {
+        ref: p.evidence.diff.ref,
+        digest: p.evidence.diff.digest,
+        byteCount: bytes.byteLength,
+        complete: true as const,
+        patch: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      },
+    };
+  }, Effect.mapError(failure));
+  const awaitPrepared = Effect.fn("WorkbenchReleaseEvidence.awaitPrepared")(function* (
+    queueId: string,
+    id: string,
+    scope: Scope,
+  ) {
+    yield* authorize(queueId, scope);
+    const done = jobs.get(id);
+    if (done) yield* Deferred.await(done);
+    return yield* get(queueId, id, scope);
+  }, Effect.mapError(failure));
+  return WorkbenchReleaseEvidence.of({ catalog, prepare, get, revalidate, diff, awaitPrepared });
+});
+export const layer = Layer.effect(WorkbenchReleaseEvidence, make);
