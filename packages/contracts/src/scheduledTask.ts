@@ -709,6 +709,84 @@ export const WorkbenchAttentionScope = Schema.Struct({
   ...WorkbenchQueueScope.fields,
   expectedTrackingId: AttentionRequestId,
 });
+export const WorkbenchTaskProgressQuery = WorkbenchAttentionScope;
+const ProgressCount = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(10),
+);
+export const WorkbenchTaskProgressResult = Schema.Struct({
+  environmentId: Schema.String,
+  trackingId: Schema.String,
+  queueId: Schema.String,
+  controllerId: Schema.String,
+  projectId: ProjectId,
+  task: Schema.Struct({
+    id: Schema.String,
+    taskId: ScheduledTaskId,
+    taskCreatedAt: IsoDateTime,
+    dispatcherThreadId: ThreadId,
+    workThreadId: Schema.NullOr(ThreadId),
+    previousTaskId: Schema.NullOr(Schema.String),
+    cycleNumber: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    version: AttentionVersion,
+    businessState: WorkbenchWorkItem.fields.businessState,
+    queueState: Schema.Literals(["queued", "occupied", "paused", "finished"]),
+    workState: Schema.Literals(["unknown", "working", "waiting_for_children", "result_available"]),
+    blockedReason: Schema.NullOr(
+      Schema.Literals([
+        "queue_full",
+        "awaiting_dispatcher",
+        "approval",
+        "state_unknown",
+        "over_capacity",
+        "attention",
+      ]),
+    ),
+    matter: Schema.NullOr(
+      Schema.Struct({
+        scopeKey: Schema.String.check(Schema.isMaxLength(16384)),
+        provider: WorkbenchMatter.fields.provider,
+        kind: WorkbenchMatter.fields.kind,
+        namespace: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(500)),
+        key: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(500)),
+      }),
+    ),
+    branch: Schema.NullOr(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(500))),
+    head: Schema.Struct({
+      state: Schema.Literals(["known", "unknown", "not_created"]),
+      sha: Schema.NullOr(Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/))),
+      observedAt: IsoDateTime,
+      checksBound: Schema.Literal(false),
+    }),
+    checks: Schema.Struct({
+      state: Schema.Literals([
+        "not_configured",
+        "pending",
+        "passed",
+        "failed",
+        "awaiting_user",
+        "unknown",
+      ]),
+      passed: ProgressCount,
+      failed: ProgressCount,
+      used: Schema.NullOr(
+        Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(3)),
+      ),
+      sourceRunId: Schema.NullOr(RunId),
+    }),
+    nextStep: Schema.Literals([
+      "await_dispatch",
+      "work_in_progress",
+      "await_user",
+      "await_delivery",
+      "completed",
+      "unknown",
+    ]),
+    threadUrl: Schema.NullOr(Schema.String.check(Schema.isMaxLength(2048))),
+    updatedAt: IsoDateTime,
+  }),
+});
+export type WorkbenchTaskProgressResult = typeof WorkbenchTaskProgressResult.Type;
 export const WorkbenchAttentionQuery = Schema.Struct({
   ...WorkbenchAttentionScope.fields,
   cursor: Schema.optional(AttentionRequestId),

@@ -72,6 +72,8 @@ import {
 } from "./speech.ts";
 import {
   WorkbenchAttentionQuery,
+  WorkbenchTaskProgressQuery,
+  WorkbenchTaskProgressResult,
   WorkbenchRuntimeResponseInput,
   WorkbenchRuntimeRequestsSnapshot,
   WorkbenchRuntimeResponseReceipt,
@@ -1336,6 +1338,21 @@ class EnvironmentWorkbenchRepairsHttpApi extends HttpApiGroup.make("workbenchRep
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+class EnvironmentWorkbenchTaskProgressHttpApi extends HttpApiGroup.make(
+  "workbenchTaskProgress",
+).add(
+  HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/progress/:workItemId", {
+    params: { queueId: TrimmedNonEmptyString, workItemId: TrimmedNonEmptyString },
+    headers: OptionalBearerHeaders,
+    query: WorkbenchTaskProgressQuery,
+    success: WorkbenchTaskProgressResult,
+    error: [
+      ...EnvironmentScopedOperationErrors,
+      WorkbenchQueueError.pipe(HttpApiSchema.status(409)),
+    ],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 class EnvironmentWorkbenchAttentionHttpApi extends HttpApiGroup.make("workbenchAttention").add(
   HttpApiEndpoint.get("get", "/api/workbench/queues/:queueId/attention", {
     params: { queueId: TrimmedNonEmptyString },
@@ -1392,6 +1409,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentEventOrchestrationHttpApi)
   .add(EnvironmentWebhooksHttpApi)
   .add(EnvironmentWorkbenchQueueHttpApi)
+  .add(EnvironmentWorkbenchTaskProgressHttpApi)
   .add(EnvironmentWorkbenchAttentionHttpApi)
   .add(EnvironmentWorkbenchRepairsHttpApi)
   .add(EnvironmentWorkbenchResponsesHttpApi)
