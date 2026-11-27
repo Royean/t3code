@@ -73,6 +73,8 @@ const decodeFrozen = Schema.decodeEffect(
 );
 const decodeResult = Schema.decodeUnknownEffect(WorkbenchTaskProgressResult);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+// Observation refreshes do not change the state protected around the Git probes.
+const stateFence = (row: Row) => ({ ...row, updated_at: null });
 const decodeBlocked = Schema.decodeUnknownOption(
   WorkbenchTaskProgressResult.fields.task.fields.blockedReason,
 );
@@ -262,11 +264,11 @@ const make = Effect.gen(function* () {
       const sha = before.work_thread_id === null ? null : yield* observeHead(before);
       const observedAt = DateTime.formatIso(yield* DateTime.now);
       const row = yield* read(queueId, workItemId, scope);
-      if ((yield* encodeJson(row)) !== (yield* encodeJson(before)))
+      if ((yield* encodeJson(stateFence(row))) !== (yield* encodeJson(stateFence(before))))
         return yield* new WorkbenchQueueError({ reason: "stale_state" });
       const evidence = yield* checks(row);
       const final = yield* read(queueId, workItemId, scope);
-      if ((yield* encodeJson(final)) !== (yield* encodeJson(row)))
+      if ((yield* encodeJson(stateFence(final))) !== (yield* encodeJson(stateFence(row))))
         return yield* new WorkbenchQueueError({ reason: "stale_state" });
       const environmentId = yield* environment.getEnvironmentId;
       const decodedBlock = decodeBlocked(row.blocked_reason);
@@ -326,7 +328,7 @@ const make = Effect.gen(function* () {
             row.work_thread_id === null
               ? null
               : hostedThreadLink({ environmentId, threadId: ThreadId.make(row.work_thread_id) }),
-          updatedAt: row.updated_at,
+          updatedAt: final.updated_at,
         },
       });
     },

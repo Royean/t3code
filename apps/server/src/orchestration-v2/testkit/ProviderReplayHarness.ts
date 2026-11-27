@@ -56,6 +56,7 @@ import * as ProviderSwitchService from "../ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "../ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "../ProviderTurnStartService.ts";
 import * as ProviderTurnStartServiceTestkit from "../ProviderTurnStartService.testkit.ts";
+import type * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import * as McpAppModelContext from "../../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../../preview/PreviewAgentActivity.ts";
 import * as RunExecutionService from "../RunExecutionService.ts";
@@ -280,6 +281,8 @@ export function layerWithRegistry<Error>(
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    readonly configLayer?: Layer.Layer<ServerConfig.ServerConfig, Error>;
+    readonly gitWorkflowLayer?: Layer.Layer<GitWorkflow.GitWorkflowService>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -302,10 +305,12 @@ export function layerWithRegistry<Error>(
   | ThreadCommandExecutor.ThreadCommandExecutor,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
-  const layerServerConfig = Layer.effect(
-    ServerConfig.ServerConfig,
-    makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
-  ).pipe(Layer.provide(NodeServices.layer));
+  const layerServerConfig =
+    options.configLayer ??
+    Layer.effect(
+      ServerConfig.ServerConfig,
+      makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
+    ).pipe(Layer.provide(NodeServices.layer));
   const layerRuntimeBase =
     scenario.runtimePolicyOverride === undefined
       ? RuntimePolicy.layer
@@ -576,7 +581,11 @@ export function layerWithRegistry<Error>(
     ThreadCommandExecutor.layer,
   ).pipe(
     Layer.provideMerge(layerDatabase),
-    Layer.provide(ProviderTurnStartServiceTestkit.layer),
+    Layer.provide(
+      options.gitWorkflowLayer === undefined
+        ? ProviderTurnStartServiceTestkit.layer
+        : Layer.merge(ProviderTurnStartServiceTestkit.layer, options.gitWorkflowLayer),
+    ),
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
 

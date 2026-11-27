@@ -302,7 +302,7 @@ const make = Effect.gen(function* () {
         updatedAt: logicalReleaseIso(d.updatedAt, Date.parse(currentStamp)),
       };
       const changed =
-        yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt},settled_state=CASE WHEN settled_state IS NULL AND ${["deployed", "rolled_back", "failed_unchanged"].includes(next.state)} THEN ${next.state} ELSE settled_state END WHERE id=${d.id} AND deployment_json=${canonicalReleaseJson(d)} RETURNING id`;
+        yield* sql`UPDATE workbench_deployments SET deployment_json=${canonicalReleaseJson(next)},state=${next.state},updated_at=${next.updatedAt},settled_state=CASE WHEN settled_state IS NULL AND ${Number(["deployed", "rolled_back", "failed_unchanged"].includes(next.state))} THEN ${next.state} ELSE settled_state END WHERE id=${d.id} AND deployment_json=${canonicalReleaseJson(d)} RETURNING id`;
       if (changed.length !== 1)
         return yield* new WorkbenchDeploymentError({ reason: "stale_state" });
       d = next;

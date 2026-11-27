@@ -187,6 +187,42 @@ it.live(
         expect(value.task.threadUrl).toBe("https://app.t3.codes/threads/environment/child");
         expect(JSON.stringify(value)).not.toContain("PRIVATE");
         expect(JSON.stringify(value)).not.toContain(directory);
+        const readDuringChange = (change: Effect.Effect<unknown, never>) =>
+          Effect.gen(function* () {
+            const reader = yield* Progress.WorkbenchTaskProgress;
+            return yield* reader.get("queue", "item", scope);
+          }).pipe(
+            Effect.provide(
+              Layer.fresh(Progress.layer).pipe(
+                Layer.provide(
+                  Layer.mock(Git.GitVcsDriver)({
+                    execute: (input) =>
+                      git
+                        .execute(input)
+                        .pipe(
+                          Effect.tap(() =>
+                            input.args[0] === "rev-parse" && input.args[1] === "--verify"
+                              ? change
+                              : Effect.void,
+                          ),
+                        ),
+                  }),
+                ),
+              ),
+            ),
+          );
+        const observedStamp = "2026-11-27T00:00:01.000Z";
+        const refreshed = yield* readDuringChange(
+          sql`UPDATE workbench_work_items SET updated_at=${observedStamp} WHERE id='item'`.pipe(
+            Effect.orDie,
+          ),
+        );
+        expect(refreshed.task.head.sha).toBe(head.commitSha);
+        expect(refreshed.task.updatedAt).toBe(observedStamp);
+        const changed = yield* readDuringChange(
+          sql`UPDATE workbench_work_items SET version=version+1 WHERE id='item'`.pipe(Effect.orDie),
+        ).pipe(Effect.flip);
+        expect(changed.reason).toBe("stale_state");
         yield* sql`UPDATE workbench_repair_generations SET context_json=${yield* encode({ ...context, gitCommonDir: `${real}/different` })}`;
         expect((yield* progress.get("queue", "item", scope)).task.head.state).toBe("unknown");
         yield* sql`UPDATE workbench_repair_generations SET context_json=${yield* encode(context)}`;
@@ -203,31 +239,11 @@ it.live(
           cwd: directory,
           args: ["switch", "progress-fixture"],
         });
-        const revoked = yield* Effect.gen(function* () {
-          const reader = yield* Progress.WorkbenchTaskProgress;
-          return yield* reader.get("queue", "item", scope).pipe(Effect.flip);
-        }).pipe(
-          Effect.provide(
-            Layer.fresh(Progress.layer).pipe(
-              Layer.provide(
-                Layer.mock(Git.GitVcsDriver)({
-                  execute: (input) =>
-                    git
-                      .execute(input)
-                      .pipe(
-                        Effect.tap(() =>
-                          input.args[0] === "rev-parse" && input.args[1] === "--verify"
-                            ? sql`UPDATE scheduled_task_execution_metadata SET tracking_id='revoked'`.pipe(
-                                Effect.orDie,
-                              )
-                            : Effect.void,
-                        ),
-                      ),
-                }),
-              ),
-            ),
+        const revoked = yield* readDuringChange(
+          sql`UPDATE scheduled_task_execution_metadata SET tracking_id='revoked'`.pipe(
+            Effect.orDie,
           ),
-        );
+        ).pipe(Effect.flip);
         expect(revoked.reason).toBe("invalid_binding");
       }).pipe(Effect.scoped);
       expect(yield* fs.exists(directory)).toBe(false);

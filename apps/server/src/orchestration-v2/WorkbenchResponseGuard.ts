@@ -171,7 +171,7 @@ const proof = Effect.fn("WorkbenchResponseGuard.proof")(function* (
       AND json_extract(t.payload_json,'$.interactionMode')=${source.interaction_mode}
       AND json(json_extract(t.payload_json,'$.modelSelection'))=json(${source.model_selection_json})
       AND n.run_id=${source.source_run_id} AND n.provider_thread_id=${source.provider_thread_id}
-      AND (${source.capability !== "message"} OR json_extract(p.payload_json,'$.nativeThreadRef.strength')='strong')
+      AND (${Number(source.capability !== "message")} OR json_extract(p.payload_json,'$.nativeThreadRef.strength')='strong')
       AND (${source.native_thread_id} IS NULL OR json_extract(p.payload_json,'$.nativeThreadRef.nativeId')=${source.native_thread_id})
       AND (${source.native_driver} IS NULL OR json_extract(p.payload_json,'$.nativeThreadRef.driver')=${source.native_driver})`;
   if (context === undefined) return yield* fail("context-mismatch", row.id);
@@ -499,9 +499,9 @@ export const refreshResponseEvidence = Effect.fn("WorkbenchResponseGuard.refresh
       });
       yield* sql`UPDATE workbench_runtime_responses SET state=${state},evidence_level=${evidence},
         effect_state=COALESCE(${effect?.status ?? null},effect_state),delivery_json=${detail},
-        runtime_accepted_at=CASE WHEN ${s.capability === "live" && effect?.status === "succeeded"} THEN COALESCE(runtime_accepted_at,${effect?.completed_at ?? now}) ELSE runtime_accepted_at END,
-        delivered_at=CASE WHEN ${ack !== undefined} THEN COALESCE(delivered_at,${now}) ELSE delivered_at END,
-        reason=CASE WHEN ${state === "unknown"} THEN 'delivery-unknown' ELSE reason END,updated_at=${now}
+        runtime_accepted_at=CASE WHEN ${Number(s.capability === "live" && effect?.status === "succeeded")} THEN COALESCE(runtime_accepted_at,${effect?.completed_at ?? now}) ELSE runtime_accepted_at END,
+        delivered_at=CASE WHEN ${Number(ack !== undefined)} THEN COALESCE(delivered_at,${now}) ELSE delivered_at END,
+        reason=CASE WHEN ${Number(state === "unknown")} THEN 'delivery-unknown' ELSE reason END,updated_at=${now}
         WHERE id=${row.id}`;
     }
   },

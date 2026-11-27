@@ -60,6 +60,9 @@
         "scripts/update-test-shard-weights.ts",
         "scripts/verify-background-live.ts",
         "src/provider/testFixtures/*.mjs",
+        // Node --import entry points for the paired-workbench acceptance subprocess.
+        "src/orchestration-v2/testkit/WorkbenchProcessBoundary.mjs",
+        "src/orchestration-v2/testkit/WorkbenchGithubBoundary.mjs",
         // graphqlgen reads its config.
         "graphql.config.ts",
       ],

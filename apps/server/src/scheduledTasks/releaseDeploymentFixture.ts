@@ -22,12 +22,21 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
   dir: string,
   baselineSha: string,
   existing?: { bytes: string; version: string },
+  externalCoordinator?: {
+    readonly id: string;
+    readonly origin: string;
+    readonly publicKey: string;
+  },
 ) {
   const path = yield* Path.Path,
     cfg = yield* Config.ServerConfig;
   const keys = NodeCrypto.generateKeyPairSync("ed25519"),
-    publicKey = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
-  const keyId = releaseHash(keys.publicKey.export({ type: "spki", format: "der" }));
+    publicKey =
+      externalCoordinator?.publicKey ??
+      keys.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const verificationKey = NodeCrypto.createPublicKey(publicKey);
+  const keyId =
+    externalCoordinator?.id ?? releaseHash(keys.publicKey.export({ type: "spki", format: "der" }));
   const store = yield* Effect.acquireRelease(
     Effect.sync(() => ({
       database: new NodeSqlite.DatabaseSync(path.join(dir, "independent-adapter.sqlite")),
@@ -139,6 +148,8 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
     payload: WorkbenchDeploymentPayload,
     kind: "reservation" | "commit",
   ): WorkbenchDeploymentSigned => {
+    if (externalCoordinator)
+      throw new Error("The external coordinator must sign its own authority.");
     const unsigned = {
       schemaVersion: 1 as const,
       kind,
@@ -442,7 +453,7 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
           !NodeCrypto.verify(
             null,
             Buffer.from(releaseDigest(unsigned), "utf8"),
-            keys.publicKey,
+            verificationKey,
             Buffer.from(signature, "base64url"),
           )
         )
@@ -608,7 +619,7 @@ export const deploymentFixture = Effect.fn("DeploymentFixture.acquire")(function
       credentialRef: "adapter-token",
     },
     serviceKey: "formal-service",
-    coordinator: { id: keyId, origin, publicKey },
+    coordinator: { id: keyId, origin: externalCoordinator?.origin ?? origin, publicKey },
     deploy: descriptor.deploy,
     rollback: descriptor.rollback,
   };
